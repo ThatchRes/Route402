@@ -132,6 +132,32 @@ class ConciergeContextTests(unittest.TestCase):
         self.assertEqual(record.call_args.args[-3:], ("conversation-test", 7, decisions))
         self.assertEqual(result.conversationRevision, 7)
 
+    def test_saved_routing_preference_reaches_paid_review_after_an_amount_edit(self):
+        preview = {"template": "send_to", "policy": "cheapest", "beneficiary": {"name": "Example supplier"},
+                   "paymentRef": "chat_preference_test", "intent": {"destCcy": "MXN", "amount": "750.00", "amountType": "SOURCE_FIXED",
+                   "deadlineUtc": "2026-11-03T20:00:00Z", "objective": "cheapest"}, "company": {},
+                   "conversationId": "preference-conversation", "conversationRevision": 3}
+        with patch.object(self.gateway.backend, "assistant_ask", AsyncMock(return_value=preview)), \
+             patch.object(self.gateway, "run_review", AsyncMock(return_value=([], [], []))) as review:
+            result = asyncio.run(self.gateway.concierge_ask(MagicMock(), "demo-tenant", "test-pref", "make it 750"))
+        self.assertEqual(result.policy, "cheapest")
+        self.assertEqual(review.call_args.args[-1], "cheapest")
+        payment = review.call_args.args[5][0]
+        self.assertEqual(payment["amount"], "750.00")
+        self.assertEqual(payment["amountType"], "SOURCE_FIXED")
+        self.assertEqual(payment["deadlineUtc"], "2026-11-03T20:00:00Z")
+
+    def test_preference_without_an_active_payment_never_buys_quotes(self):
+        preview = {"template": "routing_preference", "policy": "cheapest", "message": "Preference saved", "company": {},
+                   "conversationId": "preference-conversation", "conversationRevision": 1}
+        ctx = MagicMock()
+        with patch.object(self.gateway.backend, "assistant_ask", AsyncMock(return_value=preview)):
+            result = asyncio.run(self.gateway.concierge_ask(ctx, "demo-tenant", "test-pref-empty", "I prefer the cheapest"))
+        self.assertEqual(result.template, "routing_preference")
+        self.assertEqual(result.policy, "cheapest")
+        self.assertEqual(result.paidCalls, [])
+        ctx.send_and_receive.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ function printDecision(d: any) {
   for (const a of d.allocations) console.log(`  ${a.routeId}${a.x402Executable ? "  [x402 live]" : a.token ? "  [simulated rail]" : "  [bank, simulated]"}  ${a.quote.sourceDebit.display} -> ${a.quote.recipientNet.display}`);
   console.log(`  vs customer's current wire: ${d.baseline?.sourceDebit} -> ${d.baseline?.recipientNet}, arrives ${d.baseline?.arrivalUtc}`);
   console.log(`  customer saves ${d.value.customerSavings} | our fee ${d.value.platformFee} (${d.value.feeRule}) | customer keeps ${d.value.customerNetSaving}`);
-  console.log(`  cheapest single: ${d.cheapest?.routeId} | fastest: ${d.fastest?.routeId} | best x402-executable: ${d.bestX402?.routeId ?? "none"} ${d.bestX402 ? `(${d.bestX402.recipientNet})` : ""}`);
+  console.log(`  cheapest plan: ${d.cheapest?.routeId} | fastest plan: ${d.fastest?.routeId} | best x402-executable: ${d.bestX402?.routeId ?? "none"} ${d.bestX402 ? `(${d.bestX402.recipientNet})` : ""}`);
   console.log(`  ${d.execution}`);
   const ex = d.candidates.filter((c: any) => !c.eligible);
   if (ex.length) console.log(`  excluded (${ex.length}): ` + ex.slice(0, 4).map((c: any) => `${c.routeId}: ${c.reason}`).join(" | "));

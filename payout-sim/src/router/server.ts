@@ -31,7 +31,8 @@ import { TOKENS } from "./registry.js";
 import { issuerHeadroom, stablecoinPlanAllowed } from "./depeg.js";
 import { setTokenizedConfig } from "./tokenized.js";
 import { coinsOf, complianceChecks, disallowedCoins, railOf } from "./compliance.js";
-import { loadPolicy } from "../company/controls.js";
+import { loadPolicy, loadRequests } from "../company/controls.js";
+import { exposureContext } from "./exposureState.js";
 import { planningNow } from "./timing.js";
 import { executionPolicy, planForDispatch } from "./dispatch.js";
 import { askConversation, conversationView, recordConversationReview, ConversationConflict } from "../assistant/conversation.js";
@@ -57,14 +58,22 @@ const TREASURY_USD = toMinor(process.env.TREASURY_USD ?? "2000000.00", "USD");  
 const ID = /^[A-Za-z0-9_\-:.]{1,80}$/;
 const now = planningNow;
 
-mountUi(app, Number(process.env.ROUTER_PORT ?? 8404));   // browser demo (/app, /ui/*): local-only, mounted before the token check
+mountUi(app, Number(process.env.ROUTER_PORT ?? 8404), createIntent);   // same planner for browser release and provider quotes
 app.use((req, res, next) => (req.header("authorization") === `Bearer ${TOKEN()}` ? next() : res.status(401).json({ code: "UNAUTHORIZED" })));
 const err = (res: express.Response, status: number, code: string, message: string, details?: any) =>
   res.status(status).json({ code, message, details, retryable: false, correlationId: res.req.header("x-correlation-id") });
 
 // ------------------------------------------------------------------ intents + decisions
-function createIntent(it: Intent) {
-  it = { ...it, nowUtc: now() }; // imported snapshots and browser-supplied dates cannot move the router's clock
+function currentBudget(excludeRequestId?: string, excludeTransferId?: string) {
+  const context = exposureContext(loadPolicy(), excludeRequestId, excludeTransferId);
+  return { exposureContext: context, issuerHeadroomUsd: Object.fromEntries(Object.entries(context.hardCapsUsd).map(([iss, cap]) => [iss, Math.max(0, cap - (context.usedUsd[iss] ?? 0))])) };
+}
+function freshPlan(t: any) {
+  const request = Object.values(loadRequests()).find((r) => r.transferId === t.transferId || r.intentId === t.intentId);
+  return planForDispatch(t.terms, now(), currentBudget(request?.id, t.transferId));
+}
+function createIntent(it: Intent, excludeRequestId?: string) {
+  it = { ...it, costOfCashPct: loadLinked().input.company.costOfCashPct, ...currentBudget(excludeRequestId), nowUtc: now() }; // backend budgets, company settings and clock
   const decision: any = optimize(it);
   const intentId = `int_${randomUUID().slice(0, 8)}`;
   update((db) => { db.intents[intentId] = { intentId, intent: it, decision, createdAt: now() }; });
@@ -93,7 +102,7 @@ app.post("/v1/provider-quote", async (req, res) => {
   let r: any;
   // the stablecoin rail plans within each issuer's remaining room under the cap, splitting across issuers when one is full
   // and skips coins the compliance rules forbid for this supplier; above every allowed issuer's cap, the rest goes by bank wire
-  try { r = createIntent({ ...it, provider, objective: it.objective ?? "cheapest", ...(provider === "stablecoin"
+  try { r = createIntent({ ...it, provider, objective: it.objective ?? "balanced", ...(provider === "stablecoin"
     ? { issuerHeadroomUsd: issuerHeadroom(), excludeCoins: disallowedCoins(it.beneficiary?.country, loadPolicy()), bankComplement: true } : {}) }); }
   catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
   const d = r.decision;
@@ -117,7 +126,8 @@ app.post("/v1/provider-quote", async (req, res) => {
       : provider === "stablecoin" && d.allocations.some((a: any) => String(a.routeId).startsWith("bank:")) ? "Our stablecoin rail + your bank wire" : tokenizedLeg ? "Your bank (tokenized deposit)" : provider === "stablecoin" ? "Our stablecoin rail" : "Your bank",
     plan: { kind: d.plan, sourceDebit: d.totals.sourceDebit, recipientNet: d.totals.recipientNet, arrivalUtc: d.totals.arrivalUtc,
             allocations: d.allocations.map((a: any) => ({ routeId: a.routeId, label: a.label, x402Executable: a.x402Executable, amount: a.amount, arrivalUtc: a.arrivalUtc })) },
-    timing: d.timing, simulation: d.simulation, costVsMidBps: d.costVsMidBps, risk, compliance: compliance.checks,
+    timing: d.timing, simulation: d.simulation, costVsMidBps: d.costVsMidBps, risk, exposure: d.exposure, selection: d.selection,
+    alternatives: { cheapest: d.cheapest, fastest: d.fastest, balanced: d.balanced }, search: d.search, compliance: compliance.checks,
     baseline: d.baseline ? { sourceDebit: d.baseline.sourceDebit, meetsDeadline: d.baseline.meetsDeadline } : null, value: d.value, provenance: d.provenance });
 });
 app.get("/v1/intents/:id", (req, res) => { const i = load().intents[String(req.params.id)]; return i ? res.json(i) : err(res, 404, "NOT_FOUND", "intent"); });
@@ -140,7 +150,7 @@ app.post("/v1/transfers", (req, res) => {
     policy = executionPolicy(i.intent, i.decision, req.body?.allowReroute === true, alternatives);
   } catch (e: any) { return err(res, 422, "INVALID_FALLBACK", e.message); }
   const terms = { intent: i.intent, allocations: i.decision.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input,
-    sourceDebit: a.quote.sourceDebit.display, recipientNet: a.quote.recipientNet.display })), totals: i.decision.totals,
+    sourceDebit: a.quote.sourceDebit.display, recipientNet: a.quote.recipientNet.display, exposure: a.exposure })), totals: i.decision.totals,
     executionPolicy: policy, dispatchAtUtc: req.body?.dispatchAtUtc ?? now() };
   const dispatchAtUtc = terms.dispatchAtUtc;
   if (!Number.isFinite(Date.parse(dispatchAtUtc)) || (i.decision.timing?.latestStartUtc && Date.parse(dispatchAtUtc) > Date.parse(i.decision.timing.latestStartUtc)))
@@ -163,7 +173,7 @@ app.post("/v1/transfers/:id/approvals", (req, res) => {
   if (t.status === "APPROVED") return res.json(t);
   if (t.status !== "AWAITING_APPROVAL") return err(res, 409, "INVALID_STATE", `cannot approve a transfer in ${t.status}; inspect existing evidence before a new plan`);
   if (Date.parse(t.quoteExpiresAt) < Date.parse(now())) return err(res, 409, "QUOTE_EXPIRED", "create a new intent for fresh quotes");
-  const feasible = planForDispatch(t.terms, now());
+  const feasible = freshPlan(t);
   if (!feasible.ok) return err(res, 409, feasible.code!, feasible.reason!);
   if (!ID.test(approver ?? "")) return err(res, 400, "INVALID", "approver required");
   update((db) => { const x = db.transfers[t.transferId]; x.status = "APPROVED"; x.approval = { approver, planVersion, termsHash, at: now() };
@@ -178,7 +188,7 @@ app.post("/v1/transfers/:id/execute", (req, res) => {
   if (planVersion !== t.planVersion || termsHash !== t.termsHash) return err(res, 409, "PLAN_CHANGED", "execute must reference the approved plan");
   if (["SCHEDULED", "EXECUTING", "COMPLETED", "PARTIAL", "NEEDS_RECONCILIATION"].includes(t.status)) return res.status(200).json({ ...t, note: "already scheduled/executing/executed: not re-sent" });
   if (t.status !== "APPROVED") return err(res, 409, "NOT_APPROVED", `transfer is ${t.status}`);
-  const feasible = planForDispatch(t.terms, now());
+  const feasible = freshPlan(t);
   if (!feasible.ok) return err(res, 409, feasible.code!, feasible.reason!);
   // atomic reservation of source funds (simulated treasury), then async execution
   const debitUsd = t.terms.intent.srcCcy === "USD" ? toMinor(t.terms.totals.sourceDebit.split(" ")[0], "USD") : 0n;
@@ -203,15 +213,16 @@ export async function dispatchDue() {
     if (t.status !== "SCHEDULED" || Date.parse(t.dispatchAtUtc) > Date.parse(now()) || dispatching.has(t.transferId)) continue;
     dispatching.add(t.transferId);
     try {
-      let check = planForDispatch(t.terms, now());
+      let check = freshPlan(t);
       if (check.ok && check.decision.allocations.some((a: any) => String(a.routeId).startsWith("coin:"))) {
-        const gate = await stablecoinPlanAllowed(check.decision.allocations);
+        const request = Object.values(loadRequests()).find((r) => r.transferId === t.transferId || r.intentId === t.intentId);
+        const gate = await stablecoinPlanAllowed(check.decision.allocations, request?.id, t.transferId);
         if (!gate.ok) check = { ok: false, code: "RAIL_PAUSED", reason: gate.reason };
       }
       // Compliance again just before money moves (sanctions lists and policy can change after approval)
       if (check.ok) { const c = await complianceFor(t.terms.intent, check.decision); if (!c.ok) check = { ok: false, code: "COMPLIANCE_HOLD", reason: c.reason }; }
       // Recheck after asynchronous rail checks; nothing has been funded yet, so a pause can safely free the reservation.
-      if (check.ok) check = planForDispatch(t.terms, now());
+      if (check.ok) check = freshPlan(t);
       if (!check.ok) {
         update((db) => { const x = db.transfers[t.transferId]; unreserve(db, x); x.status = "PAUSED"; x.note = check.reason;
           x.history.push({ at: now(), status: "PAUSED", code: check.code, note: check.reason }); });
@@ -220,7 +231,7 @@ export async function dispatchDue() {
       const d = check.decision;
       update((db) => {
         const x = db.transfers[t.transferId]; x.status = "EXECUTING"; x.dispatchedAtUtc = now();
-        x.executionPlan = { allocations: d.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input, arrivalUtc: a.arrivalUtc })), totals: d.totals, timing: d.timing };
+        x.executionPlan = { allocations: d.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input, sourceDebit: a.quote.sourceDebit.display, exposure: a.exposure, arrivalUtc: a.arrivalUtc })), totals: d.totals, timing: d.timing, exposure: d.exposure };
         x.executionQuoteExpiresAt = new Date(Date.parse(now()) + QUOTE_TTL_MS).toISOString();
         x.history.push({ at: now(), status: "EXECUTING", note: "fresh deadline and price check passed; original signed terms retained",
           routeIds: d.allocations.map((a: any) => a.routeId) });
@@ -432,7 +443,7 @@ app.post("/v1/treasury/sweeps", (req, res) => safe(res, () => runSweeps(req.body
 app.post("/v1/treasury/rules/evaluate", (req, res) => safe(res, () => evaluate(req.body?.rules ?? DEMO_RULES, req.body?.state ?? DEMO_STATE)));
 
 app.get("/v1/market", (_req, res) => res.json(marketSummary()));
-app.post("/v1/company/payment-run", (req, res) => safe(res, () => runPaymentRun(req.body?.payables ? req.body : DEMO_RUN)));
+app.post("/v1/company/payment-run", (req, res) => safe(res, () => runPaymentRun(req.body?.payables ? req.body : DEMO_RUN, currentBudget())));
 // Port company data in: CSV text (accounting export) or a Nessie customer (bank sandbox), then run the payment run.
 app.post("/v1/company/import", async (req, res) => {
   try {
@@ -440,7 +451,7 @@ app.post("/v1/company/import", async (req, res) => {
     const imp: any = req.body?.source === "nessie" ? await importFromNessie(String(req.body.customerId), DEMO_COMPANY, now)
       : req.body?.source === "csv" ? importCsv(String(req.body.csv ?? ""), DEMO_COMPANY, now) : null;
     if (!imp) return err(res, 400, "INVALID_SOURCE", "source must be csv or nessie");
-    res.json({ imported: imp.imported, problems: imp.problems ?? imp.unmapped ?? [], run: runPaymentRun(imp.input) });
+    res.json({ imported: imp.imported, problems: imp.problems ?? imp.unmapped ?? [], run: runPaymentRun(imp.input, currentBudget()) });
   } catch (e: any) { err(res, 422, "IMPORT_FAILED", e.message); }
 });
 // Everyday prompts -> ready-made plan from the linked data (preview only; execution needs approval)

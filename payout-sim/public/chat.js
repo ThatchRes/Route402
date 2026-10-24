@@ -414,7 +414,7 @@ function agentTrail(a) {
   if (decisions.length) {
     const ok = decisions.filter((d) => d.decision === "approve"), review = decisions.filter((d) => d.decision === "review"), held = decisions.filter((d) => !["approve", "review"].includes(d.decision));
     const railName = (p) => (RAIL[p] ?? p).replace(/^(Our|Your) /, (w) => w.toLowerCase());
-    const pref = { cheapest: "lowest total cost", fastest: "fastest arrival", lowest_risk: "lowest risk" }[a.policy] ?? "lowest total cost";
+    const pref = { cheapest: "lowest total cost", fastest: "fastest arrival", balanced: "a balance of cost and speed", lowest_risk: "lowest risk" }[a.policy] ?? "a balance of cost and speed";
     const what = decisions.length === 1
       ? (ok.length ? `Recommended ${railName(ok[0].chosen)}, the best fit for ${pref}` : review.length ? `Recommended ${railName(review[0].chosen)}, but flagged a check for a person first` : `Held this payment: ${(held[0].reasons ?? [])[0] ?? "no route qualified"}`)
       : [ok.length && `${ok.length} recommended`, review.length && `${review.length} need a check first`, held.length && `${held.length} held`].filter(Boolean).join(", ");
@@ -472,6 +472,9 @@ function howWeGotHere(d, q) {
     </div>
     <div class="math">
       ${line("Market rate", `1 ${esc(src)} = ${esc(Number(m.mid).toFixed(4))} ${esc(dest)} <small>${esc(m.midSource ?? "")}</small>`)}
+      ${an.alternatives ? line("Cost and speed options", [["cheapest", "Lowest cash cost"], ["fastest", "Fastest arrival"], ["balanced", "Best combined value"]].map(([key, label]) => {
+        const p = an.alternatives[key]; return p ? `${esc(label)}: ${esc(money(p.sourceDebit))} route amount${num(p.platformFee) ? ` + ${esc(money(p.platformFee))} Route402 fee` : ""}; arrives ${esc(whenUtc(p.arrivalUtc))}` : "";
+      }).filter(Boolean).join("<br>")) : ""}
       ${T ? line("This route", `${esc(money(q.sourceDebit))} = ${esc(feesLine(T))} fees + ${esc(T.principal)} converted${T.converts ? ` at ${esc(T.rate)}` : ""}`) : ""}
       ${bps.plan != null ? line("Cost above the market rate", `${(bps.plan / 100).toFixed(2)}% this route · ${bps.bank != null ? `${(bps.bank / 100).toFixed(2)}% your bank` : "no bank baseline"} <small>(what you pay − its value at the market rate) ÷ value at the market rate</small>`) : ""}
       ${b ? line(fixedSource ? "Supplier receives" : "Your bank would charge", fixedSource ? `${esc(money(q.recipientNet))} here vs ${esc(money(b.recipientNet))} through your bank` : `${esc(money(b.sourceDebit))} vs ${esc(money(q.sourceDebit))} here`) : ""}
@@ -508,6 +511,7 @@ function proposal(d, a, index, current, withAction) {
     <div class="amounts">${amount("You pay, fees included", q?.sourceDebit)}${ICON("arrow-right", 18, "arrow")}${amount(`${name} receives`, q?.recipientNet)}</div>
     ${qs?.status === "error" ? `<p class="msg-note">Quote details unavailable: ${esc(qs.error)}</p>` : ""}
     ${impactRow(d, q)}
+    ${exposureNote(q)}
     <div class="divider"></div>
     ${rows.map(([k, v]) => `<div class="row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}
     ${note ? `<p class="proposal-note">${esc(note)}</p>` : ""}

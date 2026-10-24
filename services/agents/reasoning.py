@@ -4,6 +4,7 @@ import json
 import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from decimal import Decimal, InvalidOperation
 
 import llm
 from guard import untrusted
@@ -240,15 +241,17 @@ def reconcile(legs, outstanding_view=None):
 # ------------------------------------------------------------------ payment decision (routing agent)
 import os as _os
 
-POLICIES = ("cheapest", "fastest", "lowest_risk")
+POLICIES = ("balanced", "cheapest", "fastest", "lowest_risk")
 POLICY = {
     "maxCostBps": float(_os.getenv("ROUTING_MAX_COST_BPS", "150")),      # never send above this cost vs mid
-    "default": _os.getenv("ROUTING_POLICY", "cheapest"),
+    "default": _os.getenv("ROUTING_POLICY", "balanced"),
 }
 
 
 def policy_from_text(text: str, fallback: str | None = None) -> str:
     t = (text or "").lower()
+    if any(w in t for w in ("balanced", "balance speed and cost", "speed and savings", "speed and saving")):
+        return "balanced"
     if any(w in t for w in ("fastest", "asap", "urgent", "quickly", "today")):
         return "fastest"
     if any(w in t for w in ("safest", "lowest risk", "low risk", "safe")):
@@ -265,7 +268,7 @@ def _pct(bps):
 def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = POLICY, deadline_utc=None):
     """Pick ONE provider's paid quote under the company's policy. Deterministic; never invents a route, rate or amount.
     quotes: {provider_id: quote dict or {"status": "NO_QUOTE", ...}}. Returns a dict with decision, chosen, intentId, reasons, options."""
-    policy = policy if policy in POLICIES else "cheapest"
+    policy = policy if policy in POLICIES else "balanced"
     hold, reasons, options = [], [], []
     s = (screen or {}).get("status", "UNAVAILABLE")
     if s == "PASS":
@@ -284,13 +287,13 @@ def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = 
                             "why": f"no quote ({(q or {}).get('reason') or (q or {}).get('detail') or (q or {}).get('status', 'none')})"})
             continue
         c = q.get("costVsMidBps") or {}
-        cost, bank = c.get("plan"), c.get("bank")
+        cost, bank = c.get("withPlatformFee", c.get("plan")), c.get("bank")
         bank_bps = bank if bank is not None else bank_bps
         bank_basis = (q.get("provenance") or {}).get("bankBaseline", bank_basis)
         o = {"provider": pid, "label": q.get("providerLabel", pid), "costBps": cost, "arrivalUtc": q["plan"].get("arrivalUtc", ""), "timing": q.get("timing"),
              "risk": (q.get("risk") or {}).get("score", 3), "riskWhy": (q.get("risk") or {}).get("why", ""), "intentId": q.get("intentId"),
              "routeIds": [a["routeId"] for a in q["plan"].get("allocations", [])],
-             "live": any(a.get("x402Executable") for a in q["plan"].get("allocations", [])), "eligible": True}
+             "live": any(a.get("x402Executable") for a in q["plan"].get("allocations", [])), "eligible": True, "selection": q.get("selection") or {}}
         deadline = deadline_utc or (q.get("timing") or {}).get("deadlineUtc")
         try:
             arrival = datetime.fromisoformat(o["arrivalUtc"].replace("Z", "+00:00"))
@@ -307,9 +310,26 @@ def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = 
         options.append(o)
 
     ok = [o for o in options if o["eligible"]]
-    key = {"cheapest": lambda o: (o["costBps"], o["arrivalUtc"]),
-           "fastest": lambda o: (o["arrivalUtc"], o["costBps"]),
-           "lowest_risk": lambda o: (o["risk"], o["costBps"])}[policy]
+    comparable = [o for o in options if o["eligible"] or o.get("requiresCostApproval")]
+    def valid_metrics(o):
+        try:
+            return all(Decimal(str(o["selection"][k])).is_finite() for k in ("moneyCostMinor", "combinedCostMinor"))
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            return False
+    use_metrics = bool(comparable) and all(valid_metrics(o) for o in comparable) and len({o["selection"].get("sourceCcy") for o in comparable}) == 1
+    # All providers must use the same units. Legacy fixtures fall back together, never cents vs basis points.
+    earliest = min((datetime.fromisoformat(o["arrivalUtc"].replace("Z", "+00:00")) for o in comparable), default=None)
+    def money(o):
+        return Decimal(str(o["selection"]["moneyCostMinor"])) if use_metrics else Decimal(str(o["costBps"]))
+    def combined(o):
+        if use_metrics:
+            return Decimal(str(o["selection"]["combinedCostMinor"]))
+        days = (datetime.fromisoformat(o["arrivalUtc"].replace("Z", "+00:00")) - earliest).total_seconds() / 86400 if earliest else 0
+        return money(o) + Decimal(str(days)) * Decimal("1.5")
+    key = {"balanced": lambda o: (combined(o), o["arrivalUtc"], money(o)),
+           "cheapest": lambda o: (money(o), o["arrivalUtc"]),
+           "fastest": lambda o: (o["arrivalUtc"], money(o)),
+           "lowest_risk": lambda o: (o["risk"], money(o), o["arrivalUtc"])}[policy]
     ok.sort(key=key)
     # Deadline is hard. An available but over-budget route needs explicit human cost approval, never auto-execution.
     review_options = sorted([o for o in options if o.get("requiresCostApproval")], key=key)

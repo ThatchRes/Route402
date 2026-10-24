@@ -33,6 +33,9 @@ import { supplierDirectory } from "../company/suppliers.js";
 import { publicData, validateChatRequest } from "../assistant/safety.js";
 import { recordUiReview, reviewedIntent, trustedUiDecision } from "../assistant/reviews.js";
 import { browserSecurity, browserRateLimit } from "./browserSecurity.js";
+import { cleanAdaptiveExposure } from "./exposure.js";
+import { exposureContext } from "./exposureState.js";
+import type { Intent } from "./optimizer.js";
 
 const NOW = planningNow;
 const PAID = "data/executed.json";
@@ -41,7 +44,7 @@ const savePaid = (m: Record<string, any>) => { mkdirSync("data", { recursive: tr
 
 const mask = (b: any) => { const a = String(b.iban ?? b.accountNumber ?? b.usdcWallet ?? "").replace(/\s+/g, ""); return a ? `${a.slice(0, 2)}•• •••• ${a.slice(-4)}` : "no account on file"; };
 
-export function mountUi(app: express.Express, port: number) {
+export function mountUi(app: express.Express, port: number, reprice?: (intent: Intent, excludeRequestId?: string) => any) {
   C.reconcileApprovalPolicy();
   const self = async (method: string, p: string, body?: any, extra: Record<string, string> = {}) => {
     const r = await fetch(`http://127.0.0.1:${port}${p}`, { method, body: body ? JSON.stringify(body) : undefined,
@@ -61,9 +64,10 @@ export function mountUi(app: express.Express, port: number) {
   // is left out of the key: it changes on every call, and two minutes of drift does not change a plan's timing meaningfully.
   let runCache: { key: string; at: number; run: any } | null = null;
   const paymentRun = (input: any) => {
-    const key = JSON.stringify({ ...input, nowUtc: undefined });
+    const budget = exposureContext();
+    const key = JSON.stringify({ ...input, nowUtc: undefined, exposureBudget: budget });
     if (runCache?.key === key && Date.now() - runCache.at < 120_000) return runCache.run;
-    const run = runPaymentRun(input); runCache = { key, at: Date.now(), run }; return run;
+    const run = runPaymentRun(input, { exposureContext: budget }); runCache = { key, at: Date.now(), run }; return run;
   };
   // Escrow status for the dashboard, cached: on Windows a refused localhost connection takes ~2 s to fail, and every page
   // load used to wait for it when the escrow service is not running. After the first check, the last status is served at
@@ -107,7 +111,8 @@ export function mountUi(app: express.Express, port: number) {
       tokenized: { catalog: TOKENIZED_CATALOG, config: tokenizedConfig() }, compliance: { policy: compliancePolicy(pol), stablecoins: STABLECOINS },
       documents: { platforms: EBL_PLATFORMS, labels: DOC_LABEL },
       fxRisk: fxRisk(exposures, rateHistory(), Date.now(), pol.fxRiskLimitUsd), costOfCashPct: l.input.company.costOfCashPct,
-      usdc: { peg, inFlightUsd: usdcInFlight(), capUsd: pol.issuerCapUsd, byIssuer: issuerInFlight() }, escrow,
+      usdc: { peg, inFlightUsd: usdcInFlight(), capUsd: C.issuerCapFor(pol, "Circle"), byIssuer: issuerInFlight() }, escrow,
+      exposureBudget: exposureContext(pol),
       transfers: Object.values(db.transfers).slice(-20).reverse().map((t: any) => ({ transferId: t.transferId, status: t.status,
         reference: t.terms.intent.reference, supplier: t.terms.intent.beneficiary?.name, debit: t.terms.totals.sourceDebit, credit: t.terms.totals.recipientNet })) });
   });
@@ -201,7 +206,15 @@ export function mountUi(app: express.Express, port: number) {
     p.dualApprovalOverUsd = C.loadPolicy().dualApprovalOverUsd; p.requoteTolerancePct = Math.max(0, Number(p.requoteTolerancePct));
     p.requireCallbackOnDetailsChange = !!p.requireCallbackOnDetailsChange; p.quoteValidMinutes = Math.min(14, Math.max(0, Number(p.quoteValidMinutes)));
     p.depegBandPct = Math.min(5, Math.max(0.01, Number(p.depegBandPct))); p.depegFailClosed = p.depegFailClosed !== false;
-    p.issuerCapUsd = Math.max(0, Number(p.issuerCapUsd)); p.escrowDeadlineDays = Math.min(180, Math.max(0.0001, Number(p.escrowDeadlineDays)));
+    if (typeof p.issuerCapUsd !== "number" || !Number.isFinite(p.issuerCapUsd) || p.issuerCapUsd < 0 || p.issuerCapUsd > Number.MAX_SAFE_INTEGER)
+      return res.status(400).json({ error: "The default issuer cap must be a finite, non-negative USD amount" });
+    try { p.issuerCapsUsd = C.cleanIssuerCaps(p.issuerCapsUsd === undefined ? {} : p.issuerCapsUsd); }
+    catch (e: any) { return res.status(400).json({ error: e.message }); }
+    if ("adaptiveExposure" in (req.body ?? {})) {
+      try { p.adaptiveExposure = cleanAdaptiveExposure(req.body.adaptiveExposure); }
+      catch (e: any) { return res.status(400).json({ error: e.message }); }
+    }
+    p.escrowDeadlineDays = Math.min(180, Math.max(0.0001, Number(p.escrowDeadlineDays)));
     p.fxRiskLimitUsd = Math.max(0, Number(p.fxRiskLimitUsd)); p.lcFeePct = Math.min(10, Math.max(0, Number(p.lcFeePct ?? 1)));
     p.compliance = cleanCompliance(p.compliance);
     if ("tokenized" in (req.body ?? {})) {
@@ -209,6 +222,15 @@ export function mountUi(app: express.Express, port: number) {
       p.tokenized = t.config ? { ...t.config, enabledBy: u.id, enabledAt: new Date().toISOString() } : null;
     }
     C.savePolicy(p); setTokenizedConfig(p.tokenized);
+    if (JSON.stringify(before.adaptiveExposure) !== JSON.stringify(p.adaptiveExposure))
+      C.audit(u.id, "adaptive_exposure_changed", "policy", JSON.stringify(p.adaptiveExposure));
+    // Separate entries keep every issuer change readable even when the overall policy exceeds the log's detail limit.
+    if (before.issuerCapUsd !== p.issuerCapUsd)
+      C.audit(u.id, "issuer_cap_changed", "default", `${before.issuerCapUsd} USD -> ${p.issuerCapUsd} USD (default for issuers without a custom cap)`);
+    for (const issuer of new Set([...Object.keys(before.issuerCapsUsd ?? {}), ...Object.keys(p.issuerCapsUsd)])) {
+      if (before.issuerCapsUsd?.[issuer] !== p.issuerCapsUsd[issuer])
+        C.audit(u.id, "issuer_cap_changed", issuer, `${C.issuerCapFor(before, issuer)} USD -> ${C.issuerCapFor(p, issuer)} USD (${Object.hasOwn(p.issuerCapsUsd, issuer) ? "custom cap" : "default cap"})`);
+    }
     C.audit(u.id, "policy_changed", "policy", `${JSON.stringify(before)} -> ${JSON.stringify(p)}`); res.json(p);
   });
 
@@ -377,7 +399,8 @@ export function mountUi(app: express.Express, port: number) {
   async function lockEscrow(id: string) {
     const upd = (f: (x: C.PaymentRequest) => void) => { const all = C.loadRequests(); f(all[id]); C.saveRequests(all); return all[id]; };
     const r = C.loadRequests()[id], pol = C.loadPolicy();
-    const g = await usdcRouteAllowed(r.debitUsd, id);
+    const allocations = load().intents[r.intentId]?.decision?.allocations ?? [];
+    const g = allocations.length ? await stablecoinPlanAllowed(allocations, id, undefined, pol.escrowDeadlineDays * 24) : await usdcRouteAllowed(r.debitUsd, id);
     if (!g.ok) { upd((x) => { x.escrow = { chain: "-", contract: "-", lockId: "-", amountUsdc: 0, deadline: "-", state: "FAILED", error: g.reason };
       x.note = `Escrow not locked: ${g.reason}. Release still waits for delivery under Route402's controls.`; }); C.audit("system", "escrow_blocked", id, g.reason!); return; }
     const deadline = new Date(Date.now() + pol.escrowDeadlineDays * 86400e3).toISOString();
@@ -412,10 +435,12 @@ export function mountUi(app: express.Express, port: number) {
     const alternatives = r.allowReroute ? await Promise.all((r.fallbackIntentIds ?? []).map((id) => self("GET", `/v1/intents/${id}`))) : [];
     const originalTerms = { intent: original.intent, allocations: original.decision.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input })),
       totals: original.decision.totals, executionPolicy: executionPolicy(original.intent, original.decision, r.allowReroute, alternatives) };
-    const check = planForDispatch(originalTerms, NOW());
+    const current = exposureContext(pol, r.id);
+    const check = planForDispatch(originalTerms, NOW(), { exposureContext: current, issuerHeadroomUsd: issuerHeadroom(pol, r.id) });
     if (!check.ok) return pause(`${check.reason}. Nothing new was sent; request a new plan or approval.`);
     // Refresh only within the routes and debit cap the company reviewed. No provider switch or higher debit is implicit.
-    const refreshed = await self("POST", "/v1/intents", { ...original.intent, issuerHeadroomUsd: issuerHeadroom(pol, r.id), provider: r.allowReroute ? undefined : original.intent.provider, allowedRouteIds: originalTerms.executionPolicy.allowedRouteIds });
+    const refreshIntent = { ...original.intent, issuerHeadroomUsd: issuerHeadroom(pol, r.id), provider: r.allowReroute ? undefined : original.intent.provider, allowedRouteIds: originalTerms.executionPolicy.allowedRouteIds };
+    const refreshed = reprice ? reprice(refreshIntent, r.id) : await self("POST", "/v1/intents", refreshIntent);
     if (refreshed.decision?.status !== "OK") return pause(refreshed.decision?.reason ?? "No route can still meet the recipient deadline");
     const newDebit = Number(refreshed.decision.totals.sourceDebit.split(" ")[0]);
     if (newDebit > r.debitUsd) {
@@ -486,8 +511,9 @@ export function mountUi(app: express.Express, port: number) {
     if (!bill) return res.status(404).json({ error: "no such bill" });
     const co = l.input.company, bank = co.currentBank, budget = req.query.mode === "budget" && Number(req.query.usd) > 0;
     const due = typeof req.query.due === "string" && !isNaN(Date.parse(req.query.due)) ? new Date(req.query.due).toISOString() : bill.dueUtc;
+    const objective = ["cheapest", "fastest", "balanced"].includes(String(req.query.objective)) ? String(req.query.objective) : "balanced";
     const body = { srcCcy: co.homeCcy, destCcy: bill.ccy, amountType: budget ? "SOURCE_FIXED" : "RECIPIENT_FIXED", amount: budget ? Number(req.query.usd).toFixed(2) : bill.amount,
-      objective: "cheapest", deadlineUtc: due, reference: bill.id, beneficiary: bill.beneficiary, beneficiaryAcceptsUsdc: !!bill.beneficiary.usdcWallet,
+      objective, deadlineUtc: due, reference: bill.id, beneficiary: bill.beneficiary, beneficiaryAcceptsUsdc: !!bill.beneficiary.usdcWallet,
       currentBank: { label: bank.label, fxMarkupBps: bank.fxMarkupBps, wireFeeUsd: bank.wireFeeUsd, businessDays: bank.businessDays, measured: bank.measured } };
     const mid = Number(midInfo(bill.ccy).rate), now = Date.now();
     const one = async (provider: string) => {
@@ -495,16 +521,23 @@ export function mountUi(app: express.Express, port: number) {
       if (q.status !== "OK") return { provider, status: "NO_QUOTE", reason: q.reason, peg: q.peg, compliance: q.compliance };
       const it = await self("GET", `/v1/intents/${q.intentId}`), a = it.decision?.allocations?.[0]?.quote?.input ?? {};
       const youPayUsd = Number(String(q.plan.sourceDebit).split(" ")[0]), getsDest = Number(String(q.plan.recipientNet).split(" ")[0]);
-      const transferUsd = Number(a.fundingFee ?? 0), payoutUsd = Number(a.payoutFee ?? 0) / (bill.ccy === "USD" ? 1 : mid);
+      const legs = it.decision?.allocations ?? [];
+      const transferUsd = legs.reduce((s: number, leg: any) => s + Number(leg.quote.fundingFee.minor) / 100, 0);
+      const payoutDest = legs.reduce((s: number, leg: any) => s + Number(String(leg.quote.payoutFee.display).split(" ")[0]), 0);
+      const payoutUsd = payoutDest / (bill.ccy === "USD" ? 1 : mid);
+      const effectiveRate = youPayUsd > transferUsd ? (getsDest + payoutDest) / (youPayUsd - transferUsd) : Number(a.fxRate);
       const atMidUsd = getsDest / mid, days = transitDays(now, q.plan.arrivalUtc);
       const econ = allInCost({ youPayUsd, atMidUsd, amountUsd: atMidUsd, costOfCashPct: co.costOfCashPct, days });
+      const platformFeeUsd = Number(String(q.value?.platformFee ?? "0").split(" ")[0]);
+      const transitCostUsd = q.selection ? Number(q.selection.timeCostMinor) / 100 : econ.sendingEarlyUsd;
       return { provider, status: "OK", intentId: q.intentId, youPay: q.plan.sourceDebit, supplierGets: q.plan.recipientNet, arrivalUtc: q.plan.arrivalUtc,
-        timing: q.timing, simulation: q.simulation,
+        timing: q.timing, simulation: q.simulation, exposure: q.exposure, selection: q.selection, alternatives: q.alternatives,
         capturedAt: it.createdAt, expiresAt: new Date(Date.parse(it.createdAt) + C.loadPolicy().quoteValidMinutes * 60e3).toISOString(),
-        costVsMidBps: q.costVsMidBps?.plan, fxRate: a.fxRate, risk: q.risk, routeIds: q.plan.allocations.map((x: any) => x.routeId), compliance: q.compliance,
+        costVsMidBps: q.costVsMidBps?.withPlatformFee ?? q.costVsMidBps?.plan, fxRate: effectiveRate, risk: q.risk, routeIds: q.plan.allocations.map((x: any) => x.routeId), compliance: q.compliance,
         routeLabel: q.plan.allocations[0]?.label,
         breakdown: { transferFeeUsd: transferUsd, payoutFeeUsd: payoutUsd, conversionCostUsd: Math.max(0, econ.pricedUsd - transferUsd - payoutUsd), convertedPrincipalUsd: youPayUsd - transferUsd },
-        economics: { ...econ, transitDays: days, sendBy: sendBy(due, days), meetsDeadline: Date.parse(q.plan.arrivalUtc) <= Date.parse(due), costOfCashPct: co.costOfCashPct } };
+        economics: { ...econ, platformFeeUsd, sendingEarlyUsd: transitCostUsd, allInUsd: econ.pricedUsd + platformFeeUsd + transitCostUsd,
+          transitDays: days, sendBy: sendBy(due, days), meetsDeadline: Date.parse(q.plan.arrivalUtc) <= Date.parse(due), costOfCashPct: co.costOfCashPct } };
     };
     const tkWhy = tokenizedUnavailable(co.homeCcy, bill.ccy, bill.beneficiary.country);
     const [stablecoin, bankQ, tokenQ] = await Promise.all([one("stablecoin"), one("bank_wire"),
@@ -524,9 +557,10 @@ export function mountUi(app: express.Express, port: number) {
     for (const c of cands.filter((x) => !x.eligible)) excluded[excludedKind(c.reason)] = (excluded[excludedKind(c.reason)] ?? 0) + 1;
     return { baseline: d.baseline ? { label: d.baseline.label, sourceDebit: d.baseline.sourceDebit, recipientNet: d.baseline.recipientNet, arrivalUtc: d.baseline.arrivalUtc } : null,
       value: d.value ?? null, costVsMidBps: d.costVsMidBps ?? null, objective: d.objective, plannedAtUtc: d.timing?.plannedAtUtc, provenance: d.provenance,
+      alternatives: { cheapest: d.cheapest, fastest: d.fastest, balanced: d.balanced }, selection: d.selection, search: d.search,
       searched: { routes: cands.length, eligible: cands.filter((x) => x.eligible).length, rails: [...new Set(cands.map((x) => railOf2(String(x.routeId))))],
         networks: [...new Set(cands.map((x) => String(x.routeId)).filter((x) => x.startsWith("coin:")).map((x) => x.split(":")[2]))], excluded, unpriced: (d.unpriced ?? []).length },
-      model: { mid: midInfo(it.intent.destCcy).rate, midSource: midInfo(it.intent.destCcy).source, costOfCashPct, timeValueBpsPerDay: PLATFORM.timeValueBpsPerDay,
+      model: { mid: midInfo(it.intent.destCcy).rate, midSource: midInfo(it.intent.destCcy).source, costOfCashPct, timeValueBpsPerDay: (it.intent.costOfCashPct ?? costOfCashPct) * 100 / 365,
         feeRule: d.value?.feeRule ?? null } };
   }
   // Savings growth: what each open bill is projected to save against the bank wire once paid on its best route (the router's
@@ -534,14 +568,15 @@ export function mountUi(app: express.Express, port: number) {
   let growthCache: { key: string; at: number; value: any } | null = null;
   ui.get("/growth", (_req, res) => {
     const l = loadLinked(), co = l.input.company, reqs = Object.values(C.loadRequests()), db = load();
-    const key = JSON.stringify({ ...l.input, nowUtc: undefined, reqs: reqs.map((r) => [r.id, r.status, r.transferId]) });
+    const budget = exposureContext();
+    const key = JSON.stringify({ ...l.input, nowUtc: undefined, budget, reqs: reqs.map((r) => [r.id, r.status, r.transferId]) });
     if (growthCache?.key === key && Date.now() - growthCache.at < 120_000) return res.json(growthCache.value);
     const started = new Set(reqs.filter((r) => !["REJECTED", "REFUNDED"].includes(r.status)).map((r) => r.payable));
     const open = l.input.payables.filter((b) => !started.has(b.id)), blocked = open.filter((b) => validate(b.beneficiary).status === "BLOCK").length;
     const projected = open.filter((b) => validate(b.beneficiary).status !== "BLOCK").map((b) => {
       try {
-        const d: any = optimize({ srcCcy: co.homeCcy, destCcy: b.ccy, amountType: "RECIPIENT_FIXED", amount: b.amount, objective: "cheapest", deadlineUtc: b.dueUtc,
-          beneficiary: b.beneficiary, beneficiaryAcceptsUsdc: !!b.beneficiary.usdcWallet, currentBank: { ...co.currentBank, measured: true } } as any);
+        const d: any = optimize({ srcCcy: co.homeCcy, destCcy: b.ccy, amountType: "RECIPIENT_FIXED", amount: b.amount, objective: "balanced", costOfCashPct: co.costOfCashPct, deadlineUtc: b.dueUtc,
+          beneficiary: b.beneficiary, beneficiaryAcceptsUsdc: !!b.beneficiary.usdcWallet, currentBank: { ...co.currentBank, measured: true }, exposureContext: budget } as any);
         if (d.status !== "OK") return null;
         const saved = Number(String(d.value.customerNetSaving).split(" ")[0]), faster = d.baseline ? (Date.parse(d.baseline.arrivalUtc) - Date.parse(d.totals.arrivalUtc)) / 86400e3 : 0;
         return { bill: b.id, supplier: b.beneficiary.name, payOnUtc: b.dueUtc, savedUsd: Math.max(0, saved), daysFaster: Math.max(0, faster), route: d.allocations[0]?.routeId };
@@ -583,7 +618,7 @@ export function mountUi(app: express.Express, port: number) {
     const l = loadLinked(), ben = it.intent.beneficiary ?? {};
     res.json({ intentId: id, capturedAt: it.createdAt, expiresAt: new Date(Date.parse(it.createdAt) + C.loadPolicy().quoteValidMinutes * 60e3).toISOString(),
       sourceDebit: d.totals.sourceDebit, recipientNet: d.totals.recipientNet, arrivalUtc: d.totals.arrivalUtc, deadlineUtc: d.timing?.deadlineUtc ?? null,
-      amountType: it.intent.amountType, simulation: !!d.simulation, plan: d.plan, reference: it.intent.reference ?? null,
+      amountType: it.intent.amountType, simulation: !!d.simulation, plan: d.plan, reference: it.intent.reference ?? null, exposure: d.exposure,
       recipient: { name: ben.name ?? null, country: ben.country ?? null, ccy: it.intent.destCcy, maskedAccount: mask(ben) },
       sourceAccount: l.source.startsWith("Nessie") ? "Operating account (Capital One)" : `${l.input.company.homeCcy} operating account (demo)`,
       legs: d.allocations.map((a: any) => ({ label: a.label, routeId: a.routeId, arrivalUtc: a.arrivalUtc, sourceDebit: a.quote.sourceDebit.display,

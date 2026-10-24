@@ -8,6 +8,8 @@ import { div, lessBps, mul } from "./rates.js";
 import { bankMarkup, MARKET, midInfo } from "./market.js";
 import { networkLabel, tokenizedConfig, tokenizedUnavailable } from "./tokenized.js";
 import { STABLECOINS } from "./compliance.js";
+import { assessExposure, type ExposureContext, type ExposureLeg } from "./exposure.js";
+import { comparePlans, searchAllocations, type ScoredPlan } from "./allocationSearch.js";
 /** The stablecoin issuer a route holds money with while it is in flight (first coin of the route), or null for bank routes. */
 export const issuerOfCoins = (coins: string[]) => (coins.length ? STABLECOINS[coins[0]]?.issuer ?? coins[0] : null);   // live mids overwrite the demo table before any price is computed
 
@@ -15,6 +17,7 @@ export interface Intent {
   srcCcy: string; destCcy: string; amountType: "SOURCE_FIXED" | "RECIPIENT_FIXED"; amount: string;
   deadlineUtc?: string; objective?: "balanced" | "cheapest" | "fastest";   // default balanced = cost + speed
   allowSplit?: boolean; nowUtc?: string; midOverrides?: Record<string, string>;     // e.g. {"USD/XOF": "605.2"}
+  costOfCashPct?: number; // annual company cost of cash; balanced prices the actual expected transit time
   liveOnly?: boolean;   // only routes whose funding can really execute today (x402 USDC on Base) or bank routes
   provider?: "stablecoin" | "bank" | "bank_wire" | "tokenized_deposit";   // one provider's routes only (each provider quotes separately)
   beneficiaryAcceptsUsdc?: boolean;   // supplier has a USDC wallet on file (USD-invoiced suppliers)
@@ -22,6 +25,7 @@ export interface Intent {
   beneficiary?: any;                  // supplier details (payee history is updated when the payment completes)
   deadlineBufferMinutes?: number;
   issuerHeadroomUsd?: Record<string, number>;   // how much more each stablecoin issuer may hold under the company's per-issuer cap
+  exposureContext?: ExposureContext; // attached by the backend, refreshed before approval/dispatch
   excludeCoins?: string[];      // coins the company's compliance rules forbid for this supplier (e.g. non-MiCA tokens to the EEA)
   bankComplement?: boolean;     // the stablecoin plan may send the part above its issuers' caps through the company's bank wire
   allowedRouteIds?: string[];         // dispatcher restricts re-planning to the user's approved routes
@@ -153,7 +157,7 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
 
 export interface Priced {
   routeId: string; label: string; kind: string; token?: string; network?: string; x402Executable: boolean; steps: string[];
-  amount: string; quote: any; arrivalUtc: string; costMinor: bigint; timeCostMinor: bigint; scoreMinor: bigint; eligible: boolean; reason?: string;
+  amount: string; quote: any; arrivalUtc: string; costMinor: bigint; timeCostMinor: bigint; scoreMinor: bigint; eligible: boolean; reason?: string; exposure?: ExposureLeg;
 }
 
 function price(r: Route, it: Intent, amount: string, now: Date, deadline?: Date): Priced {
@@ -166,7 +170,8 @@ function price(r: Route, it: Intent, amount: string, now: Date, deadline?: Date)
   const arrival = r.arrival(now);
   const S = BigInt(quote.sourceDebit.minor), net = BigInt(quote.recipientNet.minor);
   const days = Math.max(0, (arrival.getTime() - now.getTime()) / 86400e3);
-  const time = (S * BigInt(Math.round(PLATFORM.timeValueBpsPerDay * days * 100))) / 1_000_000n;
+  const dailyBps = it.costOfCashPct === undefined ? PLATFORM.timeValueBpsPerDay : it.costOfCashPct * 100 / 365;
+  const time = (S * BigInt(Math.round(dailyBps * days * 100))) / 1_000_000n;
   const netInSrc = convert(net, it.destCcy, it.srcCcy, mid(it.destCcy, it.srcCcy, o)).minor;
   const binding = it.amountType === "RECIPIENT_FIXED" ? S : -netInSrc;
   // balanced (default): money cost + time value of a slower arrival. cheapest: money only. fastest: sorted by arrival.
@@ -176,12 +181,20 @@ function price(r: Route, it: Intent, amount: string, now: Date, deadline?: Date)
   if (sizeUsd > r.capacityUsd) return fail(`exceeds provider capacity (${r.capacityUsd.toLocaleString()} USD-eq); a split may help`);
   const issuer = issuerOfCoins(r.coins), room = issuer ? it.issuerHeadroomUsd?.[issuer] : undefined;
   if (room !== undefined && sizeUsd > room) return fail(`exceeds provider capacity (${issuer} issuer cap: ${Math.max(0, Math.round(room)).toLocaleString()} USD left); a split across issuers may help`);
+  if (issuer) {
+    out.exposure = { issuer, issuers: [...new Set(r.coins.map((c) => STABLECOINS[c]?.issuer ?? c))], amountUsd: usdOf(quote.sourceDebit.display.split(" ")[0], it.srcCcy, o),
+      durationHours: Math.max(0, days * 24), capacityUsd: r.capacityUsd,
+      liquidityKey: `${r.coins.join(">")}:${r.routeId.split(":").at(-1)}` };
+    if (it.exposureContext) {
+      const check = assessExposure(it.exposureContext, [out.exposure]);
+      if (!check.ok) return fail(`exceeds provider capacity (${check.reason}); a split may help`);
+    }
+  }
   if (deadline && arrival.getTime() + (it.deadlineBufferMinutes ?? 0) * 60_000 > deadline.getTime()) return fail(`arrives ${arrival.toISOString()}, cannot meet recipient deadline ${deadline.toISOString()}${it.deadlineBufferMinutes ? ` with ${it.deadlineBufferMinutes} min buffer` : ""}`);
   if (r.pegDeviation > STABILITY.maxPegDeviation) return fail(`${r.coins.join("/")} is ${r.pegDeviation} off peg (limit ${STABILITY.maxPegDeviation}): not stable enough`);
   return out;
 }
 
-const better = (a: bigint, b: bigint) => a < b;
 const pick = (xs: Priced[], cmp: (a: Priced, b: Priced) => number) => {
   const p = [...xs].sort(cmp)[0];
   return p ? { routeId: p.routeId, label: p.label, sourceDebit: p.quote.sourceDebit.display, recipientNet: p.quote.recipientNet.display, arrivalUtc: p.arrivalUtc } : null;
@@ -191,7 +204,8 @@ export function optimize(it: Intent) {
   const now = new Date(it.nowUtc ?? planningNow());
   const deadline = it.deadlineUtc ? new Date(it.deadlineUtc) : undefined;
   if (!Number.isFinite(now.getTime()) || (deadline && !Number.isFinite(deadline.getTime()))
-    || !Number.isFinite(it.deadlineBufferMinutes ?? 0) || (it.deadlineBufferMinutes ?? 0) < 0)
+    || !Number.isFinite(it.deadlineBufferMinutes ?? 0) || (it.deadlineBufferMinutes ?? 0) < 0
+    || (it.costOfCashPct !== undefined && (!Number.isFinite(it.costOfCashPct) || it.costOfCashPct < 0)))
     return { status: "MISSING_INPUT", missing: ["valid planning time, recipient deadline and non-negative buffer are required"] };
   const { routes, missing, unpriced } = enumerateRoutes(it);
   if (missing.length) return { status: "MISSING_INPUT", missing };
@@ -204,55 +218,52 @@ export function optimize(it: Intent) {
   const usable = routes.filter((r) => (!it.liveOnly || r.kind === "bank" || r.x402Executable) && fromProvider(r.routeId)
     && (!it.allowedRouteIds || it.allowedRouteIds.includes(r.routeId)) && (process.env.LOCAL_ROUTING !== "1" || r.kind === "bank"));
   const priced = usable.map((r) => price(r, it, it.amount, now, deadline));
-  const eligible = priced.filter((p) => p.eligible && !complement(p.routeId)).sort((a, b) => (it.objective === "fastest"
-    ? a.arrivalUtc.localeCompare(b.arrivalUtc) || Number(a.scoreMinor - b.scoreMinor) : Number(a.scoreMinor - b.scoreMinor)));
-  const bestUnsplit = eligible[0];
-
-  // ---- split search (A8): size-specific quotes per child, fixed fees counted per child, exposure caps
-  let bestSplit: { children: Priced[]; scoreMinor: bigint; arrivalUtc: string } | undefined;
-  if (it.allowSplit !== false) {
-    const pool = priced.filter((p) => p.quote && (p.eligible || p.reason?.startsWith("exceeds provider capacity")))
-      .sort((a, b) => Number(a.scoreMinor - b.scoreMinor)).slice(0, 6);
-    const ccy = it.amountType === "SOURCE_FIXED" ? it.srcCcy : it.destCcy, total = toMinor(it.amount, ccy);
-    const dec = decimals(ccy), str = (m: bigint) => { const s = m.toString().padStart(dec + 1, "0"); return dec ? `${s.slice(0, -dec)}.${s.slice(-dec)}` : s; };
-    const shares2 = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((x) => [x, 10 - x]);
-    const shares3 = [[2, 2, 6], [2, 4, 4], [2, 6, 2], [4, 2, 4], [4, 4, 2], [6, 2, 2], [2, 3, 5], [3, 3, 4], [5, 3, 2], [4, 3, 3]];
-    const tryCombo = (rs: Route[], shares: number[]) => {
-      if (rs.every((r) => complement(r.routeId))) return;   // a stablecoin plan needs at least one stablecoin leg
-      const amts = shares.map((s) => (total * BigInt(s)) / 10n); amts[amts.length - 1] = total - amts.slice(0, -1).reduce((x, y) => x + y, 0n);
-      const kids: Priced[] = [];
-      for (let i = 0; i < rs.length; i++) {
-        const p = price(rs[i], it, str(amts[i]), now, deadline);
-        if (!p.eligible) return;
-        kids.push(p);
-      }
-      // legs with the same issuer share that issuer's headroom under the company's cap
-      if (it.issuerHeadroomUsd) {
-        const per: Record<string, number> = {};
-        rs.forEach((r, i) => { const iss = issuerOfCoins(r.coins); if (iss) per[iss] = (per[iss] ?? 0) + (it.amountType === "SOURCE_FIXED" ? usdOf(str(amts[i]), it.srcCcy, it.midOverrides ?? {}) : usdOf(str(amts[i]), it.destCcy, it.midOverrides ?? {})); });
-        if (Object.entries(per).some(([iss, v]) => it.issuerHeadroomUsd![iss] !== undefined && v > it.issuerHeadroomUsd![iss])) return;
-      }
-      // legs converting through the same venue (e.g. USDC>XSGD on two networks) draw on one order book: they share its depth
-      const venue: Record<string, { used: number; cap: number }> = {};
-      rs.forEach((r, i) => { if (r.coins.length < 2) return; const k = r.coins.join(">"), v = venue[k] ??= { used: 0, cap: r.capacityUsd };
-        v.used += it.amountType === "SOURCE_FIXED" ? usdOf(str(amts[i]), it.srcCcy, it.midOverrides ?? {}) : usdOf(str(amts[i]), it.destCcy, it.midOverrides ?? {}); v.cap = Math.min(v.cap, r.capacityUsd); });
-      if (Object.values(venue).some((v) => v.used > v.cap)) return;
-      const score = kids.reduce((s, k) => s + k.scoreMinor, 0n);
-      const arrivalUtc = kids.map((k) => k.arrivalUtc).sort().at(-1)!;
-      if (!bestSplit || (it.objective === "fastest" ? arrivalUtc < bestSplit.arrivalUtc || (arrivalUtc === bestSplit.arrivalUtc && better(score, bestSplit.scoreMinor))
-        : better(score, bestSplit.scoreMinor))) bestSplit = { children: kids, scoreMinor: score, arrivalUtc };
-    };
-    const R = pool.map((p) => usable.find((r) => r.routeId === p.routeId)!);
-    for (let i = 0; i < R.length; i++) for (let j = 0; j < R.length; j++) if (i !== j) for (const s of shares2) tryCombo([R[i], R[j]], s);
-    for (let i = 0; i < R.length; i++) for (let j = i + 1; j < R.length; j++) for (let k = j + 1; k < R.length; k++) for (const s of shares3) tryCombo([R[i], R[j], R[k]], s);
-  }
-
-  const useSplit = bestSplit && (!bestUnsplit || (it.objective === "fastest" ? bestSplit.arrivalUtc < bestUnsplit.arrivalUtc
-    || (bestSplit.arrivalUtc === bestUnsplit.arrivalUtc && better(bestSplit.scoreMinor, bestUnsplit.scoreMinor)) : better(bestSplit.scoreMinor, bestUnsplit.scoreMinor)));
-  const chosen: Priced[] | undefined = useSplit ? bestSplit!.children : bestUnsplit ? [bestUnsplit] : undefined;
   const baselineId = it.currentBank ? "bank:current_bank" : "bank:legacy_wire";
   const baseline = priced.find((p) => p.routeId === baselineId)
-    ?? routes.filter((r) => r.routeId === baselineId).map((r) => price(r, it, it.amount, now, undefined))[0];   // baseline even if filtered by liveOnly
+    ?? routes.filter((r) => r.routeId === baselineId).map((r) => price(r, it, it.amount, now, undefined))[0];
+  const eligible = priced.filter((p) => p.eligible && !complement(p.routeId));
+  const scorePlan = (children: Priced[]): ScoredPlan => {
+    const debit = children.reduce((s, c) => s + BigInt(c.quote.sourceDebit.minor), 0n);
+    const net = children.reduce((s, c) => s + BigInt(c.quote.recipientNet.minor), 0n);
+    const savingsMinor = !baseline?.quote ? 0n : it.amountType === "RECIPIENT_FIXED" ? BigInt(baseline.quote.sourceDebit.minor) - debit
+      : convert(net - BigInt(baseline.quote.recipientNet.minor), it.destCcy, it.srcCcy, mid(it.destCcy, it.srcCcy, it.midOverrides ?? {})).minor;
+    const railDebit = children.filter((c) => c.kind === "stablecoin").reduce((s, c) => s + BigInt(c.quote.sourceDebit.minor), 0n);
+    const pctFee = railDebit * BigInt(PLATFORM.feeBpsOfRailVolume) / 10000n, feeCap = savingsMinor > 0n ? savingsMinor / 2n : 0n;
+    const feeMinor = pctFee < feeCap ? pctFee : feeCap;
+    const moneyCostMinor = children.reduce((s, c) => s + c.costMinor, 0n) + feeMinor;
+    const timeCostMinor = children.reduce((s, c) => s + c.timeCostMinor, 0n);
+    return { children, savingsMinor, feeMinor, moneyCostMinor, timeCostMinor, scoreMinor: moneyCostMinor + timeCostMinor,
+      arrivalUtc: children.map((c) => c.arrivalUtc).sort().at(-1)! };
+  };
+  const feasible = (kids: Priced[], complete: boolean) => {
+    if (!kids.length || kids.some((p) => !p.eligible)) return false;
+    if (complete && kids.every((p) => complement(p.routeId))) return false;
+    const issuers: Record<string, number> = {}, venues: Record<string, { used: number; cap: number }> = {};
+    for (const kid of kids) {
+      const e = kid.exposure; if (!e) continue;
+      for (const issuer of e.issuers ?? [e.issuer]) issuers[issuer] = (issuers[issuer] ?? 0) + e.amountUsd;
+      if (e.liquidityKey && e.capacityUsd !== undefined) {
+        const v = venues[e.liquidityKey] ??= { used: 0, cap: e.capacityUsd };
+        v.used += e.amountUsd; v.cap = Math.min(v.cap, e.capacityUsd);
+      }
+    }
+    if (Object.entries(issuers).some(([issuer, used]) => it.issuerHeadroomUsd?.[issuer] !== undefined && used > it.issuerHeadroomUsd[issuer] + 0.000001)) return false;
+    if (Object.values(venues).some((v) => v.used > v.cap + 0.000001)) return false;
+    return !it.exposureContext || assessExposure(it.exposureContext, kids.flatMap((k) => k.exposure ? [k.exposure] : [])).ok;
+  };
+  const ccy = it.amountType === "SOURCE_FIXED" ? it.srcCcy : it.destCcy, total = toMinor(it.amount, ccy), dec = decimals(ccy);
+  const str = (m: bigint) => { const s = m.toString().padStart(dec + 1, "0"); return dec ? `${s.slice(0, -dec)}.${s.slice(-dec)}` : s; };
+  const byId = new Map(usable.map((r) => [r.routeId, r])), memo = new Map<string, Priced>();
+  for (const p of priced) memo.set(`${p.routeId}:${total}`, p);
+  const searched = searchAllocations({ total, allowSplit: it.allowSplit !== false,
+    routeIds: priced.filter((p) => p.quote && (p.eligible || p.reason?.startsWith("exceeds provider capacity"))).map((p) => p.routeId),
+    price: (id, amount) => { const key = `${id}:${amount}`; let p = memo.get(key);
+      if (!p) { p = price(byId.get(id)!, it, str(amount), now, deadline); memo.set(key, p); } return p; },
+    feasible, score: scorePlan });
+  const objective = it.objective ?? "balanced", winner = searched.best[objective];
+  const bestUnsplit = searched.singles[objective]?.children[0];
+  const chosen = winner?.children, useSplit = chosen && chosen.length > 1;
+
   if (!chosen) return { status: "HOLD", reason: process.env.LOCAL_ROUTING === "1" && it.provider === "stablecoin" ? "stablecoin settlement disabled in LOCAL_ROUTING; use simulated bank routes"
     : priced.length ? [...new Set(priced.map((p) => `${p.label}: ${p.reason}`))].join("; ")
     : it.provider === "tokenized_deposit" ? (tokenizedUnavailable(it.srcCcy, it.destCcy, it.beneficiary?.country) ?? "no tokenized route meets this payment's deadline") : it.provider === "stablecoin" ? (unpriced.length ? unpriced.join("; ") : `our stablecoin rail has no published-price route to ${it.destCcy} yet`) : "no eligible route or allocation",
@@ -280,21 +291,29 @@ export function optimize(it: Intent) {
     return fair > 0n ? Number(((fair - n) * 1000000n) / fair) / 100 : 0;
   };
   const bankBasis = it.srcCcy === it.destCcy ? { bps: 0, basis: "no FX (same currency): wire fee only" } : it.currentBank?.measured ? bankMarkup(it.srcCcy, it.destCcy, it.currentBank.fxMarkupBps) : it.currentBank ? { bps: it.currentBank.fxMarkupBps, basis: "company-entered rate" } : null;
+  const summary = (p?: ScoredPlan) => p ? { routeId: p.children.map((c) => c.routeId).join("+"),
+    sourceDebit: fmt(p.children.reduce((s, c) => s + BigInt(c.quote.sourceDebit.minor), 0n), it.srcCcy),
+    recipientNet: fmt(p.children.reduce((s, c) => s + BigInt(c.quote.recipientNet.minor), 0n), it.destCcy), arrivalUtc: p.arrivalUtc,
+    moneyCostMinor: p.moneyCostMinor.toString(), timeCostMinor: p.timeCostMinor.toString(), combinedCostMinor: p.scoreMinor.toString(),
+    platformFee: fmt(p.feeMinor, it.srcCcy), sourceCcy: it.srcCcy, legs: p.children.length } : null;
   return {
     status: "OK", decisionRecordId: `dr_${Date.now().toString(36)}`, intent: it, unpriced,
+    exposure: it.exposureContext ? assessExposure(it.exposureContext, chosen.flatMap((c) => c.exposure ? [c.exposure] : [])) : null,
     timing: { plannedAtUtc: now.toISOString(), deadlineUtc: it.deadlineUtc ?? null, bufferMinutes: it.deadlineBufferMinutes ?? 0,
       latestStartUtc: deadline ? chosen.map((c) => latestStart(usable.find((r) => r.routeId === c.routeId)!.arrival, now, deadline, it.deadlineBufferMinutes)).sort()[0] : null,
       dispatch: "immediate_after_approval", arrivalUtc: latest, meetsDeadline: true },
     simulation: process.env.LOCAL_ROUTING === "1",
     provenance: { midRates: `${MARKET.mode}: ${it.srcCcy} ${midInfo(it.srcCcy).source}, ${it.destCcy} ${midInfo(it.destCcy).source}`,
                   bankBaseline: bankBasis ? `${bankBasis.bps} bps: ${bankBasis.basis}` : "none", ourRouteCosts: "stablecoin rail: sourced fees (Circle Mint redemption terms, network fees); local-coin conversion only at an entered venue quote" },
-    costVsMidBps: { plan: bps(debit, net), bank: baseline?.quote ? bps(BigInt(baseline.quote.sourceDebit.minor), BigInt(baseline.quote.recipientNet.minor)) : null },
+    costVsMidBps: { plan: bps(debit, net), withPlatformFee: bps(debit + feeMinor, net), bank: baseline?.quote ? bps(BigInt(baseline.quote.sourceDebit.minor), BigInt(baseline.quote.recipientNet.minor)) : null },
     objective: it.objective ?? "balanced", plan: useSplit ? "split" : "single",
-    allocations: chosen.map((c) => ({ routeId: c.routeId, label: c.label, token: c.token, network: c.network,
+    selection: summary(winner),
+    search: { method: "all available routes, capacity boundaries and interior samples", maxLegs: 3, plansEvaluated: searched.evaluated,
+      assurance: "Best evaluated feasible plan; quotes, available routes and the three-leg search limit define the comparison." },
+    allocations: chosen.map((c) => ({ routeId: c.routeId, label: c.label, token: c.token, network: c.network, exposure: c.exposure,
       x402Executable: c.x402Executable, amount: c.amount, quote: c.quote, arrivalUtc: c.arrivalUtc, steps: c.steps })),
-    cheapest: pick(eligible, (a, b) => Number(a.costMinor - b.costMinor)),
-    fastest: pick(eligible, (a, b) => a.arrivalUtc.localeCompare(b.arrivalUtc) || Number(a.costMinor - b.costMinor)),
-    bestX402: pick(eligible.filter((p) => p.x402Executable), (a, b) => Number(a.scoreMinor - b.scoreMinor)),
+    cheapest: summary(searched.best.cheapest), fastest: summary(searched.best.fastest), balanced: summary(searched.best.balanced),
+    bestX402: pick(eligible.filter((p) => p.x402Executable), (a, b) => comparePlans(scorePlan([a]), scorePlan([b]), objective)),
     execution: chosen.every((c) => c.x402Executable || c.kind === "bank")
       ? "executable: stablecoin legs fund via real x402 (testnet); bank legs simulated"
       : "winner uses a rail without a live adapter: it executes as a labeled simulation (use liveOnly for the best x402-executable plan)",

@@ -249,7 +249,7 @@ async def on_procure(ctx: Context, sender: str, msg: ProcureRequest):
     """RoutingAgent: for every payment, buys a quote from EACH provider (our stablecoin rail and the company's own bank;
     separate x402 sellers, separate payees),
     asks ComplianceAgent for a paid supplier screen (agent-to-agent), then chooses one provider under the company's
-    policy (cheapest | fastest | lowest_risk) or holds the payment."""
+    policy (balanced | cheapest | fastest | lowest_risk) or holds the payment."""
     corr, pays, policy = msg.correlationId, msg.payments, msg.policy
     log(ctx, corr, f"{len(pays)} payment(s), policy '{policy}': buying {len(pays) * len(PROVIDER_IDS)} provider quotes via x402; "
                    f"asking compliance agent to screen suppliers")
@@ -261,7 +261,7 @@ async def on_procure(ctx: Context, sender: str, msg: ProcureRequest):
         # invoice payments fix what the supplier receives; a budget payment (amountType SOURCE_FIXED) fixes what the company sends
         amount_type = p.get("amountType") if p.get("amountType") in ("RECIPIENT_FIXED", "SOURCE_FIXED") else "RECIPIENT_FIXED"
         return {"srcCcy": msg.srcCcy, "destCcy": p["destCcy"], "amountType": amount_type, "amount": p["amount"],
-                "deadlineUtc": p.get("deadlineUtc"), "objective": "fastest" if policy == "fastest" else "cheapest", "currentBank": msg.currentBank,
+                "deadlineUtc": p.get("deadlineUtc"), "objective": policy if policy in ("balanced", "cheapest", "fastest") else "cheapest", "currentBank": msg.currentBank,
                 "beneficiary": ben, "beneficiaryAcceptsUsdc": bool(ben.get("usdcWallet")), "reference": p.get("reference") or p["payable"]}
     jobs = [(i, pid) for i in range(len(pays)) for pid in PROVIDER_IDS]
     quotes_task = asyncio.ensure_future(asyncio.gather(*(backend.paid_call(f"quote:{pid}", body(pays[i]), corr, "routing-agent") for i, pid in jobs)))

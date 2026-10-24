@@ -3,9 +3,10 @@
 // rail is paused whenever the live price leaves the company's band. Two public price sources are read; the one furthest
 // from 1.00 decides (the cautious choice). No price at all = paused when the policy says fail closed (the default).
 // DEPEG_TEST_PRICE overrides the feed for tests and is always labelled as a test override.
-import { loadPolicy, loadRequests, type Policy } from "../company/controls.js";
-import { load } from "./store.js";
+import { issuerCapFor, loadPolicy, type Policy } from "../company/controls.js";
 import { STABLECOINS } from "./compliance.js";
+import { assessExposure } from "./exposure.js";
+import { exposureContext, exposureLeg } from "./exposureState.js";
 
 export interface PegCheck { status: "ok" | "paused" | "unknown"; price?: number; deviationPct?: number; bandPct: number;
   sources: { name: string; price?: number; error?: string }[]; reason?: string; at: string; test?: boolean }
@@ -49,46 +50,43 @@ export async function usdcPeg(p: Policy = loadPolicy()): Promise<PegCheck> {
 
 /** USD value currently in flight or in escrow with each stablecoin issuer, from each request's own route legs. */
 export function issuerInFlight(excludeRequestId?: string): Record<string, number> {
-  const db = load(), out: Record<string, number> = {};
-  for (const r of Object.values(loadRequests())) {
-    if (r.id === excludeRequestId || !(["READY", "EXECUTING"].includes(r.status) || (r.status === "AWAITING_DELIVERY" && r.escrow?.state === "LOCKED"))) continue;
-    const legs: any[] = db.intents[r.intentId]?.decision?.allocations ?? [];
-    for (const a of legs.length ? legs : [{ routeId: r.route, quote: { sourceDebit: { display: `${r.debitUsd} USD` } } }]) {
-      const coin = String(a.routeId ?? "").startsWith("coin:") ? String(a.routeId).split(":")[1].split(">")[0] : null; if (!coin) continue;
-      const iss = STABLECOINS[coin]?.issuer ?? coin; out[iss] = (out[iss] ?? 0) + Number(String(a.quote?.sourceDebit?.display ?? "0").split(" ")[0]);
-    }
-  }
-  return out;
+  return exposureContext(loadPolicy(), excludeRequestId).usedUsd;
 }
 /** USD value in flight or in escrow with Circle (USDC), kept for the USDC escrow and the dashboard. */
 export const usdcInFlight = (excludeRequestId?: string) => issuerInFlight(excludeRequestId).Circle ?? 0;
-/** How much more each issuer may hold under the company's per-issuer cap (the same cap applies to every issuer). */
+/** How much more each issuer may hold under its override, or the company's default cap. */
 export function issuerHeadroom(p: Policy = loadPolicy(), excludeRequestId?: string): Record<string, number> {
   const used = issuerInFlight(excludeRequestId), out: Record<string, number> = {};
-  for (const iss of new Set(Object.values(STABLECOINS).map((x) => x.issuer))) out[iss] = Math.max(0, p.issuerCapUsd - (used[iss] ?? 0));
+  for (const iss of new Set(Object.values(STABLECOINS).map((x) => x.issuer))) out[iss] = Math.max(0, issuerCapFor(p, iss) - (used[iss] ?? 0));
   return out;
 }
 /** May this plan's stablecoin legs go now? The USDC price breaker (when a leg holds USDC) and each issuer's cap. */
-export async function stablecoinPlanAllowed(allocations: any[], excludeRequestId?: string) {
+export async function stablecoinPlanAllowed(allocations: any[], excludeRequestId?: string, excludeTransferId?: string, escrowHours = 0) {
   const p = loadPolicy(), per: Record<string, number> = {}, coins = new Set<string>();
   for (const a of allocations) {
     const id = String(a.routeId ?? ""); if (!id.startsWith("coin:")) continue;
-    const coin = id.split(":")[1].split(">")[0]; coins.add(coin);
-    const iss = STABLECOINS[coin]?.issuer ?? coin; per[iss] = (per[iss] ?? 0) + Number(String(a.quote?.sourceDebit?.display ?? a.sourceDebit ?? "0").split(" ")[0]);
+    for (const coin of id.split(":")[1].split(">")) coins.add(coin);
+    const leg = exposureLeg(a)!;
+    for (const iss of leg.issuers ?? [leg.issuer]) per[iss] = (per[iss] ?? 0) + leg.amountUsd;
   }
   const peg = coins.has("USDC") ? await usdcPeg(p) : null;
   if (peg?.status === "paused") return { ok: false, reason: `USDC route paused: ${peg.reason}`, peg, perIssuer: per };
-  const used = issuerInFlight(excludeRequestId);
-  for (const [iss, v] of Object.entries(per)) if ((used[iss] ?? 0) + v > p.issuerCapUsd)
-    return { ok: false, reason: `issuer cap: ${Math.round(used[iss] ?? 0).toLocaleString()} USD already in flight with ${iss} + ${Math.round(v).toLocaleString()} USD would exceed the ${p.issuerCapUsd.toLocaleString()} USD per-issuer limit`, peg, perIssuer: per };
-  return { ok: true, peg, perIssuer: per };
+  const context = exposureContext(p, excludeRequestId, excludeTransferId, escrowHours), used = context.usedUsd;
+  for (const [iss, v] of Object.entries(per)) {
+    const cap = issuerCapFor(p, iss);
+    if ((used[iss] ?? 0) + v > cap)
+      return { ok: false, reason: `issuer cap: ${Math.round(used[iss] ?? 0).toLocaleString()} USD already in flight with ${iss} + ${Math.round(v).toLocaleString()} USD would exceed the ${cap.toLocaleString()} USD limit for ${iss}`, peg, perIssuer: per };
+  }
+  const adaptive = assessExposure(context, allocations.map((a) => exposureLeg(a, context.settings.baseHours)).filter((a) => a !== null));
+  if (!adaptive.ok) return { ok: false, reason: adaptive.reason, peg, perIssuer: per, adaptive };
+  return { ok: true, peg, perIssuer: per, adaptive };
 }
 
 /** May a stablecoin payment of `amountUsd` go now? Checks the peg and the issuer cap. */
 export async function usdcRouteAllowed(amountUsd: number, excludeRequestId?: string) {
-  const p = loadPolicy(), peg = await usdcPeg(p), inFlight = usdcInFlight(excludeRequestId);
-  if (peg.status === "paused") return { ok: false, reason: `USDC route paused: ${peg.reason}`, peg, inFlight, cap: p.issuerCapUsd };
-  if (inFlight + amountUsd > p.issuerCapUsd)
-    return { ok: false, reason: `issuer cap: ${Math.round(inFlight).toLocaleString()} USD already in flight with Circle (USDC) + ${Math.round(amountUsd).toLocaleString()} USD would exceed the ${p.issuerCapUsd.toLocaleString()} USD limit`, peg, inFlight, cap: p.issuerCapUsd };
-  return { ok: true, peg, inFlight, cap: p.issuerCapUsd };
+  const p = loadPolicy(), peg = await usdcPeg(p), inFlight = usdcInFlight(excludeRequestId), cap = issuerCapFor(p, "Circle");
+  if (peg.status === "paused") return { ok: false, reason: `USDC route paused: ${peg.reason}`, peg, inFlight, cap };
+  if (inFlight + amountUsd > cap)
+    return { ok: false, reason: `issuer cap: ${Math.round(inFlight).toLocaleString()} USD already in flight with Circle (USDC) + ${Math.round(amountUsd).toLocaleString()} USD would exceed the ${cap.toLocaleString()} USD limit`, peg, inFlight, cap };
+  return { ok: true, peg, inFlight, cap };
 }

@@ -247,26 +247,30 @@ function nextStep(r) {
 let SORT = "cost";
 async function pageCompare(P) {
   const d = DRAFT, b = billOf(d.billId);
+  SORT = d.routingObjective === "fastest" ? "speed" : d.routingObjective === "cheapest" ? "recipient" : "cost";
   if (!b) { location.hash = "#/payments/new"; return; }
-  const key = `${d.billId}|${d.mode}|${d.budgetUsd}|${d.due}`;
+  const key = quoteKey(d);
   if (DRAFT.key !== key) { DRAFT = { ...d, key, routes: null, agent: null, agentErr: null, selected: null }; saveDraft(); }
   renderCompare(P);
   if (!DRAFT.routes) {
-    const qs = `?due=${encodeURIComponent(DRAFT.due)}${DRAFT.mode === "budget" ? `&mode=budget&usd=${DRAFT.budgetUsd}` : ""}`;
-    try { DRAFT.routes = await api(`/routes/${encodeURIComponent(b.id)}${qs}`); saveDraft(); } catch (e) { DRAFT.routesErr = e.message; }
+    const qs = `?due=${encodeURIComponent(DRAFT.due)}&objective=${DRAFT.routingObjective ?? "balanced"}${DRAFT.mode === "budget" ? `&mode=budget&usd=${DRAFT.budgetUsd}` : ""}`;
+    try { const routes = await api(`/routes/${encodeURIComponent(b.id)}${qs}`); if (DRAFT.key !== key) return; DRAFT.routes = routes; saveDraft(); }
+    catch (e) { if (DRAFT.key !== key) return; DRAFT.routesErr = e.message; }
     renderCompare(P);
   }
   if (!DRAFT.agent && !DRAFT.agentErr) runAgents(P);
 }
 // Agents for the draft (paid quotes + supplier screen); shared by the compare step and the Manual payment page
 async function runAgents(P, render = renderCompare, page = "#/payments/compare") {
+  const requestKey = DRAFT.key;
   DRAFT.agentBusy = true; render(P);
   try {
-    const a = await api("/review", { payable: DRAFT.billId, mode: DRAFT.mode, usd: DRAFT.budgetUsd, due: DRAFT.due, policy: SORT === "speed" ? "fastest" : "cheapest" });
+    const a = await api("/review", { payable: DRAFT.billId, mode: DRAFT.mode, usd: DRAFT.budgetUsd, due: DRAFT.due, policy: DRAFT.routingObjective ?? "balanced" });
+    if (DRAFT.key !== requestKey) return;
     if (a.status === "error") throw new Error(a.error);
     DRAFT.agent = { ...a, decision: a.decisions?.[0] }; DRAFT.agentErr = null;
     if (!DRAFT.selected && DRAFT.agent.decision?.chosen) DRAFT.selected = DRAFT.agent.decision.chosen;
-  } catch (e) { DRAFT.agentErr = e.message; }
+  } catch (e) { if (DRAFT.key !== requestKey) return; DRAFT.agentErr = e.message; }
   DRAFT.agentBusy = false; saveDraft();
   if (location.hash.startsWith(page)) render(P);
 }
@@ -274,7 +278,7 @@ function ranked() {
   const R = DRAFT.routes; if (!R) return [];
   const ok = R.routes.filter((r) => r.status === "OK"), budget = DRAFT.mode === "budget";
   const k = { cost: (r) => r.economics.allInUsd, recipient: (r) => (budget ? -num(r.supplierGets) : num(r.youPay)), speed: (r) => Date.parse(r.arrivalUtc) };
-  return [...ok.sort((a, c) => k[SORT](a) - k[SORT](c)), ...R.routes.filter((r) => r.status !== "OK")];
+  return [...ok.sort((a, c) => SORT === "recipient" ? k[SORT](a) - k[SORT](c) : compareRouteOptions(a, c, SORT === "speed" ? "fastest" : "balanced")), ...R.routes.filter((r) => r.status !== "OK")];
 }
 function renderCompare(P) {
   const d = DRAFT, b = billOf(d.billId), R = d.routes, list = ranked(), ok = list.filter((r) => r.status === "OK");
@@ -305,6 +309,8 @@ function renderCompare(P) {
       <div class="row2 total"><span>All-in cost</span><b>${usd(e.allInUsd, 2)}</b></div><hr/>
       <div class="elig">✓ Eligible · ${r.provider === "stablecoin" ? "supplier accepts USDC" : r.provider === "tokenized_deposit" ? "bank deposit on your bank's ledger, 24/7" : "saved receiving details"}${opt ? ` · agent risk ${opt.risk}/5` : ""}</div>
       ${passed ? `<div class="elig" title="${esc((r.compliance ?? []).map((c) => `${c.label}: ${c.detail}`).join(" · "))}">✓ Compliance: ${passed} check${passed === 1 ? "" : "s"} passed</div>` : ""}
+      ${exposureNote(r)}
+      ${e.platformFeeUsd ? `<div class="row2"><span>Route402 fee (included in comparison)</span><b>${usd(e.platformFeeUsd, 2)}</b></div>` : ""}
       <div class="rel">Historical reliability: not available. No verified provider performance history.</div>
       ${isSel ? `<button class="btn primary select" disabled>✓ ${RAIL[r.provider]} selected</button>` : `<button class="btn select" data-pick="${r.provider}">Select route</button>`}</div>`;
   };
@@ -334,7 +340,9 @@ function renderCompare(P) {
     <div class="mid"><b>${sel ? `${RAIL[sel.provider]} selected · ${budget ? `${money(sel.supplierGets)} estimated` : `${money(sel.youPay)} debit`}` : "Select a route"}</b><span>Selection does not execute a payment. Review and deliberate approval come next.</span></div>
     <button class="btn primary" id="cont" ${canContinue() ? "" : "disabled"}>Continue to review →</button></div>${foot()}`;
   $$("[data-pick]").forEach((x) => x.onclick = () => { DRAFT.selected = x.dataset.pick; saveDraft(); renderCompare(P); });
-  $$("[data-sort]").forEach((x) => x.onclick = () => { SORT = x.dataset.sort; renderCompare(P); });
+  $$("[data-sort]").forEach((x) => x.onclick = () => { SORT = x.dataset.sort;
+    DRAFT.routingObjective = SORT === "speed" ? "fastest" : SORT === "recipient" ? "cheapest" : "balanced";
+    DRAFT.key = null; DRAFT.agentBusy = false; saveDraft(); pageCompare(P); });
   $("#retry-agents")?.addEventListener("click", () => { DRAFT.agentErr = null; runAgents(P); });
   $("#cont")?.addEventListener("click", () => { location.hash = "#/payments/review"; });
 }
@@ -431,7 +439,7 @@ $("#open-policy").addEventListener("click", () => {
       <div class="field"><label><input type="checkbox" name="requireCallbackOnDetailsChange" ${p.requireCallbackOnDetailsChange ? "checked" : ""} ${dis} /> Require a call-back when a supplier's bank details change</label></div>
       ${nf("requoteTolerancePct", "Re-approve if an expired quote moves more than (%)", "0.1")}${nf("depegBandPct", "Pause the USDC route if its price is further than (%) from 1.00", "0.1")}
       <div class="field"><label><input type="checkbox" name="depegFailClosed" ${p.depegFailClosed ? "checked" : ""} ${dis} /> Also pause it when no live USDC price can be read</label></div>
-      ${nf("issuerCapUsd", "Most in flight or in escrow with any one stablecoin issuer, e.g. Circle or Ripple (USD); bigger payments split across issuers")}${nf("escrowDeadlineDays", "Escrow refundable after (days)")}${nf("fxRiskLimitUsd", "Flag a currency when its 95% FX move on open bills exceeds (USD)")}
+      ${policyIssuerCaps(dis)}${nf("escrowDeadlineDays", "Escrow refundable after (days)")}${nf("fxRiskLimitUsd", "Flag a currency when its 95% FX move on open bills exceeds (USD)")}
       ${nf("lcFeePct", "Your bank's letter-of-credit fee (%), to compare document-checked payments against", "0.05")}
       ${policyTokenized(dis)}${policyCompliance(dis)}
       ${admin ? `<button class="btn primary sm">Save policy</button>` : `<p class="note">${ME ? "Only an admin can change the policy." : "Sign in as an admin to change it."}</p>`}<div id="pol-out"></div></form>
@@ -439,8 +447,17 @@ $("#open-policy").addEventListener("click", () => {
       <td>${u.roles.includes("approver") ? (u.approvalLimitUsd ? usd(u.approvalLimitUsd) : "No limit") : "Cannot approve"}</td></tr>`).join("")}</tbody></table>
     <div style="text-align:right;margin-top:14px"><button class="btn ghost" id="m-x">Close</button></div>`);
   $("#m-x").onclick = closeModal;
+  $("#issuer-default").oninput = (e) => {
+    $$("[data-issuer-cap]").forEach((input) => { input.placeholder = `Default: ${e.target.value}`; });
+  };
   $("#pol").onsubmit = async (e) => { e.preventDefault(); const f = new FormData(e.target), body = {};
     for (const k of ["dualApprovalOverUsd", "requoteTolerancePct", "depegBandPct", "issuerCapUsd", "escrowDeadlineDays", "fxRiskLimitUsd", "lcFeePct"]) body[k] = Number(f.get(k));
+    body.issuerCapsUsd = {};
+    e.target.querySelectorAll("[data-issuer-cap]").forEach((input) => {
+      if (input.value.trim() !== "") body.issuerCapsUsd[input.dataset.issuerCap] = Number(input.value);
+    });
+    body.adaptiveExposure = { enabled: f.get("ax_enabled") === "on", issuerTreasuryPct: Number(f.get("ax_issuerTreasuryPct")),
+      totalTreasuryPct: Number(f.get("ax_totalTreasuryPct")), liquidityUsePct: Number(f.get("ax_liquidityUsePct")), baseHours: Number(f.get("ax_baseHours")) };
     body.requireCallbackOnDetailsChange = f.get("requireCallbackOnDetailsChange") === "on"; body.depegFailClosed = f.get("depegFailClosed") === "on";
     body.tokenized = f.get("tk_network") ? { network: f.get("tk_network"), currencies: f.get("tk_currencies"), countries: f.get("tk_countries"), fxMarginBps: f.get("tk_fx"),
       feeUsd: f.get("tk_fee"), settlementMinutes: f.get("tk_minutes"), tariffSource: f.get("tk_source") } : null;
@@ -448,6 +465,35 @@ $("#open-policy").addEventListener("click", () => {
       travelRuleThresholdUsd: Number(f.get("c_travel")), micaForEea: f.get("c_mica") === "on", requireWalletScreening: f.get("c_screen") === "on" };
     try { POLICY = await api("/policy", body); await loadAll(); $("#pol-out").innerHTML = `<div class="alert ok">Saved and logged.</div>`; } catch (err) { $("#pol-out").innerHTML = `<div class="alert bad">${esc(err.message)}</div>`; } };
 });
+function policyIssuerCaps(dis) {
+  const p = POLICY, groups = {};
+  for (const [coin, info] of Object.entries(STATE?.compliance?.stablecoins ?? {})) (groups[info.issuer] ??= []).push(coin);
+  return `<fieldset class="pol-sec issuer-caps"><legend>Stablecoin issuer limits</legend>
+    <p class="note">Limit the money in flight or in escrow with each issuer. Coins from the same issuer share one limit.</p>
+    <div class="field"><label class="label" for="issuer-default">Default limit per issuer (USD)</label>
+      <input id="issuer-default" type="number" name="issuerCapUsd" min="0" max="${Number.MAX_SAFE_INTEGER}" step="0.01" required value="${p.issuerCapUsd}" ${dis} /></div>
+    <details><summary>Set individual issuer limits</summary>
+      <p class="note">Leave blank to use the default. Enter 0 to block new exposure. These limits are your company's risk settings.</p>
+      <div class="issuer-cap-table"><table class="tbl compact"><thead><tr><th>Issuer / coins</th><th>Custom limit (USD)</th><th>In flight (USD)</th></tr></thead><tbody>
+      ${Object.entries(groups).sort(([a], [b]) => a.localeCompare(b)).map(([issuer, coins]) => `<tr>
+        <td><b>${esc(issuer)}</b><div class="note">${esc(coins.join(", "))}</div></td>
+        <td><input type="number" data-issuer-cap="${esc(issuer)}" aria-label="${esc(issuer)} custom limit in USD" min="0" max="${Number.MAX_SAFE_INTEGER}" step="0.01"
+          value="${esc(p.issuerCapsUsd?.[issuer] ?? "")}" placeholder="Default: ${esc(p.issuerCapUsd)}" ${dis} /></td>
+        <td>${fmt(STATE?.usdc?.byIssuer?.[issuer] ?? 0, 2)}</td></tr>`).join("")}
+      </tbody></table></div></details>
+    ${policyAdaptiveExposure(dis)}
+    <p class="note">Routes use each issuer's remaining room. New limits apply to the next quote and release check.</p></fieldset>`;
+}
+function policyAdaptiveExposure(dis) {
+  const p = POLICY.adaptiveExposure ?? { enabled: false, issuerTreasuryPct: 50, totalTreasuryPct: 75, liquidityUsePct: 80, baseHours: 24 };
+  return `<details class="adaptive-policy"><summary>Adjust limits for each transfer</summary>
+    <label class="note"><input type="checkbox" name="ax_enabled" ${p.enabled ? "checked" : ""} ${dis} /> Use adaptive exposure budgets</label>
+    <p class="note">The issuer limits above remain hard ceilings. Budgets also account for treasury balance, committed transfers, settlement time and shared venue depth. These are company rules, not issuer safety ratings.</p>
+    <div class="pol-grid">${[["issuerTreasuryPct", "Treasury share per issuer (%)", 100], ["totalTreasuryPct", "Treasury share across all stablecoins (%)", 100],
+      ["liquidityUsePct", "Use at most this share of venue depth (%)", 100], ["baseHours", "Base settlement window (hours)", 168]].map(([key, label, max]) => `<div class="field"><label class="label" for="ax-${key}">${esc(label)}</label>
+      <input id="ax-${key}" type="number" name="ax_${key}" min="1" max="${max}" step="1" required value="${p[key]}" ${dis} /></div>`).join("")}</div>
+    <p class="note">A transfer taking twice the base window uses twice the exposure budget. Long escrow locks use their full lock window. Scheduled and unresolved transfers keep their budgets until resolved.</p></details>`;
+}
 $("#open-connect").addEventListener("click", () => {
   modal(`<h2>Connect your bank</h2><div class="dots"><span class="on"></span><span></span><span></span></div>
     <p>Route402 will be able to:</p><ul class="perm"><li>Read account balances</li><li>Read bills and incoming deposits</li><li>Record payments your approvers release</li></ul>

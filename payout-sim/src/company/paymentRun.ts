@@ -4,7 +4,7 @@
 //   3. natural hedge (pay foreign invoices from foreign money already received; convert only the rest)
 //   4. route the remainder through the optimizer
 // Every saving is measured against the company's CURRENT bank, pricing each conversion with the same exact math.
-import { optimize, mid } from "../router/optimizer.js";
+import { optimize, mid, type Intent } from "../router/optimizer.js";
 import { bankMarkup, MARKET, midInfo } from "../router/market.js";
 import { venueQuote } from "../router/registry.js";
 import { convert, fmt, toMinor } from "../money.js";
@@ -18,7 +18,7 @@ export interface PaymentRunInput { company: CompanyProfile; nowUtc: string; paya
 
 type Conv = { costHome: bigint; debitHome: bigint; route: string; arrivalUtc?: string; input?: any; timing?: any; blocked?: boolean; why?: string };
 
-export function runPaymentRun(r: PaymentRunInput) {
+export function runPaymentRun(r: PaymentRunInput, budget: Pick<Intent, "exposureContext" | "issuerHeadroomUsd" | "objective"> = {}) {
   const co = r.company, H = co.homeCcy, now = r.nowUtc;
   const bank = { label: co.currentBank.label, fxMarkupBps: co.currentBank.fxMarkupBps, wireFeeUsd: co.currentBank.wireFeeUsd, businessDays: co.currentBank.businessDays, measured: co.currentBank.measured };
   const midHome = (m: bigint, c: string) => convert(m, c, H, mid(c, H)).minor;
@@ -34,8 +34,8 @@ export function runPaymentRun(r: PaymentRunInput) {
       return { costHome: fee, debitHome: amountMinor + fee, route: "bank:current_bank (domestic)" };
     }
     // Cross-border (incl. USD-invoiced suppliers abroad): our rail vs the company's bank
-    const o: any = optimize({ srcCcy: H, destCcy: ccy, amountType: "RECIPIENT_FIXED", amount: amt, deadlineUtc: viaBank ? undefined : deadline,
-      objective: "balanced", nowUtc: now, currentBank: bank, beneficiaryAcceptsUsdc: !!ben?.usdcWallet });
+    const o: any = optimize({ ...(!viaBank ? budget : {}), srcCcy: H, destCcy: ccy, amountType: "RECIPIENT_FIXED", amount: amt, deadlineUtc: viaBank ? undefined : deadline,
+      objective: budget.objective ?? "balanced", costOfCashPct: co.costOfCashPct, nowUtc: now, currentBank: bank, beneficiaryAcceptsUsdc: !!ben?.usdcWallet });
     const atMid = midHome(amountMinor, ccy);
     if (viaBank) { const d = BigInt(o.baseline.sourceDebitMinor); return { costHome: d - atMid, debitHome: d, route: o.baseline.routeId }; }
     if (o.status !== "OK") {

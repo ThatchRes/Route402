@@ -22,7 +22,10 @@
     "econ:test": "tsx src/econ.selftest.ts",
     "deadline:test": "tsx src/deadline.selftest.ts",
     "context:test": "tsx src/context.selftest.ts",
-    "security:test": "tsx src/security.selftest.ts"
+    "security:test": "tsx src/security.selftest.ts",
+    "issuer:test": "tsx src/issuer.selftest.ts",
+    "exposure:test": "tsx src/exposure.selftest.ts",
+    "optimization:test": "tsx src/optimization.selftest.ts"
   },
   "dependencies": {
     "dotenv": "16.4.5",

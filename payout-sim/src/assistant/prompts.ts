@@ -3,10 +3,11 @@
 // Every result is a PREVIEW; executing always needs an explicit approval step.
 import { runPaymentRun } from "../company/paymentRun.js";
 import { validate } from "../company/validate.js";
-import { optimize } from "../router/optimizer.js";
+import { optimize, type Intent } from "../router/optimizer.js";
 import { decimals, fmt, toMinor } from "../money.js";
 import type { Linked } from "./linked.js";
 import { supplierRecords } from "../company/suppliers.js";
+import { exposureContext } from "../router/exposureState.js";
 
 const PLACES: Record<string, { country: string; ccy: string }> = {
   german: { country: "DE", ccy: "EUR" }, germany: { country: "DE", ccy: "EUR" }, french: { country: "FR", ccy: "EUR" }, france: { country: "FR", ccy: "EUR" },
@@ -90,7 +91,7 @@ export function amountOf(text: string) {
 
 /** `sourceFixed`: the amount is what the company sends, in its home currency ("transfer 50000" means 50,000 USD for a US
  *  company); the supplier receives the converted amount in its own currency. Otherwise the amount is what the supplier receives. */
-export function planSend(l: Linked, supplierId: string, value: string | number, currency?: string, deadlineUtc?: string, sourceFixed = false) {
+export function planSend(l: Linked, supplierId: string, value: string | number, currency?: string, deadlineUtc?: string, sourceFixed = false, objective: Intent["objective"] = "balanced") {
   const ben = supplierRecords(l).find((b) => b.id === supplierId);
   if (!ben) return { clarification: "Choose a saved supplier before planning a payment." };
   const home = l.input.company.homeCcy, dest = sourceFixed ? ben.currency : currency ?? ben.currency, amountCcy = sourceFixed ? home : dest;
@@ -100,8 +101,8 @@ export function planSend(l: Linked, supplierId: string, value: string | number, 
   try { amount = Number(value).toFixed(decimals(amountCcy)); toMinor(String(value), amountCcy); if (!(Number(value) > 0)) throw new Error("positive amount required"); }
   catch { return { clarification: `Enter a positive amount with valid precision for ${amountCcy}.` }; }
   const v = validate(ben); if (v.status === "BLOCK") return { blocked: v.errors, beneficiary: ben.name };
-  const intent = { srcCcy: home, destCcy: dest, amountType: (sourceFixed ? "SOURCE_FIXED" : "RECIPIENT_FIXED") as "SOURCE_FIXED" | "RECIPIENT_FIXED", amount, deadlineUtc };
-  const q: any = optimize({ ...intent, objective: "balanced", nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank, beneficiary: ben, beneficiaryAcceptsUsdc: !!ben.usdcWallet });
+  const intent = { srcCcy: home, destCcy: dest, amountType: (sourceFixed ? "SOURCE_FIXED" : "RECIPIENT_FIXED") as "SOURCE_FIXED" | "RECIPIENT_FIXED", amount, deadlineUtc, objective };
+  const q: any = optimize({ ...intent, exposureContext: exposureContext(), costOfCashPct: l.input.company.costOfCashPct, nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank, beneficiary: ben, beneficiaryAcceptsUsdc: !!ben.usdcWallet });
   const shown = Number(amount).toLocaleString("en-US", { minimumFractionDigits: decimals(amountCcy), maximumFractionDigits: decimals(amountCcy) });
   return { template: "send_to", title: sourceFixed ? `Send ${shown} ${home} to ${ben.name}${dest !== home ? ` (they receive ${dest})` : ""}` : `Send ${shown} ${dest} to ${ben.name}`,
     message: sourceFixed && dest !== home ? `No currency was given, so I used your home currency: ${shown} ${home} leaves your account, fees included, and ${ben.name} receives the converted amount in ${dest}.` : undefined,
@@ -111,7 +112,7 @@ export function planSend(l: Linked, supplierId: string, value: string | number, 
     intent, nextStep: "A new preview only: review and approve before execution." };
 }
 
-export interface Template { id: string; example: string; match: RegExp; build: (text: string, l: Linked) => any }
+export interface Template { id: string; example: string; match: RegExp; build: (text: string, l: Linked, options?: { objective?: Intent["objective"] }) => any }
 
 export const TEMPLATES: Template[] = [
   { id: "pay_bills", example: "pay my German suppliers this week", match: /\b(pay|run|settle)\b.*\b(suppliers?|vendors?|bills?|invoices?|payables?|everyone|all)\b/i,
@@ -121,7 +122,7 @@ export const TEMPLATES: Template[] = [
         && (!w || (Date.parse(x.dueUtc) <= Date.parse(w.to) || (x.discountByUtc && Date.parse(x.discountByUtc) <= Date.parse(w.to)))));
       if (!pays.length) return { clarification: `No linked bills match${p ? ` ${p.country === "*" ? "Europe" : p.country}` : ""}${w ? ` ${w.label}` : ""}. Try "pay all suppliers this month".` };
       const ccys = new Set(pays.map((x) => x.ccy));   // only money coming in for the same currencies is relevant
-      const run = runPaymentRun({ ...l.input, payables: pays, receivables: l.input.receivables.filter((r) => ccys.has(r.ccy)), receivablesScope: "matched" });
+      const run = runPaymentRun({ ...l.input, payables: pays, receivables: l.input.receivables.filter((r) => ccys.has(r.ccy)), receivablesScope: "matched" }, { exposureContext: exposureContext() });
       return { title: `Pay ${pays.length} bill(s)${p ? ` (${p.ccy})` : ""}${w ? ` due ${w.label}` : ""}`, filters: { place: p, window: w?.label ?? "any date", currency: ccy ?? p?.ccy ?? "any" },
                preview: run, nextStep: "approve to execute: npm run ask -- \"...\" --execute (or the Approve button)" };
     } },
@@ -137,7 +138,7 @@ export const TEMPLATES: Template[] = [
       const dest = ccy ?? ben.currency;
       const v = validate(ben); if (v.status === "BLOCK") return { blocked: v.errors, beneficiary: ben.name };
       const amount = fmt(toMinor(amt.toFixed(dest === "JPY" || dest === "KRW" ? 0 : 2), dest), dest).split(" ")[0];
-      const q: any = optimize({ srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED", amount, deadlineUtc: w?.to, objective: "balanced",
+      const q: any = optimize({ exposureContext: exposureContext(), srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED", amount, deadlineUtc: w?.to, objective: "balanced",
         nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank, beneficiary: ben, beneficiaryAcceptsUsdc: !!ben.usdcWallet });
       return { title: `Send ${amount} ${dest} to ${ben.name}${w ? ` ${w.label}` : ""}`, beneficiaryCheck: v.status, beneficiary: ben, preview: q.status === "OK" ? {
         route: q.allocations.map((a: any) => a.routeId).join(" + "), youPay: q.totals.sourceDebit, theyGet: q.totals.recipientNet, arrives: q.totals.arrivalUtc,
@@ -145,15 +146,15 @@ export const TEMPLATES: Template[] = [
         nextStep: "approve to execute (creates a plan with a termsHash; executes only after approval)" };
     } },
   { id: "convert", example: "convert 200k USD to EUR", match: /\b(convert|exchange|swap|change)\b.*\bto\b/i,
-    build: (text, l) => {
+    build: (text, l, options) => {
       const parts = text.split(/\bto\b/i), c = [currencyOf(parts[0] ?? ""), currencyOf(parts[1] ?? "")].filter(Boolean) as string[], amt = amountOf(parts[0] ?? "");
       if (!amt || c.length < 2) return { clarification: "Say it like: convert 200k USD to EUR" };
-      const q: any = optimize({ srcCcy: c[0], destCcy: c[1], amountType: "SOURCE_FIXED", amount: amt.toFixed(2), objective: "cheapest", nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank });
+      const q: any = optimize({ exposureContext: exposureContext(), srcCcy: c[0], destCcy: c[1], amountType: "SOURCE_FIXED", amount: amt.toFixed(2), objective: options?.objective ?? "cheapest", costOfCashPct: l.input.company.costOfCashPct, nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank });
       return { title: `Convert ${amt.toFixed(2)} ${c[0]} to ${c[1]}`, preview: q.status === "OK" ? { route: q.allocations.map((a: any) => a.routeId).join(" + "),
         youGet: q.totals.recipientNet, yourBankWouldGive: q.baseline?.recipientNet, youSave: q.value.customerNetSaving } : q };
     } },
   { id: "savings", example: "how much can I save this month", match: /\b(save|saving|savings|cost|costs)\b/i,
-    build: (text, l) => { const r = runPaymentRun(l.input); return { title: "Savings on your linked bills", savings: r.savings, companyKeeps: r.companyKeeps, vsBank: r.baseline }; } },
+    build: (text, l) => { const r = runPaymentRun(l.input, { exposureContext: exposureContext() }); return { title: "Savings on your linked bills", savings: r.savings, companyKeeps: r.companyKeeps, vsBank: r.baseline }; } },
   { id: "check_details", example: "check my suppliers' bank details", match: /\b(check|verify|validate)\b.*\b(details|bank|accounts?|suppliers?|beneficiar)/i,
     build: (_t, l) => { const seen = new Map(l.input.payables.map((p) => [p.beneficiary.name, p.beneficiary]));
       return { title: "Supplier bank details", results: [...seen.values()].map((b) => { const v = validate(b); return { supplier: b.name, status: v.status, issues: [...v.errors, ...v.warnings] }; }) }; } },
@@ -165,8 +166,8 @@ export const TEMPLATES: Template[] = [
       return { title: only ? `What you owe and what's coming in, in ${only}` : "What you owe and what's coming in, by currency", byCurrency: by, tip: "Where you both owe and receive a currency, wallets pay bills without converting." }; } },
 ];
 
-export function ask(text: string, l: Linked) {
+export function ask(text: string, l: Linked, options?: { objective?: Intent["objective"] }) {
   const t = TEMPLATES.find((x) => x.match.test(text));
   if (!t) return { template: null, clarification: "I can: " + TEMPLATES.map((x) => `"${x.example}"`).join(", "), fallback: "free-form requests go to the agents' /parse (LLM) if enabled" };
-  return { template: t.id, source: l.source, ...t.build(text, l) };
+  return { template: t.id, source: l.source, ...t.build(text, l, options) };
 }

@@ -40,6 +40,42 @@ class DeadlinePolicyTests(unittest.TestCase):
         result = self.choose({"bank": quote("bank", 90), "stablecoin": quote("stablecoin", 140, "2026-10-25T18:00:00Z")}, policy="fastest")
         self.assertEqual(result["chosen"], "stablecoin")
 
+    def test_balanced_selects_speed_when_its_time_value_exceeds_the_price_difference(self):
+        bank, stable = quote("bank", 90), quote("stablecoin", 140, "2026-10-25T18:00:00Z")
+        bank["selection"] = {"sourceCcy": "USD", "moneyCostMinor": "900", "combinedCostMinor": "1800"}
+        stable["selection"] = {"sourceCcy": "USD", "moneyCostMinor": "1400", "combinedCostMinor": "1401"}
+        self.assertEqual(self.choose({"bank": bank, "stablecoin": stable}, policy="balanced")["chosen"], "stablecoin")
+        self.assertEqual(self.choose({"bank": bank, "stablecoin": stable}, policy="cheapest")["chosen"], "bank")
+
+    def test_balanced_does_not_overpay_for_a_small_speed_gain(self):
+        bank, stable = quote("bank", 90), quote("stablecoin", 140, "2026-10-25T18:00:00Z")
+        bank["selection"] = {"sourceCcy": "USD", "moneyCostMinor": "900", "combinedCostMinor": "1000"}
+        stable["selection"] = {"sourceCcy": "USD", "moneyCostMinor": "1400", "combinedCostMinor": "1401"}
+        self.assertEqual(self.choose({"bank": bank, "stablecoin": stable}, policy="balanced")["chosen"], "bank")
+        self.assertEqual(self.choose({"bank": bank, "stablecoin": stable}, policy="fastest")["chosen"], "stablecoin")
+
+    def test_cheapest_uses_fee_inclusive_backend_value_and_equal_speed_breaks_ties_by_cost(self):
+        bank, stable = quote("bank", 90), quote("stablecoin", 80)
+        bank["selection"] = {"sourceCcy": "USD", "moneyCostMinor": "900", "combinedCostMinor": "1800"}
+        stable["selection"] = {"sourceCcy": "USD", "moneyCostMinor": "950", "combinedCostMinor": "1850"}
+        for policy in ("cheapest", "fastest", "balanced"):
+            self.assertEqual(self.choose({"bank": bank, "stablecoin": stable}, policy=policy)["chosen"], "bank")
+
+    def test_partial_legacy_metrics_do_not_mix_cents_with_basis_points(self):
+        bank, stable = quote("bank", 90), quote("stablecoin", 140)
+        stable["selection"] = {"sourceCcy": "USD", "moneyCostMinor": "1", "combinedCostMinor": "1"}
+        self.assertEqual(self.choose({"bank": bank, "stablecoin": stable}, policy="cheapest")["chosen"], "bank")
+
+    def test_balanced_policy_is_recognized_without_losing_explicit_preferences(self):
+        self.assertEqual(reasoning.policy_from_text("balance speed and cost", "cheapest"), "balanced")
+        self.assertEqual(reasoning.policy_from_text("cheapest", "balanced"), "cheapest")
+        self.assertEqual(reasoning.policy_from_text("fastest", "balanced"), "fastest")
+
+    def test_platform_fee_cannot_bypass_the_cost_approval_limit(self):
+        q = quote("stablecoin", 140)
+        q["costVsMidBps"]["withPlatformFee"] = 155
+        self.assertEqual(self.choose({"stablecoin": q}, policy="balanced")["decision"], "review")
+
     def test_failed_screen_stays_blocked_even_when_route_is_timely(self):
         self.assertEqual(self.choose({"bank": quote("bank")}, screen="BLOCK")["decision"], "hold")
 

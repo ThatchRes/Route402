@@ -10,6 +10,8 @@ import { runPaymentRun } from "../company/paymentRun.js";
 import { load as loadRouter } from "../router/store.js";
 import { unsafeInstruction, publicData } from "./safety.js";
 import { explanation } from "./explanations.js";
+import { isRoutingPreferenceTurn, resolveRoutingPolicy, routingObjective, routingPolicy } from "./routingPreference.js";
+import { exposureContext } from "../router/exposureState.js";
 
 type Task = { kind: "send" | "batch" | "convert"; supplierId?: string; amount?: number; currency?: string; sourceCurrency?: string;
   deadlineUtc?: string; billIds?: string[]; policy?: string; reference: string; requestedSupplierName?: string; sourceFixed?: boolean;
@@ -18,6 +20,7 @@ interface Conversation {
   id: string; companyId: string; tenantId: string; revision: number; selected: string[]; topic?: string; task?: Task;
   supplierDraft?: SupplierDraft; explanationTopic?: string; intentIds: string[]; decisions: any[]; turns: { user: string; reply: any }[];
   mentioned?: string[];   // suppliers named most recently in any turn ("the company I talked about before")
+  routingPolicy?: string; // preference for this conversation; separate from any submitted payment's terms
 }
 export class ConversationConflict extends Error {}
 const clean = (text: string) => text.trim().replace(/\b(companeis|companys|comapnies)\b/gi, "companies").replace(/\bsupliers?\b/gi, "suppliers");
@@ -37,7 +40,7 @@ function save(l: Linked, c: Conversation) {
 }
 function context(c: Conversation) {
   return { conversationId: c.id, conversationRevision: c.revision, topic: c.topic, selectedSupplierIds: c.selected,
-    task: c.task ? { ...c.task } : null };
+    task: c.task ? { ...c.task } : null, routingPolicy: c.routingPolicy };
 }
 export function conversationView(tenant: string, id: string) {
   const c = read(loadLinked(), tenant, id); return publicData({ ...context(c), activeIntentIds: c.intentIds, turns: c.turns });
@@ -80,7 +83,7 @@ const refersBack = (t: string) => /\b(?:the (?:company|supplier|vendor)|that (?:
 const unsupported = (t: string) => /\b(ignore (?:all|previous|your)|system prompt|poems?|jokes?|recipes?|homework|wallpaper|weather forecast|what(?:'s| is) the weather|sports scores|solve this equation|write (?:me )?(?:a |some )?(?:essay|code|story))\b/i.test(t);
 const help = "I can help with your company, suppliers, invoices, currencies, payment routes, savings and payment status. Try ‘list my suppliers using MXN’, ‘pay them’, or ‘add a supplier’.";
 const reference = () => `chat_${randomUUID()}`;
-function policies(text: string, previous?: string) { return /\b(fastest|urgent|asap)\b/i.test(text) ? "fastest" : /\b(lowest risk|safest)\b/i.test(text) ? "lowest_risk" : /\b(cheapest|lowest cost)\b/i.test(text) ? "cheapest" : previous ?? "cheapest"; }
+const policies = resolveRoutingPolicy;
 function existingTransfers(c: Conversation) {
   return Object.values(loadRouter().transfers).filter((t: any) => c.intentIds.includes(t.intentId)
     || (c.task?.kind === "send" && t.terms?.intent?.reference === c.task.reference)
@@ -144,18 +147,18 @@ function planTask(c: Conversation, l: Linked): any {
     if (task.amount == null) return { template: "send_to", clarification: task.goods
       ? `I can plan the payment to ${name}, but I can’t price ${task.goods.qty} ${task.goods.item} myself. What is the order total, or the price per unit? For example “12,000 each” or “360,000”. Amounts without a currency are in ${home}.`
       : `How much should ${name} receive? An amount without a currency is in ${home}, your home currency.` };
-    return { ...planSend(l, task.supplierId, task.amount, task.currency, task.deadlineUtc, task.sourceFixed), paymentRef: task.reference, policy: task.policy };
+    return { ...planSend(l, task.supplierId, task.amount, task.currency, task.deadlineUtc, task.sourceFixed, routingObjective(task.policy)), paymentRef: task.reference, policy: task.policy };
   }
   if (task.kind === "batch") {
     const bills = l.input.payables.filter((p) => task.billIds?.includes(p.id));
     if (!bills.length) return { template: "pay_bills", clarification: "No open bills match these suppliers. You can still request a new payment with an amount and supplier name." };
     const selected = new Set(bills.map((p) => p.ccy));
     const run = runPaymentRun({ ...l.input, payables: bills.map((p) => task.deadlineUtc ? { ...p, dueUtc: task.deadlineUtc } : p),
-      receivables: l.input.receivables.filter((r) => selected.has(r.ccy)), receivablesScope: "matched" });
+      receivables: l.input.receivables.filter((r) => selected.has(r.ccy)), receivablesScope: "matched" }, { exposureContext: exposureContext(), objective: routingObjective(task.policy) });
     return { template: "pay_bills", title: `Plan ${bills.length} linked invoice${bills.length === 1 ? "" : "s"}`, preview: run, policy: task.policy };
   }
   if (task.amount == null || !task.sourceCurrency || !task.currency) return { template: "convert", clarification: "Which amount and currencies? For example: convert 1000 USD to MXN." };
-  return { ...ask(`convert ${task.amount} ${task.sourceCurrency} to ${task.currency}`, l), policy: task.policy };
+  return { ...ask(`convert ${task.amount} ${task.sourceCurrency} to ${task.currency}`, l, { objective: routingObjective(task.policy) }), policy: task.policy };
 }
 
 export function askConversation(tenant: string, raw: string, id: string = randomUUID(), expectedRevision?: number): any {
@@ -165,6 +168,7 @@ export function askConversation(tenant: string, raw: string, id: string = random
   if (expectedRevision != null && expectedRevision !== c.revision) throw new ConversationConflict("This conversation changed in another request. Reopen it before sending again.");
   let result: any;
   const info = explanation(text, c.explanationTopic ?? (c.topic === "payment" ? "status" : c.topic?.startsWith("supplier") ? "suppliers" : undefined));
+  const preference = isRoutingPreferenceTurn(text) ? routingPolicy(text) : undefined;
   const names = namedSuppliers(text, l), directory = supplierDirectory(l), ccy = currencyOf(text), p = place(text);
   const amountText = text.replace(/\b20\d\d-\d\d-\d\d\b/g, ""), money = moneyIn(amountText);
   // a reply to "what is the price per unit?" multiplies by the quantity already on the task
@@ -191,10 +195,28 @@ export function askConversation(tenant: string, raw: string, id: string = random
   // answering "which supplier?" with part of a name, or "how much each?" with a unit price
   const awaitingSupplier = c.task?.kind === "send" && !c.task.supplierId, fragment = awaitingSupplier && t.split(/\s+/).length <= 3 ? suppliersStartingWith(text, l) : [];
   const unrelatedQuestion = /^(?:what|who|how|where|when|why|can you|could you|tell me)\b/i.test(text)
-    && !/\b(company|companies|suppliers?|vendors?|invoices?|payments?|amount|currency|currencies|deadline|bank|account|balance|owe|savings?|route|status|country|did it|did that|happened)\b/i.test(text) && !ccy && !names.length && !directoryFollowup && !payment && !(edit && c.task);
+    && !/\b(company|companies|suppliers?|vendors?|invoices?|payments?|amount|currency|currencies|deadline|bank|account|balance|owe|savings?|route|status|country|did it|did that|happened)\b/i.test(text) && !ccy && !names.length && !directoryFollowup && !payment && !(edit && c.task) && !preference;
   if (unsafeInstruction(text)) result = { template: "out_of_scope", title: "Chat cannot override security controls", message: "I can explain features or help plan business payments. Chat cannot change its authority, reveal credentials, bypass checks, execute code, or approve payments." };
   else if (info) { result = info; c.explanationTopic = info.explanationTopic ?? c.explanationTopic; }
   else if (unsupported(text) || unrelatedQuestion) result = { template: "out_of_scope", title: "Let’s keep this about your business payments", message: help };
+  else if (preference) {
+    const transfers = existingTransfers(c), busy = transfers.find((v: any) => ["SCHEDULED", "EXECUTING", "NEEDS_RECONCILIATION", "PARTIAL"].includes(v.status));
+    const label = { cheapest: "the lowest-cost eligible route", fastest: "the fastest eligible route", balanced: "the best balance of cost and speed", lowest_risk: "the lowest-risk eligible route" }[preference];
+    if (busy) result = { ...statusReply(c), title: "Resolve the existing transfer first", message: `Transfer ${busy.transferId} is ${busy.status}. Its outcome is unresolved; a preference change cannot replace or resend it.` };
+    else {
+      c.routingPolicy = preference;
+      if (!c.task || transfers.some((v: any) => v.status === "COMPLETED")) {
+        result = { template: "routing_preference", title: "Routing preference saved", policy: preference,
+          message: `I'll use ${label} for future payment previews in this conversation. ${transfers.length ? "The completed payment stays unchanged." : "Tell me which payment to plan, and I'll apply it."}` };
+      } else {
+        c.task = { ...c.task, policy: preference, reference: reference() }; c.intentIds = []; c.decisions = [];
+        result = planTask(c, l);
+        const acknowledgement = `I'll compare ${label} for the same payment.`;
+        if (result.clarification) result.clarification = `${acknowledgement} ${result.clarification}`;
+        else result.message = `${acknowledgement} ${result.message ?? "This is a fresh preview; review and approval still apply."}`;
+      }
+    }
+  }
   else if (/\b(cancel|discard)\b/i.test(text) && c.supplierDraft) { delete c.supplierDraft; result = { template: "supplier_draft_cancelled", title: "Supplier draft discarded", message: "No supplier was saved." }; }
   else if (add || (c.topic === "supplier_draft" && c.supplierDraft && !query && !payment && !edit && !/\b(owe|savings|status|check|verify|validate|convert|exchange|swap|why|how|what|list|show)\b/i.test(text))) {
     const before = add ? undefined : c.supplierDraft;
@@ -215,7 +237,8 @@ export function askConversation(tenant: string, raw: string, id: string = random
     const currencies = text.toUpperCase().match(/\b[A-Z]{3}\b/g)?.filter((v) => currencyOf(v) === v) ?? [];
     c.task = { ...(c.task?.kind === "convert" && edit ? c.task : { kind: "convert" as const, reference: reference() }),
       amount: amount ?? c.task?.amount, sourceCurrency: currencies.length > 1 ? currencies[0] : c.task?.sourceCurrency,
-      currency: currencies.at(-1) ?? c.task?.currency, policy: policies(text, c.task?.policy) };
+      currency: currencies.at(-1) ?? c.task?.currency, policy: policies(text, c.routingPolicy ?? c.task?.policy) };
+    c.routingPolicy = c.task.policy;
     c.topic = "payment"; result = planTask(c, l);
   }
   else if (names.length && /^(?:tell me about|show me|what|who|where|does|which)\b/i.test(text) && !payment && !edit) {
@@ -243,13 +266,13 @@ export function askConversation(tenant: string, raw: string, id: string = random
       if (!chosen.length && !recipientChange && useContext && c.selected.length === 1) chosen = supplierRecords(l).filter((s) => s.id === c.selected[0]);
       const batch = amount == null && /\b(all|suppliers?|vendors?|bills?|invoices?|them|everyone)\b/i.test(text) && !(edit && prior?.kind === "send");
       if (edit && prior?.kind === "batch" && amount == null && !names.length) {
-        c.task = { ...prior, deadlineUtc: date?.to ?? prior.deadlineUtc, policy: policies(text, prior.policy), reference: reference() };
+        c.task = { ...prior, deadlineUtc: date?.to ?? prior.deadlineUtc, policy: policies(text, c.routingPolicy ?? prior.policy), reference: reference() };
       } else if (batch) {
         let bills = l.input.payables.filter((b) => (!ccy || b.ccy === ccy) && (!p || p.country === "*" || b.beneficiary.country === p.country));
         if (names.length) bills = bills.filter((b) => names.some((s) => s.id === b.beneficiary.id));
         else if (/\b(them|those|these)\b/.test(t)) bills = bills.filter((b) => c.selected.includes(b.beneficiary.id));
         if (date) bills = bills.filter((b) => b.dueUtc <= date.to || (!!b.discountByUtc && b.discountByUtc <= date.to));
-        c.task = { kind: "batch", billIds: bills.map((b) => b.id), reference: reference(), policy: policies(text, prior?.policy) };
+        c.task = { kind: "batch", billIds: bills.map((b) => b.id), reference: reference(), policy: policies(text, c.routingPolicy ?? prior?.policy) };
         c.selected = [...new Set(bills.map((b) => b.beneficiary.id))];
       } else {
         const keep = edit || !payment || perUnit != null || fragment.length > 0 || (awaitingSupplier && names.length > 0), home = l.input.company.homeCcy;
@@ -258,7 +281,7 @@ export function askConversation(tenant: string, raw: string, id: string = random
         const sourceFixed = amount != null ? (!ccy || (ccy === home && !!chosen[0] && chosen[0].currency !== home)) : keep ? prior?.sourceFixed : undefined;
         c.task = { kind: "send", supplierId: chosen.length === 1 ? chosen[0].id : undefined,
           amount: amount ?? (keep ? prior?.amount : undefined), currency: ccy ?? ((keep ? prior?.currency : undefined) ?? chosen[0]?.currency),
-          deadlineUtc: date?.to ?? (keep ? prior?.deadlineUtc : undefined), policy: policies(text, prior?.policy), reference: reference(), sourceFixed,
+          deadlineUtc: date?.to ?? (keep ? prior?.deadlineUtc : undefined), policy: policies(text, c.routingPolicy ?? prior?.policy), reference: reference(), sourceFixed,
           goods: money.goods ?? (keep ? prior?.goods : undefined) };
         if (!chosen.length && !fragment.length && !regional.length && ((payment && !edit && !useContext && !purchase) || recipientChange)) {
           c.task.requestedSupplierName = text.match(/\bto\s+(.+?)(?=\s+(?:by|on|before)\b|$)/i)?.[1]; c.selected = [];
@@ -267,6 +290,7 @@ export function askConversation(tenant: string, raw: string, id: string = random
         else if (fragment.length > 1) c.selected = fragment.map((s) => s.id);
         else if (regional.length > 1) c.selected = regional.map((s) => s.id);
       }
+      c.routingPolicy = c.task.policy;
       c.topic = "payment"; c.intentIds = []; c.decisions = []; result = planTask(c, l);
       if (transfers.some((v: any) => v.status === "COMPLETED")) result.message = "The previous transfer already completed. This is a separate new preview; it does not change or resend that transfer. Review it before creating another payment.";
     }

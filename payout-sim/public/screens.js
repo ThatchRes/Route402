@@ -130,14 +130,24 @@ document.addEventListener("click", (e) => { const a = e.target.closest("#sup-ask
   const name = a.textContent.replace(/^Ask the agent about /, ""); CHAT_INPUT = `What do we owe ${name}?`; location.hash = "#/chat"; });
 
 // ================================================================== MANUAL PAYMENT (Figma 58:3505) — existing create step
-const quoteKey = (d) => `${d.billId}|${d.mode}|${d.budgetUsd}|${d.due}`;
-const recRoute = (R) => (R?.routes ?? []).filter((r) => r.status === "OK").sort((a, b) => a.economics.allInUsd - b.economics.allInUsd)[0];
+const quoteKey = (d) => `${d.billId}|${d.mode}|${d.budgetUsd}|${d.due}|${d.routingObjective ?? "balanced"}`;
+function compareRouteOptions(a, b, objective = "balanced") {
+  const arrival = String(a.arrivalUtc).localeCompare(String(b.arrivalUtc));
+  const key = objective === "cheapest" ? "moneyCostMinor" : "combinedCostMinor";
+  const score = a.selection?.[key] != null && b.selection?.[key] != null
+    ? (BigInt(a.selection[key]) < BigInt(b.selection[key]) ? -1 : BigInt(a.selection[key]) > BigInt(b.selection[key]) ? 1 : 0)
+    : a.economics.allInUsd - b.economics.allInUsd;
+  return objective === "fastest" ? arrival || score : score || arrival;
+}
+const recRoute = (R) => (R?.routes ?? []).filter((r) => r.status === "OK").sort((a, b) => compareRouteOptions(a, b, DRAFT.routingObjective ?? "balanced"))[0];
 async function loadDraftQuotes(P, q) {
   const d = DRAFT, b = billOf(d.billId);
   if (!b || !d.due || (d.mode === "budget" && !(d.budgetUsd > 0)) || d.key === quoteKey(d)) return;
   DRAFT = { ...d, key: quoteKey(d), routes: null, routesErr: null, agent: null, agentErr: null, selected: d.selected ?? null }; saveDraft();
-  const qs = `?due=${encodeURIComponent(DRAFT.due)}${DRAFT.mode === "budget" ? `&mode=budget&usd=${DRAFT.budgetUsd}` : ""}`;
-  try { DRAFT.routes = await api(`/routes/${encodeURIComponent(b.id)}${qs}`); } catch (e) { DRAFT.routesErr = e.message; }
+  const qs = `?due=${encodeURIComponent(DRAFT.due)}&objective=${DRAFT.routingObjective ?? "balanced"}${DRAFT.mode === "budget" ? `&mode=budget&usd=${DRAFT.budgetUsd}` : ""}`;
+  const requestKey = DRAFT.key;
+  try { const routes = await api(`/routes/${encodeURIComponent(b.id)}${qs}`); if (DRAFT.key !== requestKey) return; DRAFT.routes = routes; }
+  catch (e) { if (DRAFT.key !== requestKey) return; DRAFT.routesErr = e.message; }
   if (!DRAFT.routes?.routes?.some((r) => r.provider === DRAFT.selected && r.status === "OK")) DRAFT.selected = recRoute(DRAFT.routes)?.provider ?? null;
   saveDraft(); if (location.hash.startsWith("#/payments/new")) pageCreate(P, q);
 }
@@ -208,6 +218,7 @@ function pageCreate(P, q) {
         ${drow("Exchange rate", b.ccy === "USD" ? "No conversion" : `${Number(sel.fxRate).toFixed(4)} ${b.ccy} / USD`)}${drow("Exchange-rate cost", usd(x.conversionCostUsd, 2))}
         ${drow("Transfer fee", usd(x.transferFeeUsd, 2))}${x.payoutFeeUsd ? drow("Payout fee", usd(x.payoutFeeUsd, 2)) : ""}
         ${drow("Total fees included", usd(e.pricedUsd, 2))}${drow("Amount converted", usd(x.convertedPrincipalUsd, 2))}
+        ${e.platformFeeUsd ? drow("Route402 fee", usd(e.platformFeeUsd, 2)) : ""}
         <div class="divider"></div>${detail(budget ? "Estimated recipient amount" : "Supplier receives", money(sel.supplierGets))}
         ${detail(`${routeName(sel)} · ${arrival(sel)}`, `Estimated arrival ${dUtc(sel.arrivalUtc)}`)}
         <p class="note10">Quote captured ${esc(tUtc(sel.capturedAt))}; expires ${esc(utc(sel.expiresAt))} (<span data-exp="${esc(sel.expiresAt)}">${leftText(sel.expiresAt)}</span>). Next, the agents buy a paid quote and screen the supplier; you review that exact quote.</p>` : ""}
@@ -270,6 +281,13 @@ function releaseCard(d, b, sel) {
 
 // ================================================================== REVIEW & APPROVE (Figma 58:3670)
 // One document for both moments: the preparer's review before submitting, and an approver's review of a request.
+function exposureNote(q) {
+  const x = q?.exposure, rows = Object.entries(x?.perIssuer ?? {});
+  if (!x?.enabled || !rows.length) return "";
+  return `<details class="chat-details exposure-note"><summary>Transfer limits checked</summary>
+    <p class="note10">This plan fits the current treasury and issuer budgets, expected settlement time and available route liquidity. Limits are checked again before sending.</p>
+    <ul class="reasons">${rows.map(([issuer, row]) => `<li>${esc(issuer)}: ${usd(row.amountUsd, 2)} allocated. Settlement-time budget used by this plan: ${usd(row.weightedUsd, 2)} of ${usd(row.limitUsd, 2)}.</li>`).join("")}</ul></details>`;
+}
 function reviewDocument({ q, T, supplier, invoice, ref, purpose, due, routeLabel, routeWhy, editHref, changeHref, alts }) {
   const s = supplierByName(q.recipient.name) ?? supplierFor(invoice), masked = s?.maskedAccount ?? q.recipient.maskedAccount;
   return `<div class="doc-main g18">
@@ -289,7 +307,7 @@ function reviewDocument({ q, T, supplier, invoice, ref, purpose, due, routeLabel
     <div class="divider"></div>
     <div class="route2"><div class="route2-head"><span>${IC("landmark", 18)}<b>${esc(routeLabel)}</b></span>${changeHref ? `<a class="text-btn" href="${changeHref}">Change route</a>` : `<span class="note11">Route fixed at submission</span>`}</div>
       <p class="t12">${esc(routeWhy)}</p><p class="note10">Arrival time is an estimate, not a guarantee.</p>
-      ${alts ?? ""}</div>
+      ${alts ?? ""}</div>${exposureNote(q)}
   </div>`;
 }
 function altRows(options, chosen, chosenQ, T) {
@@ -631,7 +649,7 @@ async function pageTracking(P, id) {
           <div class="pair">${detail("Requested delivery", esc(dUtcY(r.timing?.deadlineUtc)))}${detail(credited ? "Recipient credited" : "Estimated arrival", esc(credited ? tUtc(credited) : dUtcY(arrival)))}</div>
           <div class="pair">${detail("Fees (already included)", esc(fees ?? "—"))}${detail("Exchange at approval", esc(conv ?? "—"))}</div>
           <p class="note10">${t?.approval ? `Approved ${esc(tUtc(t.approval.at))}; the amounts are locked to what was approved (terms ${esc(t.termsHash.slice(0, 8))})` : `Prepared ${esc(tUtc(r.preparedAt))}`}${t?.deadlineStatus ? ` · deadline ${esc(String(t.deadlineStatus).toLowerCase())}` : ""}. We assume the supplier’s bank takes nothing extra.</p></div>
-        ${documentsBlock(r)}${complianceBlock(r)}
+        ${exposureNote(q)}${documentsBlock(r)}${complianceBlock(r)}
       </section>
       <aside class="doc-aside w310" aria-label="Recipient and audit">
         <span class="eyebrow">RECIPIENT</span><h2 class="serif26">${esc(r.supplier)}</h2>

@@ -58,6 +58,43 @@ Programmable rules and the agents run underneath as safety and operations featur
 
 # payout-sim: route optimizer, orchestration, conversion, payout, ledger, reconciliation
 
+## Stablecoin issuer limits
+
+In **Policy & people → Stablecoin issuer limits**, an admin can set a default USD exposure limit and
+expand **Set individual issuer limits** to override it for each issuer. Blank uses the default; zero
+blocks new exposure. Coins from the same issuer share a limit (for example USDC and EURC share Circle's).
+Quotes and release checks use the issuer's remaining room after existing in-flight and escrow exposure.
+Changes are saved through the audited admin API. Existing policies keep their current default until edited.
+Run `npm run issuer:test` for isolated policy, quote, exposure and authorization regression checks.
+
+**Adaptive budgets:** expand **Adjust limits for each transfer** to enable treasury, settlement-time and
+liquidity budgets underneath those hard ceilings. Demo settings: 50% of the router's unspent treasury per
+issuer, 75% across stablecoin issuer exposure, 80% of quoted venue depth, and a 24-hour base window.
+A 48-hour route consumes twice the budget of the same amount on a route within 24 hours. Escrow uses its
+full lock window. These are configurable company rules, not estimated default probabilities or issuer ratings.
+Every issuer touched by a swap is budgeted conservatively; two coins from one issuer count once.
+Scheduled work, unresolved payouts and locked escrow retain exposure; a UI request and its transfer count once.
+Quotes, approval, execution and dispatch refresh the same backend budget. A changed budget can require
+a split, bank fallback or renewed approval; it cannot increase the approved debit or silently change routes.
+The UI displays **Transfer limits checked**, and savings previews include the adaptive constraints.
+`npm run exposure:test` checks these interactions without payments or external services.
+Scenario USD exposure budgets remain separate from x402's small test-USDC spending limits.
+
+**Cost and speed:** the default is `balanced`: route costs plus the Route402 fee and the company's cost of
+cash during transit. `cheapest` minimizes cash cost after the platform fee; `fastest` minimizes arrival time,
+then cost. The agents and UI use the same backend comparison values. Search includes every available route
+and plans of up to three legs, with capacity boundaries calculated to currency precision plus interior split
+samples. Cheapest, fastest and balanced summaries include split plans. This is the best evaluated feasible
+plan within the available catalog and search limits, not a guarantee over unavailable markets or future prices.
+Run `npm run optimization:test` for fee, split, speed/cost and exhaustive small-fixture comparisons.
+
+The chat accepts follow-ups such as **I prefer the cheapest**, **use lowest fees**, **go with the faster
+option**, and **balance speed and cost**. A draft keeps its supplier, amount, currency mode and deadline
+while receiving a fresh preview and review revision. The preference is remembered in that conversation.
+Without a draft, it is saved for the next payment. Completed payments are never cloned by a preference
+change, and scheduled or unresolved transfers must be resolved first. Asking what a preference means
+is read-only. These follow-ups never approve or execute a supplier payment.
+
 ## Route optimizer + orchestration (`npm run router`, port 8404)
 The route finder that decides **how** each transfer moves, and the backend that the agents and the dashboard call.
 

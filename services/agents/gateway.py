@@ -101,7 +101,7 @@ def payments_from_preview(r: dict) -> list:
     return []
 
 
-async def run_review(ctx, tenant, corr, home, bank, payments, policy="cheapest"):
+async def run_review(ctx, tenant, corr, home, bank, payments, policy="balanced"):
     if not payments:
         return [], [], []
     reply, status = await ctx.send_and_receive(
@@ -125,7 +125,7 @@ async def concierge_ask(ctx, tenant, corr, text, policy=None, conversation_id=No
         return AskResult(correlationId=corr, status="error", error="Invalid conversation ID")
     if conversation_revision is not None and (type(conversation_revision) is not int or conversation_revision < 0):
         return AskResult(correlationId=corr, status="error", error="Invalid conversation revision")
-    if policy is not None and policy not in ("cheapest", "fastest", "lowest_risk"):
+    if policy is not None and policy not in ("balanced", "cheapest", "fastest", "lowest_risk"):
         return AskResult(correlationId=corr, status="error", error="Invalid routing policy")
     policy = reasoning.policy_from_text(text, policy)
     try:

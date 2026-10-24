@@ -244,7 +244,7 @@ class ProcureRequest(Model):
     srcCcy: str
     currentBank: dict                # the company's baseline bank terms
     payments: List[dict]             # [{payable, destCcy, amount, deadlineUtc, beneficiary}]
-    policy: str = "cheapest"         # cheapest | fastest | lowest_risk
+    policy: str = "balanced"         # balanced | cheapest | fastest | lowest_risk
 
 
 class ProcureResult(Model):

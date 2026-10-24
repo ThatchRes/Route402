@@ -23,5 +23,5 @@ export function validateChatRequest(body: any) {
   if (typeof body.text !== "string" || !body.text.trim() || body.text.length > 500) throw new Error("Use a message between 1 and 500 characters");
   if (body.conversationId != null && (typeof body.conversationId !== "string" || !/^[A-Za-z0-9_-]{8,80}$/.test(body.conversationId))) throw new Error("Invalid conversation ID");
   if (body.conversationRevision != null && (!Number.isSafeInteger(body.conversationRevision) || body.conversationRevision < 0)) throw new Error("Invalid conversation revision");
-  if (body.policy != null && !["cheapest", "fastest", "lowest_risk"].includes(body.policy)) throw new Error("Invalid routing policy");
+  if (body.policy != null && !["balanced", "cheapest", "fastest", "lowest_risk"].includes(body.policy)) throw new Error("Invalid routing policy");
 }

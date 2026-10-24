@@ -7,7 +7,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { ConditionSpec } from "./conditions.js";
 import type { DocCheck, DocumentaryTerms } from "./documents.js";
 import type { TokenizedConfig } from "../router/tokenized.js";
-import { DEFAULT_COMPLIANCE, type Check, type CompliancePolicy } from "../router/compliance.js";
+import { DEFAULT_COMPLIANCE, STABLECOINS, type Check, type CompliancePolicy } from "../router/compliance.js";
+import { DEFAULT_ADAPTIVE_EXPOSURE, type AdaptiveExposurePolicy } from "../router/exposure.js";
 
 export type Role = "preparer" | "approver" | "receiving" | "admin";
 export interface User { id: string; name: string; title: string; roles: Role[]; approvalLimitUsd: number | null; owner?: boolean }
@@ -28,7 +29,9 @@ export interface Policy { dualApprovalOverUsd: number; // legacy display field; 
   requireCallbackOnDetailsChange: boolean; requoteTolerancePct: number; quoteValidMinutes: number;
   depegBandPct: number;          // pause the USDC route if its live price is further than this from 1.00 USD
   depegFailClosed: boolean;      // pause it too when no live price can be read
-  issuerCapUsd: number;          // most that may be in flight or in escrow with one stablecoin issuer at once
+  issuerCapUsd: number;          // default exposure cap for issuers without an override
+  issuerCapsUsd?: Record<string, number>; // optional cap per issuer; zero disables new exposure, omitted uses the default
+  adaptiveExposure?: AdaptiveExposurePolicy;
   escrowDeadlineDays: number;    // days after approval before an unreleased escrow can be refunded
   fxRiskLimitUsd: number;        // flag a currency when its 95% one-sided FX move on open bills exceeds this
   tokenized?: TokenizedConfig | null;   // the tokenized-deposit network the company's bank offers, with its tariff (router/tokenized.ts)
@@ -37,12 +40,28 @@ export interface Policy { dualApprovalOverUsd: number; // legacy display field; 
 const POLICY_FILE = "data/policy.json";
 // Defaults are starting company settings, editable by the admin; none of them is market data.
 const DEFAULT_POLICY: Policy = { dualApprovalOverUsd: Number.MAX_SAFE_INTEGER, requireCallbackOnDetailsChange: true, requoteTolerancePct: 0.5, quoteValidMinutes: 14,
-  depegBandPct: 0.5, depegFailClosed: true, issuerCapUsd: 250_000, escrowDeadlineDays: 30, fxRiskLimitUsd: 25_000,
-  tokenized: null, compliance: DEFAULT_COMPLIANCE, lcFeePct: 1 };
+  depegBandPct: 0.5, depegFailClosed: true, issuerCapUsd: 250_000, issuerCapsUsd: {}, escrowDeadlineDays: 30, fxRiskLimitUsd: 25_000,
+  tokenized: null, compliance: DEFAULT_COMPLIANCE, adaptiveExposure: DEFAULT_ADAPTIVE_EXPOSURE, lcFeePct: 1 };
 // Preserve the old response shape for the unchanged frontend, while disabling its legacy amount threshold.
 // The approval gate below always requires exactly one approval, including amounts above this display sentinel.
 export const loadPolicy = (): Policy => ({ ...DEFAULT_POLICY, ...(existsSync(POLICY_FILE) ? JSON.parse(readFileSync(POLICY_FILE, "utf8")) : {}), dualApprovalOverUsd: Number.MAX_SAFE_INTEGER });
 export const savePolicy = (p: Policy) => write(POLICY_FILE, { ...p, dualApprovalOverUsd: Number.MAX_SAFE_INTEGER });
+
+export const issuerCapFor = (p: Policy, issuer: string): number =>
+  Object.hasOwn(p.issuerCapsUsd ?? {}, issuer) ? p.issuerCapsUsd![issuer] : p.issuerCapUsd;
+
+/** Reject invalid limits before saving: NaN/null must never silently disable an exposure check. */
+export function cleanIssuerCaps(value: unknown): Record<string, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Issuer caps must be an object keyed by issuer name");
+  const known = new Set(Object.values(STABLECOINS).map((x) => x.issuer)), out: Record<string, number> = {};
+  for (const [issuer, cap] of Object.entries(value)) {
+    if (!known.has(issuer)) throw new Error(`Unknown stablecoin issuer: ${issuer}`);
+    if (typeof cap !== "number" || !Number.isFinite(cap) || cap < 0 || cap > Number.MAX_SAFE_INTEGER)
+      throw new Error(`The cap for ${issuer} must be a finite, non-negative USD amount`);
+    out[issuer] = cap;
+  }
+  return out;
+}
 
 function write(file: string, v: unknown) { mkdirSync("data", { recursive: true }); writeFileSync(file, JSON.stringify(v, null, 2)); }
 const read = <T>(file: string, d: T): T => (existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : d);
