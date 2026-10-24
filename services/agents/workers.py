@@ -168,7 +168,7 @@ async def on_execute(ctx: Context, sender: str, msg: ExecuteStepRequest):
 async def on_reconcile(ctx: Context, sender: str, msg: ReconcileRequest):
     log(ctx, msg.correlationId, f"reconcile {msg.transferId}")
     view = await backend.get_reconciliation_view(msg.tenantId, msg.transferId, msg.correlationId)
-    outcome, legs, outstanding, actions, refs = reasoning.reconcile(view.get("legs", []))
+    outcome, legs, outstanding, actions, refs = reasoning.reconcile(view.get("legs", []), view.get("outstanding"))
     summary = f"Reconciliation outcome {outcome}" + (f"; outstanding {outstanding}" if outstanding else "") + "."
     res = ReconcileResult(jobId=msg.jobId, tenantId=msg.tenantId, correlationId=msg.correlationId,
                           outcome=outcome, legs=legs, outstandingObligation=outstanding,

@@ -100,7 +100,11 @@ def _route_text(rank, quotes, funding):
         t += " Split across " + ", ".join(f"{a['quoteId']} ({a['sourceAmount']})" for a in allocs) + "."
     b = rank.get("baseline")
     if b:
-        t += f" Baseline ({b.get('policy')}): {b.get('quoteId')} at {b.get('sourceDebit')}."
+        b_amt = b.get("recipientNet") if mode == "SOURCE_FIXED" and b.get("recipientNet") else b.get("sourceDebit")
+        t += f" Baseline ({b.get('policy')}): {b.get('quoteId')} {'delivers' if mode == 'SOURCE_FIXED' else 'costs'} {b_amt}."
+    v = rank.get("value")
+    if v:
+        t += f" Customer saves {v.get('customerSavings')} vs baseline (platform fee {v.get('platformFee')})."
     for e in rank.get("excluded", []):
         t += f" Excluded {e['quoteId']}: {e['reason']}."
     if funding is not None:
@@ -187,7 +191,7 @@ async def investigate(events):
 
 
 # ------------------------------------------------------------------ reconciliation
-def reconcile(legs):
+def reconcile(legs, outstanding_view=None):
     """Distinct outcomes per Prompt 10. Never auto-refunds, resends, or marks delivered."""
     by = {l["leg"]: l for l in legs}
     out_legs, refs = [], []
@@ -225,4 +229,9 @@ def reconcile(legs):
         "PAYOUT_PENDING": ["Wait for beneficiary credit evidence; status refresh is read-only"],
         "PROCEEDS_MISMATCH": ["Flag discrepancy for operator review; do not edit expected values"],
     }[outcome]
+    # Prefer the ledger's own funded-but-unpaid figure (exact remainder) over the expected amount.
+    if outstanding_view and outstanding_view.get("fundedButUnpaid"):
+        outstanding = outstanding_view.get("payoutClearing") or outstanding
+    elif outstanding_view and not outstanding_view.get("fundedButUnpaid") and outcome == "MATCHED":
+        outstanding = None
     return outcome, out_legs, outstanding, actions, refs

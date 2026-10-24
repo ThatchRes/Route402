@@ -32,6 +32,7 @@ async function createPayout(transferId: string, body: any) {
   const r = await fetch(`${BASE}/payouts`, { method: "POST", headers: { ...H, "idempotency-key": `op_${transferId}` }, body: JSON.stringify(body) });
   const p = await r.json();
   if (!r.ok && r.status !== 202) { console.error(r.status, JSON.stringify(p)); process.exit(1); }
+  if (p.status === "FUNDING_NOT_CONFIRMED") console.error(`\nNO PAYOUT: ${p.history?.at(-1)?.note}\nIf x402 audit is UNREACHABLE, check SELLER_URL and that X402_INTERNAL_TOKEN matches x402-spike/.env, restart this server, then:\n  npm run payout -- ${body.scenario ?? "<scenario>"} ${body.funding?.orderId ?? ""}`);
   console.log(`\n== payout ${p.payoutId} ${p.status}`);
   const q = p.quote;
   console.log(`quote (synthetic, ${q.amountType}): debit ${q.sourceDebit.display} -> funding ${q.funding.display}${q.funding.viaX402 ? " [x402]" : ""} -> converted ${q.converted.display} -> recipient ${q.recipientNet.display}`);
@@ -56,22 +57,23 @@ async function waitAndReconcile(transferId: string, payoutId: string) {
 if (cmd === "transfer") {
   if (!a) { (await scenarios()).forEach((s) => console.log(`${s.id.padEnd(24)} ${s.quote.route.padEnd(10)} ${s.label}`)); process.exit(0); }
   const transferId = `tr_${a}_${Date.now().toString(36)}`;
-  let body: any, route: string;
+  let body: any, route: string, scenarioLive = false;
   if (a === "custom") {
     route = flag("route", "stablecoin")!;
     body = { custom: { route, srcCcy: flag("from"), destCcy: flag("to"), amountType: flag("type", "SOURCE_FIXED"), amount: flag("amount"),
       fxRate: flag("rate"), fundingFee: flag("funding-fee", "0"), payoutFee: flag("payout-fee", "0"), outcome: flag("outcome", "delivered"),
-      ...(route === "stablecoin" ? { fundingAsset: flag("asset", "USDC"), onrampRate: flag("onramp-rate", "1.000000") } : {}) } };
+      ...(route === "stablecoin" ? { fundingAsset: flag("asset", "USDC"), onrampRate: flag("onramp-rate", "1.000000"), network: flag("network", "base") } : {}) } };
     const pre = await fetch(`${BASE}/quotes/preview`, { method: "POST", headers: H, body: JSON.stringify(body.custom) });
     if (!pre.ok) { console.error(JSON.stringify(await pre.json(), null, 2)); process.exit(1); }   // validate BEFORE spending x402 funds
   } else {
     const s = (await scenarios()).find((x) => x.id === a);
     if (!s) { console.error(`unknown scenario ${a}`); process.exit(1); }
-    route = s.quote.route; body = { scenario: a };
+    route = s.quote.route; scenarioLive = !!s.quote.funding.viaX402; body = { scenario: a };
   }
   body.transferId = transferId;
   body.quoteExpiresAt = argv.includes("--expired") ? new Date(Date.now() - 60_000).toISOString() : new Date(Date.now() + 900_000).toISOString();
-  body.funding = route === "stablecoin" ? { mode: "x402_testnet", orderId: fundViaX402(transferId) } : { mode: "simulated_bank" };
+  const live = body.custom ? route === "stablecoin" && body.custom.fundingAsset === "USDC" && body.custom.network === "base" : scenarioLive;
+  body.funding = live ? { mode: "x402_testnet", orderId: fundViaX402(transferId) } : route === "stablecoin" ? { mode: "simulated_token" } : { mode: "simulated_bank" };
   const p = await createPayout(transferId, body);
   await waitAndReconcile(transferId, p.payoutId);
 } else if (cmd === "payout") {

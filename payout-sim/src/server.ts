@@ -3,7 +3,7 @@
 import "dotenv/config";
 import express from "express";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { SCENARIOS, OUTCOMES, quoteFor, validateInput, type Outcome, type QuoteInput } from "./scenarios.js";
+import { SCENARIOS, OUTCOMES, quoteFor, validateInput, x402Executable, type Outcome, type QuoteInput } from "./scenarios.js";
 import { verifyFunding } from "./chain.js";
 import { createPayout, getStatus, resumeAll, sign } from "./provider.js";
 import { assertBalanced, balance, line, type Entry, type Line } from "./ledger.js";
@@ -66,10 +66,12 @@ app.post("/payouts", internal, express.json(), async (req, res) => {
     input = rest; outcome = o; label = `custom ${rest.srcCcy}->${rest.destCcy} (${rest.route})`;
   } else return res.status(400).json({ error: "scenario or custom required" });
 
-  // x402 is mandatory on stablecoin routes and skipped on bank routes.
-  if (input.route === "stablecoin" && funding?.mode !== "x402_testnet")
-    return res.status(422).json({ error: "stablecoin route requires x402 funding: run x402-spike `npm run fund -- <transferId>` first" });
-  if (input.route === "bank" && funding?.mode === "x402_testnet")
+  // x402 is mandatory wherever it can execute (USDC on Base); other stablecoin rails are labeled simulations; bank skips x402.
+  if (x402Executable(input) && funding?.mode !== "x402_testnet")
+    return res.status(422).json({ error: "USDC-on-Base route requires x402 funding: run x402-spike `npm run fund -- <transferId>` first" });
+  if (input.route === "stablecoin" && !x402Executable(input) && funding?.mode !== "simulated_token")
+    return res.status(422).json({ error: `${input.fundingAsset} on ${input.network} has no live adapter: use funding.mode simulated_token (labeled simulation)` });
+  if (input.route === "bank" && funding?.mode !== "simulated_bank")
     return res.status(422).json({ error: "bank route does not use x402; use funding.mode simulated_bank" });
 
   const requestHash = createHash("sha256").update(JSON.stringify({ transferId, scenario, custom, quoteExpiresAt, funding })).digest("hex");
@@ -82,7 +84,8 @@ app.post("/payouts", internal, express.json(), async (req, res) => {
   try { quote = quoteFor(input, scenario ?? transferId); } catch (e: any) { return res.status(422).json({ error: e.message }); }
 
   // Funding evidence: the x402 audit (seller + buyer + chain must agree) AND our own chain check.
-  let fundingInfo: any = { mode: "simulated_bank", provenance: "simulated" };
+  let fundingInfo: any = { mode: funding?.mode ?? "simulated_bank", provenance: "simulated",
+    note: funding?.mode === "simulated_token" ? `${input.fundingAsset} on ${input.network}: simulated rail, no live adapter yet` : undefined };
   if (funding?.mode === "x402_testnet") {
     if (!ID.test(funding.orderId ?? "")) return res.status(400).json({ error: "funding.orderId required" });
     if (Object.values(load().payouts).some((x) => x.funding?.orderId === funding.orderId && x.status !== "FUNDING_NOT_CONFIRMED"))

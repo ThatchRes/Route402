@@ -11,7 +11,9 @@
     "show": "tsx src/cli.ts show",
     "refresh": "tsx src/cli.ts refresh",
     "selftest": "tsx src/selftest.ts",
-    "transfer": "tsx src/cli.ts transfer"
+    "transfer": "tsx src/cli.ts transfer",
+    "router": "tsx src/router/server.ts",
+    "route": "tsx src/router/cli.ts"
   },
   "dependencies": {
     "dotenv": "16.4.5",

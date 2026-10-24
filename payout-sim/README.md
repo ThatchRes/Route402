@@ -1,4 +1,48 @@
-# payout-sim: conversion, payout, ledger and reconciliation (guide prompt A5)
+# payout-sim: route optimizer, orchestration, conversion, payout, ledger, reconciliation
+
+## Route optimizer + orchestration (`npm run router`, port 8404)
+The route finder that decides **how** each transfer moves, and the backend that the agents and the dashboard call.
+
+**What it optimizes** (synthetic catalog in `src/router/registry.ts`, every number labeled):
+- **Every complete route:** 3 bank providers; direct coin routes (onramp → coin → network → offramp); and two-coin routes
+  (onramp → coin → on-chain swap to a local-currency coin → local redemption at par). Each route is priced with the same exact math the payout service executes.
+- **Stablecoin catalog** (`registry.ts`), 22 fiat-reserved coins on 10 networks:
+  - **USD:** USDC, PYUSD, USDG, USDP, RLUSD, GUSD.
+  - **EUR:** EURC, EURCV, EURe.
+  - **Local currencies:** QCAD, tGBP, XSGD, AUDD, JPYC, GYEN, MXNB, BRZ, TRYB, ZARP, XIDR, PHPC, cNGN.
+  - Plus 16 swap venues and 17 offramps. Issuer, decimals, networks and liquidity are **demo assumptions**: verify each one before enabling.
+- **Stable coins only.** Any coin more than 0.1% off its peg is excluded. A coin is used only when it's cheaper or faster; otherwise a bank route wins (for example USD→EUR or USD→JPY).
+- **Cost and speed.** The default `balanced` objective is money cost plus the time value of a slower arrival. Bank cutoffs and weekends are modeled.
+  Deadlines exclude late routes. `cheapest` and `fastest` are also reported.
+- **Size tiers and capacity.** Large transfers split across up to 3 routes, each child priced at its own size, compared against the best single route.
+- **Both modes:** send exactly X (`SOURCE_FIXED`) or deliver exactly Y (`RECIPIENT_FIXED`). Any ISO currency; pairs without a catalog rate need `--rate`.
+- **Value.** Savings are measured against the customer's current correspondent wire. Our fee = 20% of measured savings, charged only when the customer saves.
+- **Queues (advisory).** Netting own balances and confirmed inflows in the same ownership pool (no look-ahead; forecasts are never spent),
+  batching same-currency payments into one conversion, and just-in-time funding. Reported against independent routing with own funds valued at mid rate.
+
+**Execution:** intent → plan (termsHash) → approval → execute. Each leg runs on its own rail:
+- **USDC on Base:** real **x402** testnet funding (it calls x402-spike `fund`).
+- **Other coins:** labeled `simulated_token`.
+- **Bank:** labeled `simulated_bank`.
+
+Every leg then goes to the payout service, and the reconciliation is merged across split legs.
+
+```powershell
+npm run router                                   # window (with `npm run server` and the x402 seller running)
+npm run route -- quote USD CAD 50000.00          # ranked plan, savings, fee, cheapest/fastest/best-x402
+npm run route -- send USD CAD 50000.00 --live    # best route x402 can execute for real -> payout -> reconciliation
+npm run route -- send USD CAD 500000.00          # split across providers (USDC-on-Base legs use x402)
+npm run route -- quote USD CAD 68500.00 --type RECIPIENT_FIXED --deadline 2026-10-27T17:00:00Z
+npm run route -- quote USD XOF 1000.00 --rate USD/XOF=605.20
+npm run route -- queue                           # netting/batching/timing vs independent routing
+```
+**Agents:** in `services/agents/.env` set `MOCK_API=0`, `API_BASE_URL=http://localhost:8404`,
+`AGENT_SERVICE_TOKEN=<ROUTER_TOKEN>`, and an empty `EVIDENCE_API_BASE_URL=`. Then `/coordinate` with a router `intentId` ranks real routes,
+liquidity checks the treasury, the executor goes through the approval gate, and reconciliation and investigation read real transfers.
+
+---
+
+# Conversion, payout, ledger and reconciliation (guide prompt A5)
 
 The step after funding: **convert the funded asset to the destination currency, pay the recipient, record a
 balanced ledger, and prove it all matches.** The payout *provider* is simulated (labeled synthetic rates and fees)

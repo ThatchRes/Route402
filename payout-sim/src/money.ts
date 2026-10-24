@@ -2,7 +2,9 @@
 // Fiat precision comes from the runtime's ISO 4217 data (Intl), with ISO overrides where CLDR differs.
 // Stablecoins/tokens must be registered explicitly with their on-chain decimals.
 const ISO_OVERRIDES: Record<string, number> = { IQD: 3, CLF: 4, UYW: 4, ISK: 0, HUF: 2, TWD: 2, IDR: 2, PKR: 2, RSD: 2 };
-export const TOKENS: Record<string, number> = { USDC: 6, EURC: 6, USDT: 6, PYUSD: 6 };
+import { TOKENS as CATALOG } from "./router/registry.js";
+/** Every catalog stablecoin with its on-chain decimals (catalog assumption: verify per contract). */
+export const TOKENS: Record<string, number> = Object.fromEntries(CATALOG.map((t) => [t.id, t.decimals]));
 
 let FIAT: Set<string> | null = null;
 function fiatCodes(): Set<string> {

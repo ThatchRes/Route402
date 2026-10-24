@@ -9,6 +9,9 @@ from guard import safe_id, USAGE
 API = os.getenv("API_BASE_URL", "http://localhost:4000")
 TOKEN = os.getenv("AGENT_SERVICE_TOKEN", "dev-only-token")
 MOCK = os.getenv("MOCK_API", "1") == "1"
+# Optional: read transfer evidence (events, reconciliation) from the payout service even while MOCK_API=1.
+EVIDENCE_API = os.getenv("EVIDENCE_API_BASE_URL", "")
+EVIDENCE_TOKEN = os.getenv("EVIDENCE_API_TOKEN", TOKEN)
 
 
 def _headers(tenant: str, corr: str, extra=None):
@@ -162,7 +165,20 @@ async def get_step_status(tenant, transfer_id, step_id, corr):
 
 
 # ------------------------------------------------------------------ evidence
+async def _evidence(name, path, tenant, corr):
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{EVIDENCE_API}{path}", headers={**_headers(tenant, corr), "Authorization": f"Bearer {EVIDENCE_TOKEN}"})
+            r.raise_for_status()
+            return r.json()
+    finally:
+        USAGE.tool(name, (time.time() - t0) * 1000)
+
+
 async def get_events(tenant, transfer_id, corr):
+    if EVIDENCE_API:
+        return (await _evidence("get_events", f"/v1/transfers/{safe_id(transfer_id, 'transferId')}/events", tenant, corr))["items"]
     if MOCK:
         return _mock("get_events", [
             {"id": "ev_1", "type": "FUNDING_CONFIRMED", "producer": "x402", "evidenceRef": "0xabc123",
@@ -177,6 +193,8 @@ async def get_events(tenant, transfer_id, corr):
 
 async def get_reconciliation_view(tenant, transfer_id, corr):
     """Per-leg expected vs observed: bank debit, per-asset ledger, chain settlement, FX, beneficiary credit."""
+    if EVIDENCE_API:
+        return await _evidence("get_reconciliation_view", f"/v1/transfers/{safe_id(transfer_id, 'transferId')}/reconciliation", tenant, corr)
     if MOCK:
         return _mock("get_reconciliation_view", {"legs": [
             {"leg": "bank_debit", "expected": "50210.00 USD", "observed": "50210.00 USD", "evidenceRef": "nessie_tx_1"},

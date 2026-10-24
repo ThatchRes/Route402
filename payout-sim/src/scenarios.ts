@@ -11,6 +11,7 @@ export interface QuoteInput {
   route: "stablecoin" | "bank"; srcCcy: string; destCcy: string;
   amountType: "SOURCE_FIXED" | "RECIPIENT_FIXED"; amount: string;   // amount in srcCcy (SOURCE_FIXED) or destCcy (RECIPIENT_FIXED)
   fundingAsset?: string; onrampRate?: string;                         // stablecoin routes: token + srcCcy->token rate
+  network?: string;                                                   // chain the token moves on (default base)
   fxRate: string;                                                     // fundingAsset (or srcCcy on bank routes) -> destCcy
   fundingFee: string; payoutFee: string;                              // in srcCcy / destCcy
 }
@@ -43,6 +44,9 @@ export const SCENARIOS: Record<string, Scenario> = Object.fromEntries([
      amountType: "SOURCE_FIXED", amount: "50040.00", fxRate: "1", fundingFee: "25.00", payoutFee: "15.00" }),
 ].map((s) => [s.id, s]));
 
+/** Only USDC on Base has a live funding adapter (x402). Other stablecoin rails execute as labeled simulation. */
+export const x402Executable = (i: QuoteInput) => i.route === "stablecoin" && i.fundingAsset === "USDC" && (i.network ?? "base") === "base";
+
 /** Validate an arbitrary custom pair. Every rate and fee must be supplied: nothing is guessed. */
 export function validateInput(i: QuoteInput): string[] {
   const e: string[] = [];
@@ -53,7 +57,7 @@ export function validateInput(i: QuoteInput): string[] {
   try { decimals(i.srcCcy); } catch (x: any) { e.push(x.message); }
   try { decimals(i.destCcy); } catch (x: any) { e.push(x.message); }
   if (i.route === "stablecoin") {
-    if (!i.fundingAsset || !(i.fundingAsset in TOKENS)) e.push("stablecoin route needs a registered fundingAsset (USDC, EURC, USDT, PYUSD)");
+    if (!i.fundingAsset || !(i.fundingAsset in TOKENS)) e.push(`stablecoin route needs a catalog fundingAsset (${Object.keys(TOKENS).join(", ")})`);
     if (!i.onrampRate) e.push(`missing onrampRate (${i.srcCcy}->${i.fundingAsset})`);
   }
   return e;
@@ -83,7 +87,7 @@ export function quoteFor(i: QuoteInput, id = "custom") {
   const m = (x: bigint, c: string) => ({ minor: x.toString(), ccy: c, display: fmt(x, c) });
   return { quoteId: `sq_${id}`, provenance: "synthetic", route: i.route, amountType: i.amountType, input: i,
     sourceDebit: m(S, i.srcCcy), fundingFee: m(fee, i.srcCcy),
-    funding: { ...m(F, asset), rate: i.route === "stablecoin" ? i.onrampRate : null, viaX402: i.route === "stablecoin" },
+    funding: { ...m(F, asset), rate: i.route === "stablecoin" ? i.onrampRate : null, viaX402: x402Executable(i), network: i.network ?? (i.route === "stablecoin" ? "base" : null) },
     converted: { ...m(C, i.destCcy), rate: i.fxRate }, payoutFee: m(pFee, i.destCcy),
     roundingSurplus: m(surplus, i.destCcy), recipientNet: m(net, i.destCcy) };
 }
