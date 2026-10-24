@@ -13,16 +13,20 @@ if (!unknown.length) console.log("no unknown attempts");
 for (const a of unknown) {
   const order = db.orders[a.orderId];
   let txFound: string | undefined;
-  if (a.transaction) {
-    const v = await verifyTransfer(a.transaction as Hex, { payTo: order.payTo, amountAtomic: BigInt(a.amountAtomic), payer: a.payer });
-    if (v.ok) txFound = a.transaction;
-  } else {
+  // Known hash first: the attempt's own, else the one the seller recorded for this order (seller write won, buyer write lost).
+  const known = a.transaction ?? order.settlement?.transaction;
+  if (known) {
+    const v = await verifyTransfer(known as Hex, { payTo: order.payTo, amountAtomic: BigInt(a.amountAtomic), payer: a.payer });
+    if (v.ok) txFound = known.toLowerCase();
+  }
+  if (!txFound && !a.transaction) {
     // Search USDC transfers payer -> receiver for the exact amount since the attempt started.
     const from = BigInt(a.startBlock ?? "0");
     const head = await client.getBlockNumber();
     const logs = await client.getLogs({ address: USDC, event: TRANSFER, fromBlock: from, toBlock: head,
       args: { from: getAddress(a.payer), to: getAddress(order.payTo) } });
-    const used = new Set(Object.keys(load().txIndex));
+    // Exclude transactions that back OTHER orders; this order's own settlement is still a valid match.
+    const used = new Set(Object.entries(load().txIndex).filter(([, id]) => id !== a.orderId).map(([h]) => h.toLowerCase()));
     const hits = logs.filter((l) => l.args.value === BigInt(a.amountAtomic) && !used.has(l.transactionHash!.toLowerCase()));
     if (hits.length > 1) { console.log(`${a.attemptId}: ${hits.length} candidate transfers -> operator review`); continue; }
     txFound = hits[0]?.transactionHash?.toLowerCase();

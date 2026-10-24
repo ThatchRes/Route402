@@ -1,0 +1,17 @@
+# Accounting-system export (AP open bills + AR expected receipts): same suppliers as the demo company, plus a Brazil supplier.
+type,id,counterparty,country,currency,amount,due_date,iban,account,swift,routing,discount_pct,discount_by,status
+payable,AP-DE-Muller,Muller Teile GmbH,DE,EUR,"380,000.00",2026-10-30,DE89 3704 0044 0532 0130 00,,COBADEFFXXX,,,,
+payable,AP-DE-Klein,Klein Logistik,DE,EUR,290000.00,2026-11-24,DE89370400440532013000,,,,2,2026-11-04,
+payable,AP-DE-typo,Bauer AG,DE,EUR,45000.00,2026-11-02,DE89370400440532013001,,,,,,
+payable,AP-CA-Maple,Maple Freight,CA,CAD,450000.00,2026-10-27,,0031234512345678,,,,,
+payable,AP-CA-North,North Pack Co,CA,CAD,200000.00,2026-11-02,,0040987654321,,,,,
+payable,AP-MX-Proveedora,Proveedora SA,MX,MXN,3800000.00,2026-11-04,,012180012345678909,,,1,2026-10-28,
+payable,AP-SG-Lion,Lion Components,SG,SGD,120000.00,2026-11-01,,1234567890,DBSSSGSG,,,,
+payable,AP-GB-Northwind,Northwind Ltd,GB,GBP,85000.00,2026-11-03,GB82WEST12345698765432,,NWBKGB2L,,,,
+payable,AP-BR-Sol,Sol Embalagens,BR,BRL,600000.00,2026-11-06,,0001-123456-7,,,,,
+payable,AP-US-contractor,A. Chen,US,USD,12000.00,2026-10-31,,987654321,,011000016,,,
+receivable,AR-EU-1,Euro Retail BV,NL,EUR,420000.00,2026-10-27,,,,,,,confirmed
+receivable,AR-EU-2,Euro Retail BV,NL,EUR,310000.00,2026-11-03,,,,,,,confirmed
+receivable,AR-EU-3,Paris Market SAS,FR,EUR,150000.00,2026-11-05,,,,,,,expected
+receivable,AR-CA-1,Toronto Stores,CA,CAD,600000.00,2026-10-28,,,,,,,confirmed
+receivable,AR-MX-1,Tienda MX,MX,MXN,2500000.00,2026-10-27,,,,,,,confirmed

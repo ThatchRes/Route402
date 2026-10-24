@@ -18,10 +18,11 @@ export async function auditOrder(orderId: string) {
   const termsOk = o.network === NETWORK && o.asset.toLowerCase() === USDC.toLowerCase() && BigInt(o.amountAtomic) === PER_PAYMENT_ATOMIC;
   legs.push({ leg: "order_terms", expected: `${NETWORK} USDC ${PER_PAYMENT_ATOMIC}`, observed: `${o.network} ${o.asset === USDC ? "USDC" : o.asset} ${o.amountAtomic}`,
               status: termsOk ? "MATCHED" : "MISMATCH" });
-  legs.push({ leg: "single_settlement", expected: "at most one settled attempt", observed: `${settled.length} settled attempt(s)`,
-              status: settled.length <= 1 ? "MATCHED" : "MISMATCH" });
-  legs.push({ leg: "seller_vs_buyer", expected: sellerTx ?? "(none yet)", observed: buyerTx ?? "(none yet)",
-              status: !sellerTx && !buyerTx ? "PENDING" : sellerTx && buyerTx && sellerTx !== buyerTx ? "MISMATCH" : "MATCHED" });
+  // Missing evidence is PENDING, never MATCHED: a check only passes when there is something to compare.
+  legs.push({ leg: "single_settlement", expected: "exactly one settled attempt", observed: `${settled.length} settled attempt(s)`,
+              status: settled.length > 1 ? "MISMATCH" : settled.length === 1 ? "MATCHED" : "PENDING" });
+  legs.push({ leg: "seller_vs_buyer", expected: `seller ${sellerTx ?? "(no record)"}`, observed: `buyer ${buyerTx ?? "(no record)"}`,
+              status: sellerTx && buyerTx ? (sellerTx === buyerTx ? "MATCHED" : "MISMATCH") : "PENDING" });
 
   const tx = (sellerTx ?? buyerTx) as Hex | undefined;
   let chain: any = { leg: "chain_transfer", expected: `${PER_PAYMENT_ATOMIC} USDC units to ${o.payTo}`, observed: null, status: "PENDING" };
@@ -36,6 +37,18 @@ export async function auditOrder(orderId: string) {
     } catch (e) { chain = { ...chain, observed: `chain unreachable: ${String(e).split("\n")[0].slice(0, 60)}`, status: "PENDING", evidenceRef: tx }; }
   }
   legs.push(chain);
+
+  // Every order pays the same amount to the same receiver, so one transaction must back exactly one order.
+  if (tx) {
+    const others = Object.entries(db.orders).filter(([id, x]) => id !== orderId &&
+      (x.settlement?.transaction?.toLowerCase() === tx ||
+       db.attempts.some((a) => a.orderId === id && a.transaction?.toLowerCase() === tx)));
+    const indexed = db.txIndex?.[tx];
+    const claimedBy = [...new Set([...others.map(([id]) => id), ...(indexed && indexed !== orderId ? [indexed] : [])])];
+    legs.push({ leg: "tx_unique", expected: "transaction backs only this order",
+                observed: claimedBy.length ? `also claimed by ${claimedBy.join(", ")}` : "only this order",
+                status: claimedBy.length ? "MISMATCH" : "MATCHED" });
+  }
 
   const unknown = attempts.some((a) => ["SUBMITTED", "UNKNOWN"].includes(a.status));
   const outcome = legs.some((l) => l.status === "MISMATCH") ? "MISMATCH"

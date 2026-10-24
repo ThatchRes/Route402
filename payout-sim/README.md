@@ -1,3 +1,61 @@
+# Company international payments: savings engine
+
+**Who it's for:** companies that pay and get paid internationally. **What it does:** every payment run goes through the four
+levers that actually save money, each measured against **the company's own bank** (FX markup, wire fee and speed taken from their statements):
+
+1. **Validate beneficiaries.** Payments that would bounce (bad IBAN or routing number) are blocked before sending.
+2. **Timing.** Take early-payment discounts only when they beat the company's cost of cash.
+3. **Wallets / natural hedge.** Pay foreign invoices from foreign money already received; convert only the rest.
+4. **Routing.** Everything that still converts goes through the cheapest and fastest stable route (bank, or stablecoin with x402 on USDC/Base).
+
+```powershell
+npm run company -- run              # full payment run for the demo company: per-payment plan + savings by lever
+npm run company -- run --execute    # also executes each converted payment (needs: npm run server, npm run router, x402 seller)
+```
+Demo company: Acme Imports, whose bank charges a 1.2% markup plus 35 USD per wire. One run saves 41,439 USD
+(routing 29,349 · wallets 4,297 · discounts 7,067 · failed payments avoided 726). The company keeps 33,151 after our 20% fee.
+Endpoint: `POST /v1/company/payment-run` (empty body = demo). Edit `src/company/profile.ts` with a real company's bank terms.
+
+### Link once, then just ask (`npm run ask`)
+1. **Link** the company's data once: `npm run import -- nessie link` (bank) or `npm run import -- csv link <file>` (accounting export).
+   It's saved to `data/linked.json`, so every request reuses it with no re-fetching.
+2. **Ask in plain words.** Each request matches a ready-made template and is filled from the linked data, with no LLM needed:
+   | Say | You get |
+   |---|---|
+   | `pay my German suppliers this week` | payment run for just those bills (country, currency and date window filled in) |
+   | `send 50k CAD to Maple Freight by Friday` | validated recipient, best route, what you pay vs your bank, arrival |
+   | `convert 200k dollars to pesos` | best conversion vs your bank |
+   | `how much can I save this month` | savings by lever |
+   | `check my suppliers' bank details` | OK / REVIEW / BLOCK per supplier |
+   | `what do we owe in euros` | owed vs incoming vs expected per currency |
+   Unknown recipients, ambiguous names, or missing amounts get one clarifying question. Every answer is a **preview**:
+   `--execute` (or an Approve button) creates the plan, approves it and executes it.
+   API: `POST /v1/assistant/ask {text}`.
+3. **Before a pitch:** `npm run demo:reset` clears transfers, payouts and linked data (x402 testnet evidence is never touched).
+
+### How a company ports its data in (`npm run import`)
+- **Bank connection (Capital One Nessie sandbox).** Accounts become USD balances, pending bills become payables, deposits become receivables.
+  Nessie is US-dollar only, so foreign currency, amount and supplier bank details are kept in `data/nessie-meta.json`, keyed by Nessie id.
+  ```powershell
+  npm run import -- nessie seed [--fresh]                  # creates "XB-DEMO Acme Imports" in your Nessie sandbox (--fresh = new copy)
+  npm run import -- nessie run                             # import -> payment run
+  npm run import -- nessie run --execute --writeback       # also executes, then records each USD debit back in Nessie
+  ```
+- **Accounting export (CSV from QuickBooks, Xero or NetSuite: open bills plus expected receipts).**
+  ```powershell
+  npm run import -- csv template                           # the columns
+  npm run import -- csv run samples/acme-ap-ar.csv [--execute]
+  ```
+- **Bank terms** (the savings baseline) go in `src/company/profile.ts`, taken from the company's statements.
+- API: `POST /v1/company/import` with `{source:"csv", csv:"<text>"}` or `{source:"nessie", customerId:"..."}`.
+- Validation now requires account details on every payment, checks Mexican CLABE check digits and the Canadian
+  institution/transit format, and only warns (doesn't block) on Brazil local accounts without an IBAN.
+
+For companies with several subsidiaries, netting and cash pooling are also available (`npm run treasury`).
+Programmable rules and the agents run underneath as safety and operations features.
+
+---
+
 # payout-sim: route optimizer, orchestration, conversion, payout, ledger, reconciliation
 
 ## Route optimizer + orchestration (`npm run router`, port 8404)
@@ -39,6 +97,27 @@ npm run route -- queue                           # netting/batching/timing vs in
 **Agents:** in `services/agents/.env` set `MOCK_API=0`, `API_BASE_URL=http://localhost:8404`,
 `AGENT_SERVICE_TOKEN=<ROUTER_TOKEN>`, and an empty `EVIDENCE_API_BASE_URL=`. Then `/coordinate` with a router `intentId` ranks real routes,
 liquidity checks the treasury, the executor goes through the approval gate, and reconciliation and investigation read real transfers.
+
+## Company tools (`npm run company -- hedge|discounts|validate|report`)
+- **Multi-currency wallets + natural hedge.** Receivables in a currency pay that currency's payables first; only the shortfall or surplus
+  is converted. Dates are respected and expected-but-unconfirmed receipts are never relied on. Demo: FX volume 3.02M → 0.85M USD, FX cost −12,074 USD.
+- **Early-payment discount optimizer.** Pay early only when the annualized discount beats the cost of cash. Demo: +6,863 USD this cycle.
+- **Beneficiary validation before sending.** IBAN checksum and length, SWIFT/BIC format and country, US routing checksum, unusual
+  currency-for-country. Blocks the payments that would bounce back with fees and a second FX conversion.
+- **report**: one page combining every saving lever.
+Router endpoints: `POST /v1/company/hedge`, `/v1/company/discounts`, `/v1/company/beneficiaries/validate`.
+
+## Treasury optimization for large groups (`npm run treasury -- netting|sweeps|rules`)
+Large companies already get near-wholesale FX on a single payment. Their savings come from treasury structure:
+- **Multilateral intercompany netting.** Subsidiaries settle one net amount each with a netting centre instead of paying invoice by invoice.
+  In the demo group, 12 payments become 6, FX trades drop from 12 to 5, and FX notional falls 92.6% (net legs are priced by the optimizer).
+- **Cash pooling / target-balance sweeps.** Surplus accounts cover overdrawn ones in the same currency and pool, so you stop paying overdraft
+  interest while other accounts sit idle. Demo: +90,435 USD/yr and +46,458 EUR/yr after sweep fees.
+- **Programmable treasury rules** (our own rule format): balance sweeps, top-ups, pay approved invoices via the optimizer,
+  **bounded conversion windows** (best quote inside the window, forced at the deadline, never held beyond it), and
+  **conditional payment release** (pay only when delivery is confirmed AND the invoice matches the PO; held otherwise, returned on expiry).
+  Every proposal is either within a pre-approved mandate or needs approval, carries an idempotency key, and executes through `/v1/transfers`.
+Router endpoints: `POST /v1/treasury/netting`, `/v1/treasury/sweeps`, `/v1/treasury/rules/evaluate` (empty body = demo data).
 
 ---
 

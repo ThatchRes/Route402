@@ -10,6 +10,7 @@ export interface Intent {
   deadlineUtc?: string; objective?: "balanced" | "cheapest" | "fastest";   // default balanced = cost + speed
   allowSplit?: boolean; nowUtc?: string; midOverrides?: Record<string, string>;     // e.g. {"USD/XOF": "605.2"}
   liveOnly?: boolean;   // only routes whose funding can really execute today (x402 USDC on Base) or bank routes
+  currentBank?: { label: string; fxMarkupBps: number; wireFeeUsd: number; businessDays: number };   // the company's own bank = baseline
 }
 
 export function mid(a: string, b: string, o: Record<string, string> = {}): string {
@@ -41,7 +42,12 @@ interface Route {
 export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[] } {
   const o = it.midOverrides ?? {}, routes: Route[] = [], missing: string[] = [];
   try { mid(it.srcCcy, it.destCcy, o); } catch (e: any) { missing.push(e.message); return { routes, missing }; }
-  for (const b of BANKS) {
+  const banks = it.currentBank
+    ? [{ id: "current_bank", label: `${it.currentBank.label} (your current bank)`, fixedUsd: it.currentBank.wireFeeUsd, tiers: [{ upToUsd: Infinity, bps: it.currentBank.fxMarkupBps }],
+         businessDays: it.currentBank.businessDays, cutoffUtcHour: 21, capacityUsd: Infinity, dest: "*" as const, isBaseline: true },
+       ...BANKS.filter((b) => !b.isBaseline)]
+    : BANKS;
+  for (const b of banks) {
     if (b.dest !== "*" && !b.dest.includes(it.destCcy)) continue;
     routes.push({ routeId: `bank:${b.id}`, kind: "bank", label: b.label, x402Executable: false, capacityUsd: b.capacityUsd,
       steps: [`${it.srcCcy} debit`, `${b.label} FX ${it.srcCcy}->${it.destCcy}`, `${it.destCcy} credit`], pegDeviation: 0, coins: [],
@@ -177,7 +183,9 @@ export function optimize(it: Intent) {
 
   const useSplit = bestSplit && (!bestUnsplit || better(bestSplit.scoreMinor, bestUnsplit.scoreMinor));
   const chosen: Priced[] | undefined = useSplit ? bestSplit!.children : bestUnsplit ? [bestUnsplit] : undefined;
-  const baseline = priced.find((p) => p.routeId === "bank:legacy_wire");
+  const baselineId = it.currentBank ? "bank:current_bank" : "bank:legacy_wire";
+  const baseline = priced.find((p) => p.routeId === baselineId)
+    ?? routes.filter((r) => r.routeId === baselineId).map((r) => price(r, it, it.amount, now, undefined))[0];   // baseline even if filtered by liveOnly
   if (!chosen) return { status: "HOLD", reason: "no eligible route or allocation", candidates: priced, baseline };
 
   const sum = (k: "sourceDebit" | "recipientNet") => chosen.reduce((s, c) => s + BigInt(c.quote[k].minor), 0n);
@@ -203,7 +211,7 @@ export function optimize(it: Intent) {
       : "winner uses a rail without a live adapter: it executes as a labeled simulation (use liveOnly for the best x402-executable plan)",
     totals: { sourceDebit: fmt(debit, it.srcCcy), recipientNet: fmt(net, it.destCcy), arrivalUtc: latest },
     bestUnsplit: bestUnsplit ? { routeId: bestUnsplit.routeId, sourceDebit: bestUnsplit.quote.sourceDebit.display, recipientNet: bestUnsplit.quote.recipientNet.display } : null,
-    baseline: baseline?.quote ? { routeId: baseline.routeId, label: baseline.label, sourceDebit: baseline.quote.sourceDebit.display,
+    baseline: baseline?.quote ? { routeId: baseline.routeId, label: baseline.label, sourceDebit: baseline.quote.sourceDebit.display, sourceDebitMinor: baseline.quote.sourceDebit.minor,
       recipientNet: baseline.quote.recipientNet.display, arrivalUtc: baseline.arrivalUtc, meetsDeadline: baseline.eligible } : null,
     value: { customerSavings: fmt(savingsMinor, it.srcCcy), platformFee: fmt(feeMinor, it.srcCcy),
              customerNetSaving: fmt(savingsMinor - feeMinor, it.srcCcy), feeRule: `${PLATFORM.savingsSharePct}% of measured savings, only when savings > 0` },

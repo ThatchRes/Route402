@@ -1,0 +1,4 @@
+type,id,counterparty,country,currency,amount,due_date,iban,account,swift,routing,discount_pct,discount_by,status
+payable,INV-1001,Supplier GmbH,DE,EUR,25000.00,2026-11-05,DE89370400440532013000,,COBADEFFXXX,,2,2026-10-30,
+payable,INV-1002,Proveedor SA,MX,MXN,450000.00,2026-11-08,,012180012345678909,,,,,
+receivable,AR-2001,Customer SARL,FR,EUR,18000.00,2026-10-29,,,,,,,confirmed

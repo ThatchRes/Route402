@@ -9,6 +9,20 @@ import path from "node:path";
 import { optimize, type Intent } from "./optimizer.js";
 import { planQueue, type QueueInput } from "./queue.js";
 import { load, update } from "./store.js";
+import { runNetting } from "../treasury/netting.js";
+import { runSweeps } from "../treasury/sweeps.js";
+import { evaluate } from "../treasury/rules.js";
+import { DEMO_NETTING, DEMO_RULES, DEMO_STATE, DEMO_SWEEPS } from "../treasury/demo.js";
+import { runHedge } from "../company/hedge.js";
+import { runDiscounts } from "../company/discounts.js";
+import { validate as validateBeneficiary } from "../company/validate.js";
+import { DEMO_BENEFICIARIES, DEMO_DISCOUNTS, DEMO_HEDGE, DEMO_RUN } from "../company/demo.js";
+import { runPaymentRun } from "../company/paymentRun.js";
+import { importCsv } from "../connectors/csv.js";
+import { importFromNessie } from "../connectors/nessieImport.js";
+import { DEMO_COMPANY } from "../company/profile.js";
+import { ask } from "../assistant/prompts.js";
+import { loadLinked } from "../assistant/linked.js";
 import { fmt, toMinor } from "../money.js";
 
 const app = express();
@@ -250,6 +264,29 @@ app.post("/internal/queue/proposals", (req, res) => {
   res.json({ ...q, metrics: { ...q.metrics, balanceDays: { plan: "n/a", baseline: "n/a" } } });
 });
 app.post("/v1/queues/plan", (req, res) => { try { res.json(planQueue(req.body?.payments ? req.body : { ...DEMO_QUEUE, nowUtc: "2026-10-26T14:00:00Z" })); } catch (e: any) { err(res, 422, "INVALID_QUEUE", e.message); } });
+
+// ------------------------------------------------------------------ treasury (advisory; execution via /v1/transfers)
+const safe = (res: express.Response, f: () => any) => { try { res.json(f()); } catch (e: any) { err(res, 422, "INVALID_INPUT", e.message); } };
+app.post("/v1/treasury/netting", (req, res) => safe(res, () => runNetting(req.body?.invoices ? req.body : DEMO_NETTING)));
+app.post("/v1/treasury/sweeps", (req, res) => safe(res, () => runSweeps(req.body?.accounts ? req.body : DEMO_SWEEPS)));
+app.post("/v1/treasury/rules/evaluate", (req, res) => safe(res, () => evaluate(req.body?.rules ?? DEMO_RULES, req.body?.state ?? DEMO_STATE)));
+
+app.post("/v1/company/payment-run", (req, res) => safe(res, () => runPaymentRun(req.body?.payables ? req.body : DEMO_RUN)));
+// Port company data in: CSV text (accounting export) or a Nessie customer (bank sandbox), then run the payment run.
+app.post("/v1/company/import", async (req, res) => {
+  try {
+    const now = req.body?.nowUtc ?? "2026-10-26T14:00:00Z";
+    const imp: any = req.body?.source === "nessie" ? await importFromNessie(String(req.body.customerId), DEMO_COMPANY, now)
+      : req.body?.source === "csv" ? importCsv(String(req.body.csv ?? ""), DEMO_COMPANY, now) : null;
+    if (!imp) return err(res, 400, "INVALID_SOURCE", "source must be csv or nessie");
+    res.json({ imported: imp.imported, problems: imp.problems ?? imp.unmapped ?? [], run: runPaymentRun(imp.input) });
+  } catch (e: any) { err(res, 422, "IMPORT_FAILED", e.message); }
+});
+// Everyday prompts -> ready-made plan from the linked data (preview only; execution needs approval)
+app.post("/v1/assistant/ask", (req, res) => safe(res, () => ask(String(req.body?.text ?? ""), loadLinked())));
+app.post("/v1/company/hedge", (req, res) => safe(res, () => runHedge(req.body?.payables ? req.body : DEMO_HEDGE)));
+app.post("/v1/company/discounts", (req, res) => safe(res, () => runDiscounts(req.body?.payables ? req.body : DEMO_DISCOUNTS)));
+app.post("/v1/company/beneficiaries/validate", (req, res) => safe(res, () => (Array.isArray(req.body) && req.body.length ? req.body : DEMO_BENEFICIARIES).map(validateBeneficiary)));
 
 const port = Number(process.env.ROUTER_PORT ?? 8404);
 app.listen(port, () => console.log(`router on :${port} (optimizer + orchestration; synthetic rates)`));

@@ -35,6 +35,12 @@ export function toMinor(amount: string, ccy: string): bigint {
   return BigInt(i) * 10n ** BigInt(d) + BigInt((f + "0".repeat(d)).slice(0, d) || "0");
 }
 
+/** Signed variant for account balances (overdrafts). Payment amounts still use toMinor (positive only). */
+export function toMinorSigned(amount: string, ccy: string): bigint {
+  const a = String(amount).trim();
+  return a.startsWith("-") ? -toMinor(a.slice(1), ccy) : toMinor(a, ccy);
+}
+
 export function fmt(minor: bigint, ccy: string): string {
   const d = decimals(ccy);
   const neg = minor < 0n; const m = neg ? -minor : minor;
