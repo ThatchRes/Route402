@@ -11,13 +11,16 @@ from uagents import Agent, Bureau, Context
 
 import backend
 import reasoning
-from addressbook import RESOLVER, WORKERS_PORT, LIQUIDITY, RECONCILIATION
+from addressbook import RESOLVER, WORKERS_PORT, LIQUIDITY, RECONCILIATION, COMPLIANCE, COMPLIANCE_SEED
 from guard import redact, USAGE
 from models import (RouteRequest, RouteResult, FundingCheckRequest, FundingCheckResult,
                     LiquidityRequest, LiquidityResult, ExecuteStepRequest, ExecuteStepResult,
-                    ReconcileRequest, ReconcileResult, InvestigateRequest, InvestigateResult)
+                    ReconcileRequest, ReconcileResult, InvestigateRequest, InvestigateResult,
+                    ProcureRequest, ProcureResult, ScreenRequest, ScreenResult)
 
-routing = Agent(name="routing", seed=os.environ["ROUTING_SEED"], resolve=RESOLVER)
+# Routing and compliance handle several payments at once (each one waits on paid calls)
+routing = Agent(name="routing", seed=os.environ["ROUTING_SEED"], resolve=RESOLVER, handle_messages_concurrently=True)
+compliance = Agent(name="compliance", seed=COMPLIANCE_SEED, resolve=RESOLVER, handle_messages_concurrently=True)
 investigation = Agent(name="investigation", seed=os.environ["INVESTIGATION_SEED"], resolve=RESOLVER)
 liquidity = Agent(name="liquidity", seed=os.environ["LIQUIDITY_SEED"], resolve=RESOLVER)
 executor = Agent(name="execution_coordinator", seed=os.environ["EXECUTOR_SEED"], resolve=RESOLVER)
@@ -193,8 +196,85 @@ async def on_investigate(ctx: Context, sender: str, msg: InvestigateRequest):
     await ctx.send(sender, res)
 
 
+# ------------------------------------------------------------------ paid procurement (x402 pay-per-call)
+def _evidence(r: dict, who: str) -> dict:
+    p = dict(r.get("payment") or {})
+    p["buyer"] = who
+    if r.get("mock"):
+        p["mock"] = True
+    return p
+
+
+@compliance.on_message(model=ScreenRequest, replies=ScreenResult)
+@guarded
+async def on_screen(ctx: Context, sender: str, msg: ScreenRequest):
+    """ComplianceAgent buys one supplier screen per payment with x402 and reports them. It never approves a payment."""
+    log(ctx, msg.correlationId, f"screening {len(msg.items)} supplier(s): buying 1 screen call each via x402")
+
+    async def one(item):
+        r = await backend.paid_call("compliance", {"beneficiary": item["beneficiary"]}, msg.correlationId, "compliance-agent")
+        d = r.get("data") or {}
+        return {"payable": item["payable"], "status": d.get("status", "UNAVAILABLE") if r.get("ok") else "UNAVAILABLE",
+                "errors": d.get("errors", []) if r.get("ok") else [r.get("error", "screen failed")],
+                "warnings": d.get("warnings", []), "notCovered": d.get("notCovered", []),
+                "payment": _evidence(r, "compliance-agent") if r.get("ok") else None}
+    results = await asyncio.gather(*(one(i) for i in msg.items))
+    await ctx.send(sender, ScreenResult(correlationId=msg.correlationId, results=list(results)))
+
+
+PROVIDER_IDS = ("stablecoin", "partner", "bank")
+
+
+@routing.on_message(model=ProcureRequest, replies=ProcureResult)
+@guarded
+async def on_procure(ctx: Context, sender: str, msg: ProcureRequest):
+    """RoutingAgent: for every payment, buys a quote from EACH provider (three separate x402 sellers, separate payees),
+    asks ComplianceAgent for a paid supplier screen (agent-to-agent), then chooses one provider under the company's
+    policy (cheapest | fastest | lowest_risk) or holds the payment."""
+    corr, pays, policy = msg.correlationId, msg.payments, msg.policy
+    log(ctx, corr, f"{len(pays)} payment(s), policy '{policy}': buying {len(pays) * len(PROVIDER_IDS)} provider quotes via x402; "
+                   f"asking compliance agent to screen suppliers")
+    t0 = time.time()
+    hops = [{"from": "concierge", "to": "routing", "message": f"ProcureRequest ({len(pays)} payments, policy {policy})"}]
+
+    def body(p):
+        return {"srcCcy": msg.srcCcy, "destCcy": p["destCcy"], "amountType": "RECIPIENT_FIXED", "amount": p["amount"],
+                "deadlineUtc": p.get("deadlineUtc"), "objective": "cheapest", "currentBank": msg.currentBank}
+    jobs = [(i, pid) for i in range(len(pays)) for pid in PROVIDER_IDS]
+    quotes_task = asyncio.ensure_future(asyncio.gather(*(backend.paid_call(f"quote:{pid}", body(pays[i]), corr, "routing-agent") for i, pid in jobs)))
+    screen, status = await ctx.send_and_receive(
+        COMPLIANCE, ScreenRequest(tenantId=msg.tenantId, correlationId=corr,
+                                  items=[{"payable": p["payable"], "beneficiary": p["beneficiary"]} for p in pays]),
+        response_type=ScreenResult, timeout=170)
+    screens = {r["payable"]: r for r in screen.results} if isinstance(screen, ScreenResult) else {}
+    hops += [{"from": "routing", "to": "compliance", "message": f"ScreenRequest ({len(pays)} suppliers)"},
+             {"from": "compliance", "to": "routing", "message": "ScreenResult" if screens else f"no reply: {status}",
+              "ms": round((time.time() - t0) * 1000)}]
+    raw = await quotes_task
+    hops.append({"from": "routing", "to": "providers", "message": f"{len(jobs)} paid quotes ({len(PROVIDER_IDS)} providers)",
+                 "ms": round((time.time() - t0) * 1000)})
+    results = []
+    for i, p in enumerate(pays):
+        quotes, paid = {}, []
+        for (j, pid), q in zip(jobs, raw):
+            if j != i:
+                continue
+            quotes[pid] = q.get("data") if q.get("ok") else {"status": "NO_QUOTE", "detail": q.get("error")}
+            if q.get("ok"):
+                paid.append(_evidence(q, "routing-agent"))
+        scr = screens.get(p["payable"])
+        if scr and scr.get("payment"):
+            paid.append(scr["payment"])
+        d = reasoning.choose_route(quotes, scr, policy)
+        log(ctx, corr, f"{p['payable']}: {d['decision']} -> {d['chosen'] or '-'} ({d['reasons'][0]})")
+        results.append({"payable": p["payable"], **d, "screen": scr, "paidCalls": paid})
+    hops.append({"from": "routing", "to": "concierge", "message": "ProcureResult",
+                 "status": ", ".join(f"{r['payable']}={r['decision']}:{r['chosen']}" for r in results), "ms": round((time.time() - t0) * 1000)})
+    await ctx.send(sender, ProcureResult(correlationId=corr, results=results, hops=hops))
+
+
 bureau = Bureau(port=WORKERS_PORT, endpoint=f"http://127.0.0.1:{WORKERS_PORT}/submit")
-for a in (routing, investigation, liquidity, executor, reconciler):
+for a in (routing, investigation, liquidity, executor, reconciler, compliance):
     bureau.add(a)
 
 if __name__ == "__main__":

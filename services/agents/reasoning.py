@@ -235,3 +235,86 @@ def reconcile(legs, outstanding_view=None):
     elif outstanding_view and not outstanding_view.get("fundedButUnpaid") and outcome == "MATCHED":
         outstanding = None
     return outcome, out_legs, outstanding, actions, refs
+
+
+# ------------------------------------------------------------------ payment decision (routing agent)
+import os as _os
+
+POLICIES = ("cheapest", "fastest", "lowest_risk")
+POLICY = {
+    "maxCostBps": float(_os.getenv("ROUTING_MAX_COST_BPS", "150")),      # never send above this cost vs mid
+    "default": _os.getenv("ROUTING_POLICY", "cheapest"),
+}
+
+
+def policy_from_text(text: str, fallback: str | None = None) -> str:
+    t = (text or "").lower()
+    if any(w in t for w in ("fastest", "asap", "urgent", "quickly", "today")):
+        return "fastest"
+    if any(w in t for w in ("safest", "lowest risk", "low risk", "safe")):
+        return "lowest_risk"
+    if any(w in t for w in ("cheapest", "lowest cost", "cheap")):
+        return "cheapest"
+    return fallback if fallback in POLICIES else POLICY["default"]
+
+
+def _pct(bps):
+    return f"{bps / 100:.2f}%"
+
+
+def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = POLICY):
+    """Pick ONE provider's paid quote under the company's policy. Deterministic; never invents a route, rate or amount.
+    quotes: {provider_id: quote dict or {"status": "NO_QUOTE", ...}}. Returns a dict with decision, chosen, intentId, reasons, options."""
+    policy = policy if policy in POLICIES else "cheapest"
+    hold, reasons, options = [], [], []
+    s = (screen or {}).get("status", "UNAVAILABLE")
+    if s == "PASS":
+        reasons.append("supplier screen PASS (account and checksum checks)")
+    elif s == "REVIEW":
+        hold.append("supplier screen needs human review: " + "; ".join((screen or {}).get("warnings", [])[:2]))
+    elif s == "BLOCK":
+        hold.append("supplier screen BLOCK: " + "; ".join((screen or {}).get("errors", [])[:2]))
+    else:
+        hold.append("supplier screen unavailable: not sending to an unscreened supplier")
+
+    bank_bps, bank_basis = None, None
+    for pid, q in quotes.items():
+        if not q or q.get("status") != "OK" or not q.get("plan"):
+            options.append({"provider": pid, "label": (q or {}).get("providerLabel", pid), "eligible": False,
+                            "why": f"no quote ({(q or {}).get('reason') or (q or {}).get('detail') or (q or {}).get('status', 'none')})"})
+            continue
+        c = q.get("costVsMidBps") or {}
+        cost, bank = c.get("plan"), c.get("bank")
+        bank_bps = bank if bank is not None else bank_bps
+        bank_basis = (q.get("provenance") or {}).get("bankBaseline", bank_basis)
+        o = {"provider": pid, "label": q.get("providerLabel", pid), "costBps": cost, "arrivalUtc": q["plan"].get("arrivalUtc", ""),
+             "risk": (q.get("risk") or {}).get("score", 3), "riskWhy": (q.get("risk") or {}).get("why", ""), "intentId": q.get("intentId"),
+             "routeIds": [a["routeId"] for a in q["plan"].get("allocations", [])],
+             "live": any(a.get("x402Executable") for a in q["plan"].get("allocations", [])), "eligible": True}
+        if cost is None or cost > limits["maxCostBps"]:
+            o.update(eligible=False, why=f"cost {_pct(cost or 0)} above policy limit {_pct(limits['maxCostBps'])}")
+        elif bank is not None and cost >= bank:
+            o.update(eligible=False, why="no saving vs your bank")
+        options.append(o)
+
+    ok = [o for o in options if o["eligible"]]
+    key = {"cheapest": lambda o: (o["costBps"], o["arrivalUtc"]),
+           "fastest": lambda o: (o["arrivalUtc"], o["costBps"]),
+           "lowest_risk": lambda o: (o["risk"], o["costBps"])}[policy]
+    ok.sort(key=key)
+    if not ok:
+        hold.append("no provider quote meets the policy")
+    chosen = ok[0] if ok else None
+    if chosen:
+        reasons.insert(0, f"policy '{policy}': chose {chosen['label']}: {_pct(chosen['costBps'])} above mid, arrives "
+                          f"{chosen['arrivalUtc'][:16]}Z, risk {chosen['risk']}/5 ({chosen['riskWhy']})")
+        if bank_bps is not None:
+            reasons.append(f"your bank would cost {_pct(bank_bps)} ({bank_basis})")
+        reasons.append("USDC-on-Base legs carry an x402 settlement proof" if chosen["live"] else "payout rail is simulated")
+    reasons.append("compared: " + " | ".join(
+        f"{o['label']} {_pct(o['costBps'])}, {o['arrivalUtc'][:10]}, risk {o['risk']}" if o.get("costBps") is not None else f"{o['label']}: {o.get('why')}"
+        for o in options))
+    decision = "hold" if hold else "approve"
+    return {"decision": decision, "policy": policy, "chosen": chosen["provider"] if chosen else None,
+            "intentId": chosen["intentId"] if (chosen and decision == "approve") else None,
+            "routeIds": chosen["routeIds"] if chosen else [], "reasons": hold + reasons, "options": options}

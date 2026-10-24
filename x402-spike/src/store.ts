@@ -31,13 +31,16 @@ export function load(): Db {
   return JSON.parse(readFileSync(FILE, "utf8"));
 }
 
-export function save(db: Db) {
+export function save(db: Db) { saveFile(FILE, db); }
+
+/** Atomic JSON write (temp file + rename). Each file has exactly ONE writer process, so updates are never lost. */
+export function saveFile(file: string, value: unknown) {
   mkdirSync(DIR, { recursive: true });
-  const tmp = `${FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(db, null, 2));
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2));
   // Windows can briefly lock the target while another process reads it: retry instead of failing.
   for (let i = 0; ; i++) {
-    try { renameSync(tmp, FILE); return; }
+    try { renameSync(tmp, file); return; }
     catch (e: any) {
       if (!["EPERM", "EBUSY", "EACCES"].includes(e?.code) || i >= 20) throw e;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
@@ -51,3 +54,20 @@ export function update<T>(fn: (db: Db) => T): T {
   save(db);
   return out;
 }
+
+// ---- Paid API calls (pay-per-request). Buyer side: data/calls-wallet.json (agent wallet). Seller side: data/calls-seller.json.
+export type CallStatus = "SUBMITTED" | "SETTLED" | "REJECTED" | "UNKNOWN";
+export interface CallRecord {
+  callId: string; service: string; amountAtomic: string; status: CallStatus; at: string;
+  transaction?: string; payer?: string; payTo?: string; correlationId?: string; caller?: string; detail?: string; request?: string;
+}
+export const WALLET_CALLS = `${DIR}/calls-wallet.json`;
+export const SELLER_CALLS = `${DIR}/calls-seller.json`;
+export const PROVIDER_CALLS = `${DIR}/calls-providers.json`;     // written only by `npm run providers`
+export function loadCalls(file: string): CallRecord[] {
+  for (let i = 0; ; i++) {
+    try { return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : []; }
+    catch (e: any) { if (i >= 20) throw e; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50); }   // file mid-rename on Windows
+  }
+}
+export function updateCalls<T>(file: string, fn: (calls: CallRecord[]) => T): T { const c = loadCalls(file); const out = fn(c); saveFile(file, c); return out; }

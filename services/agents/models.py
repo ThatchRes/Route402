@@ -234,3 +234,66 @@ class Metrics(Model):
     llmOutputTokens: int
     rejectedRequests: dict
     avgToolLatencyMs: float
+
+
+# ---------- Paid procurement: the routing agent buys quotes, the compliance agent buys screens (x402 per call) ----------
+# Batched: one message per payment run, because replies are matched per (sender, receiver, session).
+class ProcureRequest(Model):
+    tenantId: str
+    correlationId: str
+    srcCcy: str
+    currentBank: dict                # the company's baseline bank terms
+    payments: List[dict]             # [{payable, destCcy, amount, deadlineUtc, beneficiary}]
+    policy: str = "cheapest"         # cheapest | fastest | lowest_risk
+
+
+class ProcureResult(Model):
+    correlationId: str
+    results: List[dict]              # per payment: {payable, decision, intentId, routeIds, reasons, quote, screen, paidCalls}
+    hops: List[dict]
+
+
+class ScreenRequest(Model):
+    tenantId: str
+    correlationId: str
+    items: List[dict]                # [{payable, beneficiary}]
+
+
+class ScreenResult(Model):
+    correlationId: str
+    results: List[dict]              # [{payable, status PASS|REVIEW|BLOCK|UNAVAILABLE, errors, warnings, notCovered, payment}]
+
+
+# ---------- Concierge (front door): everyday prompts and payment-run reviews ----------
+class AskBody(Model):
+    tenantId: str
+    correlationId: str
+    serviceToken: str
+    text: str
+    policy: Optional[str] = None     # overrides the policy read from the text
+
+
+class ReviewBody(Model):
+    tenantId: str
+    correlationId: str
+    serviceToken: str
+    homeCcy: str
+    currentBank: dict
+    payments: List[dict]             # [{payable, ccy, amount, deadlineUtc, beneficiary}]
+    policy: Optional[str] = None
+
+
+class AskResult(Model):
+    correlationId: str
+    status: str                      # ok | clarification | blocked | error
+    template: Optional[str] = None
+    title: Optional[str] = None
+    clarification: Optional[str] = None
+    preview: Optional[dict] = None   # the calculator's plan (router), for display
+    decisions: List[dict] = []       # one ProcureResult per payment that needs conversion
+    paidCalls: List[dict] = []
+    spentUsdc: str = "0"
+    policy: Optional[str] = None
+    hops: List[dict] = []
+    next: Optional[str] = None
+    error: Optional[str] = None

@@ -5,6 +5,7 @@
 //   4. route the remainder through the optimizer
 // Every saving is measured against the company's CURRENT bank, pricing each conversion with the same exact math.
 import { optimize, mid } from "../router/optimizer.js";
+import { bankMarkup, MARKET, midInfo } from "../router/market.js";
 import { convert, fmt, toMinor } from "../money.js";
 import { validate, type Beneficiary } from "./validate.js";
 import type { CompanyProfile } from "./profile.js";
@@ -18,7 +19,7 @@ type Conv = { costHome: bigint; debitHome: bigint; route: string; arrivalUtc?: s
 
 export function runPaymentRun(r: PaymentRunInput) {
   const co = r.company, H = co.homeCcy, now = r.nowUtc;
-  const bank = { label: co.currentBank.label, fxMarkupBps: co.currentBank.fxMarkupBps, wireFeeUsd: co.currentBank.wireFeeUsd, businessDays: co.currentBank.businessDays };
+  const bank = { label: co.currentBank.label, fxMarkupBps: co.currentBank.fxMarkupBps, wireFeeUsd: co.currentBank.wireFeeUsd, businessDays: co.currentBank.businessDays, measured: co.currentBank.measured };
   const midHome = (m: bigint, c: string) => convert(m, c, H, mid(c, H)).minor;
 
   // cost (vs mid) of buying `amount` of ccy from home currency: via the company's bank, or via our best route
@@ -84,7 +85,7 @@ export function runPaymentRun(r: PaymentRunInput) {
       while (ri < recs.length && recs[ri].dateUtc <= p.payOnUtc) { if (recs[ri].status === "confirmed") wallet += toMinor(recs[ri].amount, ccy); ri++; }
       const need = toMinor(p.amount, ccy), use = ccy === H ? 0n : (wallet >= need ? need : wallet); wallet -= use; matchedRec += use;
       const c = buy(ccy, need - use, p.payOnUtc, false); C += c.costHome; if (ccy !== H) volC += midHome(need - use, ccy);
-      lines.push({ payable: p.id, ccy, convertedAmount: fmt(need - use, ccy).split(" ")[0], deadlineUtc: p.payOnUtc,
+      lines.push({ payable: p.id, ccy, beneficiary: p.beneficiary, convertedAmount: fmt(need - use, ccy).split(" ")[0], deadlineUtc: p.payOnUtc,
                    payOnUtc: p.payOnUtc.slice(0, 10), amount: `${p.amount} ${ccy}`, fromWallet: fmt(use, ccy), converted: fmt(need - use, ccy),
                    route: need - use > 0n ? c.route : "wallet only", arrivesUtc: c.arrivalUtc, note: (p as any)._note || undefined, plan: c.input });
     }
@@ -97,16 +98,38 @@ export function runPaymentRun(r: PaymentRunInput) {
     A += sell(ccy, recCounted, true); B += sell(ccy, recCounted, false); if (ccy !== H) volA += midHome(recCounted, ccy);
   }
   const routing = A - B, hedge = B - C, total = routing + hedge + discountGain + validationAvoided;
-  const fee = total > 0n ? (total * BigInt(co.pricing.savingsSharePct)) / 100n : 0n;
+  // Our fee: flat bps of the volume we actually convert (volC, at mid). Existing balances, discounts and checks are free.
+  const feeBps = co.pricing.flatFeeBps ?? 15;
+  const fee = (volC * BigInt(Math.round(feeBps * 100))) / 1_000_000n;
+  const pctOf = (x: bigint, base: bigint) => base > 0n ? `${(Number((x * 1_000_000n) / base) / 10000).toFixed(2)}%` : "0.00%";
   const f = (x: bigint) => fmt(x, H);
   return {
-    company: co.name, homeCcy: H, baseline: `${co.currentBank.label}: ${co.currentBank.fxMarkupBps} bps FX markup, ${co.currentBank.wireFeeUsd} USD/wire, T+${co.currentBank.businessDays}`,
-    provenance: "synthetic rates; baseline from company bank terms", lines,
+    company: co.name, homeCcy: H,
+    baseline: co.currentBank.measured
+      ? `${co.currentBank.label}: measured bank FX markup per corridor, ${co.currentBank.wireFeeUsd} USD/wire, T+${co.currentBank.businessDays}`
+      : `${co.currentBank.label}: ${co.currentBank.fxMarkupBps} bps FX markup, ${co.currentBank.wireFeeUsd} USD/wire, T+${co.currentBank.businessDays}`,
+    market: {
+      mode: MARKET.mode, loadedAt: MARKET.loadedAt, sources: MARKET.sources, notes: MARKET.notes,
+      corridors: ccys.filter((c) => c !== H).map((c) => {
+        const b = co.currentBank.measured ? bankMarkup(H, c, co.currentBank.fxMarkupBps) : { bps: co.currentBank.fxMarkupBps, basis: "company-entered rate" };
+        const pr = MARKET.partners[`${H}/${c}`], m = midInfo(c);
+        return { pair: `${H}/${c}`, mid: m.rate, midSource: `${m.source}${m.date !== "-" ? ` ${m.date}` : ""}`, bankMarkupBps: b.bps, bankBasis: b.basis,
+                 partnerRail: pr ? `+${(pr.totalCostBps / 100).toFixed(2)}% all-in (measured)` : "not measured" };
+      }),
+    },
+    provenance: `mid rates: ${MARKET.mode}; bank baseline: ${co.currentBank.measured ? "measured (Wise comparison data)" : "company-entered"}; partner rail: measured partner price; stablecoin rails: synthetic catalog`, lines,
     expectedOnly: r.receivables.filter((x) => x.status === "expected").map((x) => `${x.id} ${x.amount} ${x.ccy} (expected, not relied on)`),
     fxVolume: { withYourBank: f(volA), withUs: f(volC) },
     costVsMid: { withYourBank: f(A), routingOnly: f(B), routingPlusWallets: f(C) },
     savings: { routing: f(routing), naturalHedge: f(hedge), earlyPayDiscounts: f(discountGain), failedPaymentsAvoided: f(validationAvoided), total: f(total) },
-    ourFee: f(fee), companyKeeps: f(total - fee),
+    savingsGroups: {
+      routing: { label: "routing savings (cheaper conversion; our fee applies to this volume)", total: f(routing) },
+      treasury: { label: "treasury suggestions (free)", items: { "pay from existing balances": f(hedge), "early-pay discounts": f(discountGain) }, total: f(hedge + discountGain) },
+      checks: { label: "pre-send checks (free)", items: { "failed payments avoided": f(validationAvoided) }, total: f(validationAvoided) },
+    },
+    ourFee: f(fee), feeRule: `${feeBps / 100}% of converted volume (${f(volC)})`, companyKeeps: f(total - fee),
+    percent: { savedOfFxVolume: pctOf(total, volA), keptOfFxVolume: pctOf(total - fee, volA), routingOfFxVolume: pctOf(routing, volA),
+               bankCostOfFxVolume: pctOf(A, volA), ourCostOfFxVolume: pctOf(C, volA), feeOfFxVolume: pctOf(fee, volA) },
     multiEntity: (co.entities?.length ?? 0) > 1 ? "netting and cash pooling available: npm run treasury" : "single entity: netting/pooling not applicable",
   };
 }

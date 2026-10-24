@@ -1,7 +1,8 @@
 // How a company ports its data in:
 //   npm run import -- nessie seed [--fresh]               create the demo company in your Nessie sandbox (once; --fresh = new one)
 //   npm run import -- nessie link [--customer ID]          link the company's bank data (then use: npm run ask)
-//   npm run import -- nessie run [--customer ID] [--execute] [--writeback]
+//   npm run import -- nessie run [--customer ID] [--execute] [--writeback] [--direct] [--policy cheapest|fastest|lowest_risk]
+//        the run is reviewed by the Fetch.ai agents (paid quotes + supplier screens via x402); --execute sends only approved bills
 //   npm run import -- csv link <file.csv>                 link an accounting export (then use: npm run ask)
 //   npm run import -- csv run <file.csv> [--execute]      e.g. samples/acme-ap-ar.csv (accounting-system export)
 //   npm run import -- csv template                        print the CSV header + example rows
@@ -14,6 +15,7 @@ import { runPaymentRun } from "../company/paymentRun.js";
 import { printRun, executeRun } from "../company/runner.js";
 import { DEMO_COMPANY } from "../company/profile.js";
 import { saveLinked } from "../assistant/linked.js";
+import { reviewWithAgents, paymentsOf, printAgents, policyFlag } from "../assistant/agents.js";
 
 const [src, cmd, arg] = process.argv.slice(2);
 const flag = (n: string) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : undefined; };
@@ -35,12 +37,17 @@ if (src === "nessie" && cmd === "seed") {
   if (cmd === "link") process.exit(0);
   console.log("");
   const r = runPaymentRun(imp.input); printRun(r);
+  let decisions: any[] | undefined;
+  if (!process.argv.includes("--direct")) {
+    try { const a = await reviewWithAgents(r.homeCcy, imp.input.company.currentBank, paymentsOf(r), policyFlag()); printAgents(a); decisions = a.decisions; }
+    catch (e: any) { console.error(`\n  ${e.message}`); if (process.argv.includes("--execute")) process.exit(1); }
+  }
   if (process.argv.includes("--execute")) {
     const opAcct = meta[`customer:${customerId}`]?.operatingAccountId;
     await executeRun(r, imp.input.company, process.argv.includes("--writeback") && opAcct ? async (l, st) => {
       await writeBack(opAcct, st.terms.totals.sourceDebit.split(" ")[0], st.transferId);
       console.log(`      recorded USD debit in Nessie account ${opAcct}`);
-    } : undefined);
+    } : undefined, decisions);
   }
 } else if (src === "csv" && (cmd === "run" || cmd === "link")) {
   if (!arg) { console.error("usage: npm run import -- csv run <file.csv>"); process.exit(1); }

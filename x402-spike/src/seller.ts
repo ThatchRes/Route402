@@ -5,8 +5,9 @@ import express from "express";
 import { createX402Server } from "@coinbase/cdp-sdk/x402";
 import { paymentMiddlewareFromHTTPServer } from "@x402/express";
 import { decodePaymentResponseHeader } from "@x402/core/http";
-import { NETWORK, USDC, PER_PAYMENT_USDC, PER_PAYMENT_ATOMIC, PAY_TO, INTERNAL_TOKEN } from "./config.js";
-import { load, update, type Order } from "./store.js";
+import { randomUUID } from "node:crypto";
+import { NETWORK, USDC, PER_PAYMENT_USDC, PER_PAYMENT_ATOMIC, PAY_TO, INTERNAL_TOKEN, CALL_PRICE_USDC, CALL_PRICE_ATOMIC, ROUTER_URL, ROUTER_TOKEN } from "./config.js";
+import { load, update, updateCalls, SELLER_CALLS, type Order } from "./store.js";
 import { auditOrder } from "./audit.js";
 
 const app = express();
@@ -73,6 +74,42 @@ app.use("/fund", (req, res, next) => {
   next();
 });
 
+// ---- Paid services: guard runs BEFORE the x402 middleware, so a malformed request is never charged ----
+const CCY = /^[A-Z]{3}$/, AMT = /^\d+(\.\d+)?$/;
+async function routerUp(): Promise<boolean> {
+  try { return (await fetch(`${ROUTER_URL}/v1/market`, { headers: { authorization: `Bearer ${ROUTER_TOKEN()}` }, signal: AbortSignal.timeout(3000) })).ok; }
+  catch { return false; }
+}
+app.use("/v1/quotes", async (req, res, next) => {
+  const b = req.body ?? {};
+  if (req.method !== "POST" || !CCY.test(b.srcCcy ?? "") || !CCY.test(b.destCcy ?? "") || !AMT.test(String(b.amount ?? ""))
+      || !["SOURCE_FIXED", "RECIPIENT_FIXED"].includes(b.amountType)) return res.status(400).json({ error: "srcCcy, destCcy, amount, amountType required" });
+  if (!(await routerUp())) return res.status(503).json({ error: "quote engine unavailable: not charging" });
+  next();
+});
+app.use("/v1/compliance/screen", async (req, res, next) => {
+  const b = req.body?.beneficiary;
+  if (req.method !== "POST" || !b || typeof b.name !== "string" || typeof b.country !== "string") return res.status(400).json({ error: "beneficiary {name, country, ...} required" });
+  if (!(await routerUp())) return res.status(503).json({ error: "screening service unavailable: not charging" });
+  next();
+});
+// Record every settled paid call (seller side). The agent wallet keeps its own record; `npm run calls` reconciles both.
+function recordCall(service: string, req: express.Request, res: express.Response) {
+  res.on("finish", () => {
+    const raw = res.getHeader("payment-response") ?? res.getHeader("x-payment-response");
+    if (!raw) return;
+    const s = decodePaymentResponseHeader(String(raw));
+    updateCalls(SELLER_CALLS, (calls) => { calls.push({ callId: randomUUID(), service, amountAtomic: CALL_PRICE_ATOMIC.toString(),
+      status: s.success && s.transaction ? "SETTLED" : "REJECTED", transaction: s.transaction?.toLowerCase(), payer: s.payer, payTo: PAY_TO(),
+      correlationId: req.header("x-correlation-id") ?? undefined, at: new Date().toISOString(), detail: s.errorReason }); });
+  });
+}
+const routerPost = async (path: string, body: unknown) => {
+  const r = await fetch(`${ROUTER_URL}${path}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${ROUTER_TOKEN()}` },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
+  return { ok: r.ok, status: r.status, json: await r.json() };
+};
+
 const server = await createX402Server({
   environment: "development",                          // Base Sepolia only; mainnet is not configurable here
   payToConfig: { type: "address", evm: PAY_TO() as `0x${string}` },
@@ -83,6 +120,14 @@ const server = await createX402Server({
       paymentFlow: "upfront",
       maxTimeoutSeconds: 120,
       description: "Fund one approved transfer order (test USDC)",
+    },
+    "POST /v1/quotes": {
+      price: `$${CALL_PRICE_USDC}`, networks: [NETWORK], paymentFlow: "upfront", maxTimeoutSeconds: 120,
+      description: "Route quote for one cross-border payment: candidates, recommended plan, cost vs mid, measured bank baseline",
+    },
+    "POST /v1/compliance/screen": {
+      price: `$${CALL_PRICE_USDC}`, networks: [NETWORK], paymentFlow: "upfront", maxTimeoutSeconds: 120,
+      description: "Beneficiary pre-send screen: account/IBAN/routing checks for one supplier",
     },
   },
 });
@@ -110,4 +155,33 @@ app.get("/fund", (req, res) => {
   res.json({ orderId, accepted: true, next: "awaiting on-chain confirmation" });
 });
 
-app.listen(8402, () => console.log(`x402 seller on :8402, receiving at ${server.payToEvmAddress} (Base Sepolia, test USDC only)`));
+app.post("/v1/quotes", async (req, res) => {
+  recordCall("quote", req, res);
+  const b = req.body;
+  try {
+    const r = await routerPost("/v1/intents", { srcCcy: b.srcCcy, destCcy: b.destCcy, amountType: b.amountType, amount: String(b.amount),
+      deadlineUtc: b.deadlineUtc, objective: b.objective ?? "balanced", currentBank: b.currentBank });
+    if (!r.ok) return res.status(200).json({ status: "NO_QUOTE", detail: r.json });
+    const d = r.json.decision;
+    res.json({ status: d.status, intentId: r.json.intentId, quoteExpiresInSec: 900, reason: d.reason,
+      plan: d.status === "OK" ? { kind: d.plan, sourceDebit: d.totals.sourceDebit, recipientNet: d.totals.recipientNet, arrivalUtc: d.totals.arrivalUtc,
+        allocations: d.allocations.map((a: any) => ({ routeId: a.routeId, label: a.label, x402Executable: a.x402Executable, amount: a.amount, arrivalUtc: a.arrivalUtc })) } : null,
+      costVsMidBps: d.costVsMidBps, baseline: d.baseline ? { routeId: d.baseline.routeId, sourceDebit: d.baseline.sourceDebit, meetsDeadline: d.baseline.meetsDeadline } : null,
+      bestX402: d.bestX402, cheapest: d.cheapest, fastest: d.fastest, value: d.value, provenance: d.provenance,
+      alternatives: (d.candidates ?? []).filter((c: any) => c.eligible).slice(0, 5) });
+  } catch (e: any) { res.status(200).json({ status: "NO_QUOTE", detail: String(e).slice(0, 200) }); }
+});
+
+app.post("/v1/compliance/screen", async (req, res) => {
+  recordCall("compliance", req, res);
+  try {
+    const r = await routerPost("/v1/company/beneficiaries/validate", [req.body.beneficiary]);
+    const v = Array.isArray(r.json) ? r.json[0] : null;
+    if (!v) return res.status(200).json({ status: "REVIEW", checks: [], detail: "validator returned no result" });
+    res.json({ status: v.status === "OK" ? "PASS" : v.status, beneficiary: req.body.beneficiary.name, errors: v.errors ?? [], warnings: v.warnings ?? [],
+      checks: ["account details present", "IBAN mod-97 / US routing checksum / CLABE check digit / Canadian transit format", "currency matches country"],
+      notCovered: ["sanctions screening", "business identity verification"] });
+  } catch (e: any) { res.status(200).json({ status: "REVIEW", detail: String(e).slice(0, 200) }); }
+});
+
+app.listen(8402, () => console.log(`x402 seller on :8402, receiving at ${server.payToEvmAddress} (Base Sepolia, test USDC only)\n  paid: POST /v1/quotes, POST /v1/compliance/screen at ${CALL_PRICE_USDC} test USDC per call | funding: GET /fund (settlement proof)`));

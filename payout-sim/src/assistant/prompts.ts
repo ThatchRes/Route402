@@ -75,7 +75,7 @@ export const TEMPLATES: Template[] = [
       const amount = fmt(toMinor(amt.toFixed(dest === "JPY" || dest === "KRW" ? 0 : 2), dest), dest).split(" ")[0];
       const q: any = optimize({ srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED", amount, deadlineUtc: w?.to, objective: "balanced",
         nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank });
-      return { title: `Send ${amount} ${dest} to ${ben.name}${w ? ` ${w.label}` : ""}`, beneficiaryCheck: v.status, preview: q.status === "OK" ? {
+      return { title: `Send ${amount} ${dest} to ${ben.name}${w ? ` ${w.label}` : ""}`, beneficiaryCheck: v.status, beneficiary: ben, preview: q.status === "OK" ? {
         route: q.allocations.map((a: any) => a.routeId).join(" + "), youPay: q.totals.sourceDebit, theyGet: q.totals.recipientNet, arrives: q.totals.arrivalUtc,
         yourBankWould: q.baseline?.sourceDebit, youSave: q.value.customerNetSaving } : q, intent: { srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED", amount, deadlineUtc: w?.to },
         nextStep: "approve to execute (creates a plan with a termsHash; executes only after approval)" };

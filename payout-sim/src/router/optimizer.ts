@@ -2,15 +2,18 @@
 // Every candidate is priced through the SAME quoteFor() the payout service executes, so numbers match exactly.
 import { quoteFor, type QuoteInput } from "../scenarios.js";
 import { convert, decimals, fmt, toMinor } from "../money.js";
-import { BANKS, NETWORKS, OFFRAMPS, ONRAMPS, PLATFORM, STABILITY, SWAPS, TOKENS, MID_PER_USD, type Tier } from "./registry.js";
+import { BANKS, NETWORKS, OFFRAMPS, ONRAMPS, PARTNER, PLATFORM, STABILITY, SWAPS, TOKENS, MID_PER_USD, type Tier } from "./registry.js";
 import { div, lessBps, mul } from "./rates.js";
+import { bankMarkup, MARKET, midInfo } from "./market.js";   // live mids overwrite the demo table before any price is computed
 
 export interface Intent {
   srcCcy: string; destCcy: string; amountType: "SOURCE_FIXED" | "RECIPIENT_FIXED"; amount: string;
   deadlineUtc?: string; objective?: "balanced" | "cheapest" | "fastest";   // default balanced = cost + speed
   allowSplit?: boolean; nowUtc?: string; midOverrides?: Record<string, string>;     // e.g. {"USD/XOF": "605.2"}
   liveOnly?: boolean;   // only routes whose funding can really execute today (x402 USDC on Base) or bank routes
-  currentBank?: { label: string; fxMarkupBps: number; wireFeeUsd: number; businessDays: number };   // the company's own bank = baseline
+  provider?: "stablecoin" | "partner" | "bank";   // one provider's routes only (each provider quotes separately)
+  currentBank?: { label: string; fxMarkupBps: number; wireFeeUsd: number; businessDays: number; measured?: boolean };   // the company's own bank = baseline
+  // measured: true -> the FX markup comes from measured bank pricing for this corridor (market.ts); fxMarkupBps is only the fallback
 }
 
 export function mid(a: string, b: string, o: Record<string, string> = {}): string {
@@ -42,8 +45,9 @@ interface Route {
 export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[] } {
   const o = it.midOverrides ?? {}, routes: Route[] = [], missing: string[] = [];
   try { mid(it.srcCcy, it.destCcy, o); } catch (e: any) { missing.push(e.message); return { routes, missing }; }
+  const cbBps = it.currentBank ? (it.currentBank.measured ? bankMarkup(it.srcCcy, it.destCcy, it.currentBank.fxMarkupBps).bps : it.currentBank.fxMarkupBps) : 0;
   const banks = it.currentBank
-    ? [{ id: "current_bank", label: `${it.currentBank.label} (your current bank)`, fixedUsd: it.currentBank.wireFeeUsd, tiers: [{ upToUsd: Infinity, bps: it.currentBank.fxMarkupBps }],
+    ? [{ id: "current_bank", label: `${it.currentBank.label} (your current bank)`, fixedUsd: it.currentBank.wireFeeUsd, tiers: [{ upToUsd: Infinity, bps: cbBps }],
          businessDays: it.currentBank.businessDays, cutoffUtcHour: 21, capacityUsd: Infinity, dest: "*" as const, isBaseline: true },
        ...BANKS.filter((b) => !b.isBaseline)]
     : BANKS;
@@ -58,6 +62,15 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
         const start = isBiz(now) && now.getUTCHours() < b.cutoffUtcHour ? now : nextBiz(now, 9);
         return addBizDays(start, b.businessDays);
       } });
+  }
+  // Partner rail: a licensed payment partner, priced from measured partner pricing for this corridor (when measured)
+  const partner = MARKET.partners[`${it.srcCcy}/${it.destCcy}`];
+  if (partner) {
+    routes.push({ routeId: "partner:measured", kind: "bank", label: "Payment partner rail (measured partner price)", x402Executable: false,
+      capacityUsd: PARTNER.capacityUsd, steps: [`${it.srcCcy} debit`, `partner FX ${it.srcCcy}->${it.destCcy}`, `${it.destCcy} local payout`], pegDeviation: 0, coins: [],
+      build: (amountType, amount) => ({ route: "bank", srcCcy: it.srcCcy, destCcy: it.destCcy, amountType, amount,
+        fxRate: lessBps(mid(it.srcCcy, it.destCcy, o), partner.totalCostBps), fundingFee: "0", payoutFee: "0" }),
+      arrival: (now) => addBizDays(isBiz(now) && now.getUTCHours() < PARTNER.cutoffUtcHour ? now : nextBiz(now, 9), PARTNER.businessDays) });
   }
   for (const on of ONRAMPS.filter((x) => x.src === it.srcCcy)) {
     const tok = TOKENS.find((t) => t.id === on.token)!;
@@ -150,7 +163,8 @@ export function optimize(it: Intent) {
   const deadline = it.deadlineUtc ? new Date(it.deadlineUtc) : undefined;
   const { routes, missing } = enumerateRoutes(it);
   if (missing.length) return { status: "MISSING_INPUT", missing };
-  const usable = it.liveOnly ? routes.filter((r) => r.kind === "bank" || r.x402Executable) : routes;
+  const ofProvider = (id: string) => id.startsWith("coin:") ? "stablecoin" : id.startsWith("partner:") ? "partner" : id === "bank:current_bank" ? "baseline" : "bank";
+  const usable = routes.filter((r) => (!it.liveOnly || r.kind === "bank" || r.x402Executable) && (!it.provider || ofProvider(r.routeId) === it.provider));
   const priced = usable.map((r) => price(r, it, it.amount, now, deadline));
   const eligible = priced.filter((p) => p.eligible).sort((a, b) => (it.objective === "fastest"
     ? a.arrivalUtc.localeCompare(b.arrivalUtc) || Number(a.scoreMinor - b.scoreMinor) : Number(a.scoreMinor - b.scoreMinor)));
@@ -196,10 +210,23 @@ export function optimize(it: Intent) {
     savingsMinor = it.amountType === "RECIPIENT_FIXED" ? BigInt(baseline.quote.sourceDebit.minor) - debit
       : convert(net - BigInt(baseline.quote.recipientNet.minor), it.destCcy, it.srcCcy, mid(it.destCcy, it.srcCcy, it.midOverrides ?? {})).minor;
   }
-  const feeMinor = savingsMinor > 0n ? (savingsMinor * BigInt(PLATFORM.savingsSharePct)) / 100n : 0n;
+  // flat fee on converted volume, valued at mid in the source currency (never negative)
+  const volSrc = it.amountType === "RECIPIENT_FIXED" ? convert(net, it.destCcy, it.srcCcy, mid(it.destCcy, it.srcCcy, it.midOverrides ?? {})).minor : debit;
+  const feeMinor = (volSrc * BigInt(PLATFORM.flatFeeBps)) / 10000n;
   const latest = chosen.map((c) => c.arrivalUtc).sort().at(-1)!;
+  // cost above mid in bps (what the payer gives up vs the mid-market rate), for the plan and the bank baseline
+  const atMidSrc = it.amountType === "RECIPIENT_FIXED" ? convert(net, it.destCcy, it.srcCcy, mid(it.destCcy, it.srcCcy, it.midOverrides ?? {})).minor : debit;
+  const bps = (d: bigint, n: bigint) => {
+    if (it.amountType === "RECIPIENT_FIXED") return atMidSrc > 0n ? Number(((d - atMidSrc) * 1000000n) / atMidSrc) / 100 : 0;
+    const fair = convert(d, it.srcCcy, it.destCcy, mid(it.srcCcy, it.destCcy, it.midOverrides ?? {})).minor;
+    return fair > 0n ? Number(((fair - n) * 1000000n) / fair) / 100 : 0;
+  };
+  const bankBasis = it.currentBank?.measured ? bankMarkup(it.srcCcy, it.destCcy, it.currentBank.fxMarkupBps) : it.currentBank ? { bps: it.currentBank.fxMarkupBps, basis: "company-entered rate" } : null;
   return {
-    status: "OK", decisionRecordId: `dr_${Date.now().toString(36)}`, provenance: "synthetic", intent: it,
+    status: "OK", decisionRecordId: `dr_${Date.now().toString(36)}`, intent: it,
+    provenance: { midRates: `${MARKET.mode}: ${it.srcCcy} ${midInfo(it.srcCcy).source}, ${it.destCcy} ${midInfo(it.destCcy).source}`,
+                  bankBaseline: bankBasis ? `${bankBasis.bps} bps: ${bankBasis.basis}` : "none", ourRouteCosts: "partner rail: measured partner price (Wise comparison data); stablecoin and bank-partner rails: synthetic catalog (registry.ts)" },
+    costVsMidBps: { plan: bps(debit, net), bank: baseline?.quote ? bps(BigInt(baseline.quote.sourceDebit.minor), BigInt(baseline.quote.recipientNet.minor)) : null },
     objective: it.objective ?? "balanced", plan: useSplit ? "split" : "single",
     allocations: chosen.map((c) => ({ routeId: c.routeId, label: c.label, token: c.token, network: c.network,
       x402Executable: c.x402Executable, amount: c.amount, quote: c.quote, arrivalUtc: c.arrivalUtc, steps: c.steps })),
@@ -214,7 +241,7 @@ export function optimize(it: Intent) {
     baseline: baseline?.quote ? { routeId: baseline.routeId, label: baseline.label, sourceDebit: baseline.quote.sourceDebit.display, sourceDebitMinor: baseline.quote.sourceDebit.minor,
       recipientNet: baseline.quote.recipientNet.display, arrivalUtc: baseline.arrivalUtc, meetsDeadline: baseline.eligible } : null,
     value: { customerSavings: fmt(savingsMinor, it.srcCcy), platformFee: fmt(feeMinor, it.srcCcy),
-             customerNetSaving: fmt(savingsMinor - feeMinor, it.srcCcy), feeRule: `${PLATFORM.savingsSharePct}% of measured savings, only when savings > 0` },
+             customerNetSaving: fmt(savingsMinor - feeMinor, it.srcCcy), feeRule: `${PLATFORM.flatFeeBps / 100}% of converted volume` },
     candidates: priced.map((p) => ({ routeId: p.routeId, label: p.label, eligible: p.eligible, reason: p.reason, x402Executable: p.x402Executable,
       sourceDebit: p.quote?.sourceDebit.display, recipientNet: p.quote?.recipientNet.display, arrivalUtc: p.arrivalUtc })),
   };

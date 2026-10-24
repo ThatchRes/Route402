@@ -1,30 +1,40 @@
-"""Gateway agent: the ONLY entry point for Person A's API (port 8100).
+"""Concierge (gateway) agent: the front door for people and for Person A's API (port 8100).
 Auth + tenant check + rate limit + jobId de-dup, then a typed message to the right agent.
+/ask     everyday prompt -> calculator preview -> routing agent buys quotes + compliance agent buys screens (x402)
+         -> approve/hold per payment, with the on-chain evidence of every paid call
+/review  same review for an explicit payment run (used by `npm run import -- nessie run`)
 /coordinate returns a synchronous multi-agent trace for one instruction.
-Optional: ENABLE_CHAT=1 adds the Fetch.ai chat protocol + mailbox for Agentverse/ASI:One."""
+ENABLE_CHAT=1 (default for the demo) adds the Fetch.ai chat protocol + Agentverse mailbox, so ASI:One can reach it."""
 import os
 import asyncio
 asyncio.set_event_loop(asyncio.new_event_loop())   # Python 3.14: uAgents needs a loop to exist
 
 import json
 import time
+from decimal import Decimal
 from uagents import Agent, Context
 
 import backend
 import llm
 import reasoning
-from addressbook import RESOLVER, ROUTING, INVESTIGATION, LIQUIDITY, EXECUTOR, RECONCILIATION, GATEWAY_PORT
+from addressbook import RESOLVER, ROUTING, INVESTIGATION, LIQUIDITY, EXECUTOR, RECONCILIATION, COMPLIANCE, GATEWAY_PORT
 from guard import RateLimiter, JobDedupe, USAGE, safe_id, redact
 from models import (ParseBody, ParseResult, RouteJobBody, InvestigateBody, LiquidityBody, ExecuteBody,
                     ReconcileBody, Accepted, TraceResult, Health, Metrics, RouteRequest, RouteResult,
                     InvestigateRequest, InvestigateResult, LiquidityRequest, LiquidityResult,
-                    ExecuteStepRequest, ExecuteStepResult, ReconcileRequest, ReconcileResult)
+                    ExecuteStepRequest, ExecuteStepResult, ReconcileRequest, ReconcileResult,
+                    AskBody, ReviewBody, AskResult, ProcureRequest, ProcureResult)
 
 TOKEN = os.getenv("AGENT_SERVICE_TOKEN", "dev-only-token")
 ALLOWED_TENANTS = {t.strip() for t in os.getenv("ALLOWED_TENANTS", "demo-tenant").split(",") if t.strip()}
-CHAT = os.getenv("ENABLE_CHAT", "0") == "1"
+CHAT = os.getenv("ENABLE_CHAT", "1") == "1"
+README = os.path.join(os.path.dirname(__file__), "AGENT_README.md")
 
-kwargs = dict(name="gateway", seed=os.environ["GATEWAY_SEED"], port=GATEWAY_PORT, resolve=RESOLVER)
+kwargs = dict(name=os.getenv("AGENT_NAME", "Cross-Border AP Concierge"), seed=os.environ["GATEWAY_SEED"], port=GATEWAY_PORT,
+              resolve=RESOLVER, handle_messages_concurrently=True,
+              description="Plans a company's international supplier payments: buys route quotes and supplier screens "
+                          "with x402 (Base Sepolia test USDC), approves or holds each payment, explains why. Preview only in chat.",
+              readme_path=README if os.path.exists(README) else None)
 if CHAT:
     kwargs.update(mailbox=True, publish_agent_details=True)
 else:
@@ -68,12 +78,85 @@ async def dispatch(ctx, req, route, dest, msg):
 
 
 # ------------------------------------------------------------------ REST
+# ------------------------------------------------------------------ concierge: prompts and payment-run reviews
+def payments_from_preview(r: dict) -> list:
+    """Payments that need conversion, from the calculator's preview (bills paid from wallets need no quote)."""
+    if r.get("template") == "pay_bills":
+        run = r.get("preview") or {}
+        home = run.get("homeCcy", "USD")
+        return [{"payable": l["payable"], "destCcy": l["ccy"], "amount": l["convertedAmount"], "deadlineUtc": l.get("deadlineUtc"),
+                 "beneficiary": l.get("beneficiary") or {"name": l["payable"], "country": "??"}}
+                for l in run.get("lines", []) if l.get("convertedAmount") and float(l["convertedAmount"]) > 0 and l.get("ccy") != home]
+    if r.get("template") == "send_to" and r.get("intent") and r.get("beneficiary"):
+        it = r["intent"]
+        return [{"payable": f"send:{r['beneficiary'].get('name', 'beneficiary')}", "destCcy": it["destCcy"], "amount": it["amount"],
+                 "deadlineUtc": it.get("deadlineUtc"), "beneficiary": r["beneficiary"]}]
+    return []
+
+
+async def run_review(ctx, tenant, corr, home, bank, payments, policy="cheapest"):
+    if not payments:
+        return [], [], []
+    reply, status = await ctx.send_and_receive(
+        ROUTING, ProcureRequest(tenantId=tenant, correlationId=corr, srcCcy=home, currentBank=bank, payments=payments, policy=policy),
+        response_type=ProcureResult, timeout=200)
+    if not isinstance(reply, ProcureResult):
+        return [{"payable": p["payable"], "decision": "hold", "routeIds": [], "intentId": None, "paidCalls": [],
+                 "reasons": [f"routing agent did not reply ({status}): not sending"]} for p in payments], [], []
+    paid = [c for r in reply.results for c in r.get("paidCalls", [])]
+    return reply.results, paid, reply.hops
+
+
+def spent(paid):
+    return str(sum((Decimal(str(c.get("priceUsdc", "0"))) for c in paid if not c.get("mock")), Decimal("0")))
+
+
+async def concierge_ask(ctx, tenant, corr, text, policy=None) -> AskResult:
+    policy = reasoning.policy_from_text(text, policy)
+    try:
+        r = await backend.assistant_ask(tenant, corr, text)
+    except Exception as e:  # noqa: BLE001
+        return AskResult(correlationId=corr, status="error", error=f"calculator (router) unavailable: {e}")
+    if r.get("clarification"):
+        return AskResult(correlationId=corr, status="clarification", template=r.get("template"), clarification=r["clarification"])
+    if r.get("blocked"):
+        return AskResult(correlationId=corr, status="blocked", template=r.get("template"), title=r.get("beneficiary"),
+                         clarification="; ".join(r["blocked"]))
+    company = r.get("company") or {}
+    home = (r.get("preview") or {}).get("homeCcy") or company.get("homeCcy", "USD")
+    bank = company.get("currentBank") or {}
+    decisions, paid, hops = await run_review(ctx, tenant, corr, home, bank, payments_from_preview(r), policy)
+    hops = [{"from": "user", "to": "concierge", "message": "ask"}, {"from": "concierge", "to": "router", "message": "calculator preview"}] + hops
+    return AskResult(correlationId=corr, status="ok", template=r.get("template"), title=r.get("title"), preview=r,
+                     decisions=decisions, paidCalls=paid, spentUsdc=spent(paid), hops=hops, policy=policy,
+                     next="execution needs approval in the app (npm run ask -- \"...\" --execute); only approved payments are sent")
+
+
+@gateway.on_rest_post("/ask", AskBody, AskResult)
+async def ask(ctx: Context, req: AskBody) -> AskResult:
+    err = check(req, "ask")
+    if err:
+        return AskResult(correlationId=req.correlationId, status="error", error=err)
+    return await concierge_ask(ctx, req.tenantId, req.correlationId, req.text[:500], req.policy)
+
+
+@gateway.on_rest_post("/review", ReviewBody, AskResult)
+async def review(ctx: Context, req: ReviewBody) -> AskResult:
+    err = check(req, "review")
+    if err:
+        return AskResult(correlationId=req.correlationId, status="error", error=err)
+    policy = reasoning.policy_from_text("", req.policy)
+    decisions, paid, hops = await run_review(ctx, req.tenantId, req.correlationId, req.homeCcy, req.currentBank, req.payments[:25], policy)
+    return AskResult(correlationId=req.correlationId, status="ok", template="payment_run", decisions=decisions, paidCalls=paid,
+                     spentUsdc=spent(paid), policy=policy, hops=[{"from": "app", "to": "concierge", "message": "review"}] + hops)
+
+
 @gateway.on_rest_get("/health", Health)
 async def health(ctx: Context) -> Health:
     return Health(status="ok", mockApi=backend.MOCK, llmEnabled=llm.ENABLED,
                   agents={"gateway": gateway.address, "routing": ROUTING, "liquidity": LIQUIDITY,
                           "executionCoordinator": EXECUTOR, "reconciliation": RECONCILIATION,
-                          "investigation": INVESTIGATION})
+                          "investigation": INVESTIGATION, "compliance": COMPLIANCE})
 
 
 @gateway.on_rest_get("/metrics", Metrics)
@@ -202,6 +285,32 @@ if CHAT:
     chat = Protocol(spec=chat_protocol_spec)
     CHAT_TENANT = os.getenv("CHAT_TENANT", "demo-tenant")
 
+    chat_limiter = RateLimiter(int(os.getenv("CHAT_PAID_PER_MIN", "3")))   # each chat review spends test USDC
+
+    def format_answer(a: AskResult) -> str:
+        if a.status != "ok":
+            return redact(a.clarification or a.error or "I couldn't plan that.")
+        out = [a.title or "Plan"]
+        p = a.preview or {}
+        run = p.get("preview") if isinstance(p.get("preview"), dict) else None
+        if run and run.get("savings"):
+            pct = (run.get("percent") or {}).get("keptOfFxVolume")
+            out.append(f"Savings vs your bank: {run['savings'].get('total')}; company keeps {run.get('companyKeeps')}"
+                       + (f" ({pct} of FX volume)." if pct else "."))
+        if a.decisions:
+            out.append(f"Policy: {a.policy} (say 'fastest' or 'lowest risk' to change it).")
+        for d in a.decisions:
+            out.append(redact(f"- {d['payable']}: {d['decision'].upper()} via {d.get('chosen') or '-'}. " + " ".join(d.get("reasons", [])[:2])))
+            for c in d.get("paidCalls", []):
+                out.append(f"    paid {c.get('service')} {c.get('priceUsdc')} test USDC: {c.get('explorer')}")
+        if a.paidCalls:
+            out.append(f"My agents paid for {len(a.paidCalls)} calls with x402 ({a.spentUsdc} test USDC on Base Sepolia).")
+        if not a.decisions and run is None:
+            rest = {k: v for k, v in p.items() if k not in ("template", "source", "title", "company")}
+            out.append(redact(json.dumps(rest)[:1200]))
+        out.append("Chat is preview-only: payments are sent only after approval in the company app.")
+        return "\n".join(out)
+
     @chat.on_message(ChatMessage)
     async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(sender, ChatAcknowledgement(timestamp=datetime.now(timezone.utc),
@@ -209,7 +318,6 @@ if CHAT:
         text = "".join(c.text for c in msg.content if isinstance(c, TextContent)).strip()
         corr = f"chat-{uuid4().hex[:12]}"
         parts = text.split()
-        answer = "Commands: 'status <transferId>' or 'route <intentId>'. Read-only; I cannot move money."
         if len(parts) == 2 and parts[0].lower() in ("status", "route"):
             try:
                 ref = safe_id(parts[1], "id")
@@ -218,16 +326,24 @@ if CHAT:
                         jobId=corr, tenantId=CHAT_TENANT, transferId=ref, correlationId=corr),
                         response_type=InvestigateResult, timeout=30)
                     answer = (f"{r.exceptionType}. Missing: {', '.join(r.missingEvidence) or 'nothing'}. "
-                              + " ".join(r.hypotheses)) if r else "Investigation agent did not reply."
+                              + " ".join(r.hypotheses)) if isinstance(r, InvestigateResult) else "Investigation agent did not reply."
                 else:
                     r, _ = await ctx.send_and_receive(ROUTING, RouteRequest(
                         jobId=corr, tenantId=CHAT_TENANT, intentId=ref, correlationId=corr),
                         response_type=RouteResult, timeout=30)
-                    answer = r.explanation if r else "Routing agent did not reply."
+                    answer = r.explanation if isinstance(r, RouteResult) else "Routing agent did not reply."
             except ValueError:
                 answer = "Invalid id."
+            answer = redact(answer)
+        elif not text:
+            answer = 'Try: "pay my Canadian suppliers this week", "send 50k CAD to Maple Freight by Friday", "how much can I save this month".'
+        elif not chat_limiter.allow(sender):
+            answer = "Rate limit: each plan buys paid quotes. Try again in a minute."
+        else:
+            ctx.logger.info(redact(f"[{corr}] chat from {sender[:16]}...: {text[:120]}"))
+            answer = format_answer(await concierge_ask(ctx, CHAT_TENANT, corr, text[:500]))
         await ctx.send(sender, ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(),
-                                           content=[TextContent(type="text", text=redact(answer)),
+                                           content=[TextContent(type="text", text=answer),   # parts redacted above; tx links kept
                                                     EndSessionContent(type="end-session")]))
 
     @chat.on_message(ChatAcknowledgement)

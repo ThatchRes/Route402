@@ -137,4 +137,6 @@ export const OFFRAMPS: Offramp[] = [
       dest: [ccy], tiers: [{ upToUsd: Infinity, bps: 10 }], fixedUsd: 1, capacityUsd: 400_000, payoutMin: mins, cutoffUtcHour: cutoff })),
 ];
 
-export const PLATFORM = { savingsSharePct: 20, timeValueBpsPerDay: 1.5 };   // fee = 20% of measured savings; time value for cost+speed ranking
+export const PLATFORM = { flatFeeBps: 15, timeValueBpsPerDay: 1.5 };   // fee = 0.15% of converted volume (at mid); time value for cost+speed ranking
+/** Partner rail: priced from measured partner pricing (market.ts). Arrival and capacity are labeled assumptions. */
+export const PARTNER = { businessDays: 1, cutoffUtcHour: 20, capacityUsd: 1_000_000 };

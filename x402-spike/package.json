@@ -16,7 +16,10 @@
     "status": "tsx src/status.ts",
     "selftest": "tsx src/selftest.ts",
     "audit": "tsx src/auditCli.ts",
-    "fund": "tsx src/fund.ts"
+    "fund": "tsx src/fund.ts",
+    "wallet": "tsx src/agentWallet.ts",
+    "calls": "tsx src/callsCli.ts",
+    "providers": "tsx src/providers.ts"
   },
   "dependencies": {
     "@coinbase/cdp-sdk": "1.60.0",

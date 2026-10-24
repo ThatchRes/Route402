@@ -207,3 +207,62 @@ async def get_reconciliation_view(tenant, transfer_id, corr):
              "evidenceRef": "sim_789", "status": "CREDITED"}]})
     return await _call("get_reconciliation_view", "GET",
                        f"/v1/transfers/{safe_id(transfer_id, 'transferId')}/reconciliation", tenant, corr)
+
+
+# ------------------------------------------------------------------ paid calls (x402, pay per request)
+WALLET = os.getenv("AGENT_WALLET_URL", "http://localhost:8405")
+WALLET_TOKEN = os.getenv("X402_INTERNAL_TOKEN", "")
+WALLET_MOCK = os.getenv("AGENT_WALLET_MOCK", "0") == "1"     # tests only: labeled fake payments, no chain
+
+
+async def paid_call(service: str, body: dict, corr: str, caller: str) -> dict:
+    """Ask the agent wallet to buy ONE call to an allow-listed service with x402.
+    Returns {ok, data, payment:{transaction, explorer, priceUsdc, ...}, budget} or {ok: False, error}.
+    The wallet checks the seller's terms, the per-call price and the budget; the agent never holds keys."""
+    if service not in ("quote", "compliance", "quote:stablecoin", "quote:partner", "quote:bank"):
+        raise ValueError("unknown paid service")
+    safe_id(corr, "correlationId")
+    t0 = time.time()
+    try:
+        if WALLET_MOCK:
+            return {"ok": True, "data": _mock_paid(service, body), "mock": True,
+                    "payment": {"service": service, "priceUsdc": "0.001", "transaction": "0xMOCK", "explorer": "(mock: no chain)"},
+                    "budget": {"spentUsdc": "0.000", "capUsdc": "0.10"}}
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(f"{WALLET}/pay-call", json={"service": service, "body": body, "correlationId": corr, "caller": caller},
+                             headers={"Authorization": f"Bearer {WALLET_TOKEN}"})
+        try:
+            out = r.json()
+        except ValueError:
+            out = {"ok": False, "error": f"wallet HTTP {r.status_code}"}
+        return out
+    except httpx.HTTPError as e:
+        return {"ok": False, "error": f"agent wallet unreachable ({type(e).__name__}): start `npm run wallet` in x402-spike"}
+    finally:
+        USAGE.tool(f"paid_{service}", (time.time() - t0) * 1000)
+
+
+_MOCK_PROVIDERS = {"stablecoin": (25.0, "2026-10-26T14:30:00Z", 2, "USDC on Base with on-chain settlement proof", True),
+                   "partner": (5.0, "2026-10-27T17:00:00Z", 2, "licensed payment partner", False),
+                   "bank": (40.0, "2026-10-27T17:00:00Z", 1, "regulated bank rail", False)}
+
+
+def _mock_paid(service, body):
+    if service.startswith("quote:"):
+        pid = service.split(":", 1)[1]
+        bps, arr, risk, why, live = _MOCK_PROVIDERS[pid]
+        return {"provider": pid, "status": "OK", "intentId": f"int_mock_{pid}", "providerLabel": f"{pid} provider (mock)",
+                "plan": {"kind": "single", "sourceDebit": "100.00 USD", "recipientNet": f"{body.get('amount')} {body.get('destCcy')}", "arrivalUtc": arr,
+                         "allocations": [{"routeId": f"{pid}:mock", "label": "mock", "x402Executable": live}]},
+                "costVsMidBps": {"plan": bps, "bank": 126.0}, "risk": {"score": risk, "why": why}, "provenance": {"bankBaseline": "mock"}}
+    if service == "compliance":
+        return {"status": "PASS", "errors": [], "warnings": [], "notCovered": ["sanctions screening"]}
+    return {"status": "OK", "intentId": "int_mock", "plan": {"kind": "single", "sourceDebit": "100.00 USD", "recipientNet": f"{body.get('amount')} {body.get('destCcy')}",
+            "arrivalUtc": "2026-10-27T17:00:00Z", "allocations": [{"routeId": "coin:USDC:base:mock", "label": "mock", "x402Executable": True}]},
+            "costVsMidBps": {"plan": 25.0, "bank": 140.0}, "provenance": {"midRates": "mock"}}
+
+
+# ------------------------------------------------------------------ the calculator (router), for the concierge
+async def assistant_ask(tenant, corr, text: str):
+    """Router's deterministic prompt templates + payment-run calculator over the company's linked data (preview only)."""
+    return await _call("assistant_ask", "POST", "/v1/assistant/ask", tenant, corr, {"text": text[:500]})

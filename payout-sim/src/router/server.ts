@@ -24,6 +24,8 @@ import { DEMO_COMPANY } from "../company/profile.js";
 import { ask } from "../assistant/prompts.js";
 import { loadLinked } from "../assistant/linked.js";
 import { fmt, toMinor } from "../money.js";
+import { MARKET, marketSummary } from "./market.js";
+import { TOKENS } from "./registry.js";
 
 const app = express();
 app.use(express.json());
@@ -41,15 +43,43 @@ const err = (res: express.Response, status: number, code: string, message: strin
   res.status(status).json({ code, message, details, retryable: false, correlationId: res.req.header("x-correlation-id") });
 
 // ------------------------------------------------------------------ intents + decisions
-app.post("/v1/intents", (req, res) => {
-  const it: Intent = req.body;
-  if (!it?.srcCcy || !it?.destCcy || !it?.amount || !["SOURCE_FIXED", "RECIPIENT_FIXED"].includes(it.amountType))
-    return err(res, 400, "INVALID_INTENT", "srcCcy, destCcy, amount, amountType required");
-  let decision: any;
-  try { decision = optimize(it); } catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
+function createIntent(it: Intent) {
+  const decision: any = optimize(it);
   const intentId = `int_${randomUUID().slice(0, 8)}`;
   update((db) => { db.intents[intentId] = { intentId, intent: it, decision, createdAt: now() }; });
-  res.status(201).json({ intentId, decision });
+  return { intentId, decision };
+}
+const validIntent = (it: any) => it?.srcCcy && it?.destCcy && it?.amount && ["SOURCE_FIXED", "RECIPIENT_FIXED"].includes(it.amountType);
+
+app.post("/v1/intents", (req, res) => {
+  const it: Intent = req.body;
+  if (!validIntent(it)) return err(res, 400, "INVALID_INTENT", "srcCcy, destCcy, amount, amountType required");
+  try { res.status(201).json(createIntent(it)); } catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
+});
+
+// One provider's quote (stablecoin rail | partner rail | bank partner). Each provider service calls this for its own routes only.
+// The returned intentId is bound to that provider's plan, so executing it sends exactly what that provider quoted.
+const RISK: Record<string, { score: number; why: string }> = {
+  bank: { score: 1, why: "regulated bank rail" },
+  partner: { score: 2, why: "licensed payment partner" },
+  stablecoin_live: { score: 2, why: "USD stablecoins; USDC-on-Base legs carry an on-chain settlement proof" },
+  stablecoin: { score: 3, why: "local stablecoin rail: thinner liquidity, simulated off-ramp" },
+};
+app.post("/v1/provider-quote", (req, res) => {
+  const { provider, ...it } = req.body ?? {};
+  if (!["stablecoin", "partner", "bank"].includes(provider) || !validIntent(it)) return err(res, 400, "INVALID_INTENT", "provider + intent required");
+  let r: any;
+  try { r = createIntent({ ...it, provider, objective: it.objective ?? "cheapest" }); } catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
+  const d = r.decision;
+  if (d.status !== "OK") return res.json({ provider, status: "NO_QUOTE", reason: d.reason || (d.missing ?? []).join("; ") || "no route from this provider" });
+  // stablecoin risk: USD coins only (USDC/USDG/PYUSD...) = 2; any local-currency coin (thinner liquidity) = 3
+  const usdOnly = d.allocations.every((a: any) => !String(a.routeId).includes(">")          // a swap into a local coin
+    && (!a.token || TOKENS.find((t) => t.id === a.token)?.peg === "USD"));
+  const risk = provider !== "stablecoin" ? RISK[provider] : usdOnly ? RISK.stablecoin_live : RISK.stablecoin;
+  res.json({ provider, status: "OK", intentId: r.intentId, quoteExpiresInSec: 900,
+    plan: { kind: d.plan, sourceDebit: d.totals.sourceDebit, recipientNet: d.totals.recipientNet, arrivalUtc: d.totals.arrivalUtc,
+            allocations: d.allocations.map((a: any) => ({ routeId: a.routeId, label: a.label, x402Executable: a.x402Executable, amount: a.amount, arrivalUtc: a.arrivalUtc })) },
+    costVsMidBps: d.costVsMidBps, risk, baseline: d.baseline ? { sourceDebit: d.baseline.sourceDebit } : null, value: d.value, provenance: d.provenance });
 });
 app.get("/v1/intents/:id", (req, res) => { const i = load().intents[String(req.params.id)]; return i ? res.json(i) : err(res, 404, "NOT_FOUND", "intent"); });
 
@@ -112,12 +142,12 @@ function setStep(transferId: string, stepId: string, status: string, extra: any 
   update((db) => { const x = db.transfers[transferId]; x.steps[stepId] = { ...(x.steps[stepId] ?? {}), status, ...extra, at: now() }; });
 }
 
-function runX402Fund(childId: string): Promise<string> {
+function runX402Fund(childId: string): Promise<{ orderId: string; tx?: string }> {
   return new Promise((resolve, reject) => {
     const p = spawn("npx", ["tsx", "src/fund.ts", childId], { cwd: X402_DIR, shell: process.platform === "win32" });
     let out = ""; p.stdout.on("data", (d) => (out += d)); p.stderr.on("data", (d) => (out += d));
     p.on("close", () => { const last = out.trim().split("\n").reverse().find((l) => /^(NOT_)?FUNDED /.test(l));
-      last?.startsWith("FUNDED ") ? resolve(last.split(" ")[1]) : reject(new Error(`x402 funding failed: ${last ?? out.slice(-300)}`)); });
+      last?.startsWith("FUNDED ") ? resolve({ orderId: last.split(" ")[1], tx: last.split(" ")[2] }) : reject(new Error(`x402 funding failed: ${last ?? out.slice(-300)}`)); });
   });
 }
 
@@ -129,8 +159,11 @@ async function execute(transferId: string) {
     let funding: any;
     const live = input.route === "stablecoin" && input.fundingAsset === "USDC" && (input.network ?? "base") === "base";
     if (live) {
-      setStep(transferId, fundStep, "REQUESTED", { rail: "x402 USDC on Base Sepolia (real testnet)" });
-      try { const orderId = await runX402Fund(childId); funding = { mode: "x402_testnet", orderId }; setStep(transferId, fundStep, "CONFIRMED", { orderId }); }
+      const rail = "x402 settlement proof: 0.01 test USDC on Base Sepolia (proves the settlement path; not the transfer amount)";
+      setStep(transferId, fundStep, "REQUESTED", { rail });
+      try { const { orderId, tx } = await runX402Fund(childId); funding = { mode: "x402_testnet", orderId };
+        setStep(transferId, fundStep, "CONFIRMED", { rail, orderId, proofTx: tx, explorer: tx ? `https://sepolia.basescan.org/tx/${tx}` : undefined,
+          transferAmountRail: `${input.route === "stablecoin" ? "stablecoin" : "bank"} payout of the full amount: simulated payout partner` }); }
       catch (e: any) { setStep(transferId, fundStep, "UNKNOWN", { detail: e.message }); throw e; }   // never re-funds blindly
     } else {
       funding = { mode: input.route === "stablecoin" ? "simulated_token" : "simulated_bank" };
@@ -201,7 +234,9 @@ app.get("/v1/transfers/:id/receipt", async (req, res) => {
   if (!t) return err(res, 404, "NOT_FOUND", "transfer");
   const kids = await Promise.all(t.children.map((c: string) => fetch(`${PAYOUT}/v1/transfers/${c}/receipt`, { headers: PAYOUT_H() }).then((r) => r.json())));
   res.json({ transferId: id, status: t.status, plan: t.terms, termsHash: t.termsHash, approval: t.approval, value: t.value, children: kids,
-    disclosure: "Synthetic rates. Bank and non-USDC coin rails simulated. USDC-on-Base legs funded by real x402 testnet payments (0.01 test USDC each)." });
+    disclosure: `Mid rates: ${MARKET.mode} (ECB reference rates via Frankfurter when live). Bank baseline: measured bank pricing (Wise comparison data) when live. `
+      + "Our route costs: synthetic catalog. Bank and non-USDC coin rails: simulated. Each USDC-on-Base leg carries an x402 settlement proof: "
+      + "a real 0.01 test USDC payment on Base Sepolia tied to this transfer's order and reconciled on chain. It proves the settlement path; it is not the transfer amount." });
 });
 
 // ------------------------------------------------------------------ agent contract (/internal/*)
@@ -271,6 +306,7 @@ app.post("/v1/treasury/netting", (req, res) => safe(res, () => runNetting(req.bo
 app.post("/v1/treasury/sweeps", (req, res) => safe(res, () => runSweeps(req.body?.accounts ? req.body : DEMO_SWEEPS)));
 app.post("/v1/treasury/rules/evaluate", (req, res) => safe(res, () => evaluate(req.body?.rules ?? DEMO_RULES, req.body?.state ?? DEMO_STATE)));
 
+app.get("/v1/market", (_req, res) => res.json(marketSummary()));
 app.post("/v1/company/payment-run", (req, res) => safe(res, () => runPaymentRun(req.body?.payables ? req.body : DEMO_RUN)));
 // Port company data in: CSV text (accounting export) or a Nessie customer (bank sandbox), then run the payment run.
 app.post("/v1/company/import", async (req, res) => {
@@ -283,10 +319,10 @@ app.post("/v1/company/import", async (req, res) => {
   } catch (e: any) { err(res, 422, "IMPORT_FAILED", e.message); }
 });
 // Everyday prompts -> ready-made plan from the linked data (preview only; execution needs approval)
-app.post("/v1/assistant/ask", (req, res) => safe(res, () => ask(String(req.body?.text ?? ""), loadLinked())));
+app.post("/v1/assistant/ask", (req, res) => safe(res, () => { const l = loadLinked(); return { ...ask(String(req.body?.text ?? ""), l), company: l.input.company }; }));
 app.post("/v1/company/hedge", (req, res) => safe(res, () => runHedge(req.body?.payables ? req.body : DEMO_HEDGE)));
 app.post("/v1/company/discounts", (req, res) => safe(res, () => runDiscounts(req.body?.payables ? req.body : DEMO_DISCOUNTS)));
 app.post("/v1/company/beneficiaries/validate", (req, res) => safe(res, () => (Array.isArray(req.body) && req.body.length ? req.body : DEMO_BENEFICIARIES).map(validateBeneficiary)));
 
 const port = Number(process.env.ROUTER_PORT ?? 8404);
-app.listen(port, () => console.log(`router on :${port} (optimizer + orchestration; synthetic rates)`));
+app.listen(port, () => console.log(`router on :${port} (optimizer + orchestration; market data: ${MARKET.mode})`));
