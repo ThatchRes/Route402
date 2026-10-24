@@ -1,0 +1,27 @@
+{
+  "name": "payout-sim",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "server": "tsx src/server.ts",
+    "payout": "tsx src/cli.ts payout",
+    "show": "tsx src/cli.ts show",
+    "refresh": "tsx src/cli.ts refresh",
+    "selftest": "tsx src/selftest.ts",
+    "transfer": "tsx src/cli.ts transfer"
+  },
+  "dependencies": {
+    "dotenv": "16.4.5",
+    "express": "5.3.0",
+    "viem": "^2.57.10"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.2",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3"
+  }
+}

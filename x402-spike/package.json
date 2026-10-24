@@ -1,0 +1,39 @@
+{
+  "name": "x402-spike",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "address": "tsx src/address.ts",
+    "faucet": "tsx src/faucet.ts",
+    "seller": "tsx src/seller.ts",
+    "order": "tsx src/createOrder.ts",
+    "pay": "tsx src/buyer.ts",
+    "confirm": "tsx src/confirm.ts",
+    "reconcile": "tsx src/reconcile.ts",
+    "status": "tsx src/status.ts",
+    "selftest": "tsx src/selftest.ts",
+    "audit": "tsx src/auditCli.ts",
+    "fund": "tsx src/fund.ts"
+  },
+  "dependencies": {
+    "@coinbase/cdp-sdk": "1.60.0",
+    "@x402/core": "2.28.0",
+    "@x402/evm": "2.28.0",
+    "@x402/extensions": "2.28.0",
+    "@x402/express": "2.28.0",
+    "@x402/fetch": "2.28.0",
+    "@x402/svm": "2.28.0",
+    "dotenv": "16.4.5",
+    "express": "5.3.0",
+    "viem": "2.57.10"
+  },
+  "devDependencies": {
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.2"
+  }
+}
