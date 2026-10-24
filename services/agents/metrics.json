@@ -1,1 +1,1 @@
-{"toolCalls": {"paid_quote:stablecoin": 12, "paid_compliance": 12, "paid_quote:bank": 12}, "llmCalls": 0, "llmInputTokens": 0, "llmOutputTokens": 0, "rejectedRequests": {}, "avgToolLatencyMs": 2747.0}
+{"toolCalls": {"paid_quote:stablecoin": 13, "paid_compliance": 13, "paid_quote:bank": 13}, "llmCalls": 0, "llmInputTokens": 0, "llmOutputTokens": 0, "rejectedRequests": {}, "avgToolLatencyMs": 2673.6}

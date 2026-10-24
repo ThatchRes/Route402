@@ -59,6 +59,23 @@ All calls send `Authorization: Bearer $AGENT_SERVICE_TOKEN`, `X-Tenant-Id` and `
 
 Person B's B5 forecasting service replaces `backend.get_forecast` when it exists.
 
+## ASI:One chat and confirmation
+
+The gateway implements the [Agent Chat Protocol](https://docs.asi1.ai/documentation/tutorials/agent-chat-protocol) with `ChatMessage`, `TextContent` and `ChatAcknowledgement`. Normal replies keep the session open; only an explicit end closes it. The existing company frontend and its REST response shapes are unchanged. An additional `/asi/link` page handles one-time account authorization.
+
+Run the router, workers and gateway with `ENABLE_CHAT=1`, a stable gateway seed and an Agentverse mailbox connection. `register_agentverse.py` prints the gateway's ASI:One mention. The gateway must remain running and able to reach the router. Set `ASI_APP_URL` to the same reachable app origin in both services if it differs from `http://localhost:8404`; this does not change existing hosting or proxy configuration. `CHAT_TENANT` must match the router's `AGENT_TENANT` (default `demo-tenant`). The service token authenticates the gateway, never the human user.
+
+1. Ask the agent to plan a payment. Open its connection link, sign in on the existing site and explicitly authorize that sender and chat session. No payment is prepared by linking.
+2. Return to the same ASI:One conversation and say `continue`. Review the exact quoted amounts, fees, route, arrival and expiry.
+3. Say `yes`. The router submits the reviewed payment through the website's existing preparation handler, then tries its existing approval handler as the linked user. A preparer-only account stops at awaiting approval; required supplier call-backs and release evidence still block release. Alex's existing owner authority can prepare and approve in one chat acceptance, with the normal owner-override audit record.
+4. Ask `status` for this chat's requests, or open the returned payment link on the unchanged site. `cancel` closes an unaccepted proposal; it does not cancel a submitted payment. `disconnect`, app sign-out or session expiry revokes chat access.
+
+Only one current displayed proposal can be accepted per conversation. A changed draft, quote, policy, company or conversation version invalidates it. An increased debit requires fresh approval. Confirmation state and request IDs survive router restarts; duplicate message IDs are stored by the gateway and never re-dispatched. If the outcome is unknown, inspect existing requests instead of automatically retrying. Do not delete chat state to try to force a retry.
+
+This is the existing demo execution flow: x402 quote/screening purchases can spend test USDC; supplier payments and FX conversion remain simulated and supported chain settlement is a representative proof. No real invoice payment was added. Account identity remains the app's demo sign-in, not production SSO.
+
+Offline checks: from this folder run `python -m unittest test_chat_format test_asi_chat test_chat_protocol test_context test_deadlines`. From `payout-sim`, run `npm run asi:test` for isolated authorization-state and local HTTP integration checks. No external payments are made by these tests.
+
 ## Gateway routes
 `GET /health`, `GET /metrics`, `POST /parse`, `/coordinate`, `/route-jobs`, `/liquidity-jobs` (`kind`: queue | treasury_rebalance),
 `/execute-requests`, `/reconcile`, `/investigate`. Every body includes `tenantId`, `correlationId`, `serviceToken`.
@@ -66,4 +83,33 @@ Person B's B5 forecasting service replaces `backend.get_forecast` when it exists
 ## Notes
 - Python 3.14 works because of the event-loop line at the top of `workers.py` and `gateway.py`.
 - The "not enough funds" and "Almanac" warnings come from an optional mainnet listing. Don't send funds.
-- LLM is off unless `ANTHROPIC_API_KEY` and `LLM_MODEL` are set. With it off, outputs say `deterministic_fallback`.
+- The older `/parse` and explanation helpers use `ANTHROPIC_API_KEY` + `LLM_MODEL`. The separate conversation fallback below uses ASI:One; enabling it does not enable those helpers.
+
+## ASI:One conversation understanding
+
+Fetch provides a [general LLM API](https://docs.asi1.ai/documentation/build-with-asi-one/chat-completions), separate from Agentverse and the Agent Chat Protocol. Route402 uses its [structured output](https://docs.asi1.ai/documentation/build-with-asi-one/structured-data) to interpret unfamiliar follow-up wording. The same gateway handles both the existing website and ASI:One chat. No frontend files, pricing models, routing algorithms, quote providers or approval/execution rules change.
+
+Add these settings to `services/agents/.env`, then restart the gateway using the existing launcher:
+
+```dotenv
+ASI_ONE_API_KEY=your-asi-one-api-key
+ASI_CONTEXT_MODEL=asi1-mini
+CONTEXT_LLM_ENABLED=1
+```
+
+Create the key in the [ASI:One dashboard](https://asi1.ai/dashboard/api-keys). An Agentverse key is not an ASI:One LLM key. Keep it server-side. `ASI1_API_KEY` is also accepted for existing deployments. `GET :8100/health` reports `contextUnderstanding.enabled` and the configured model without exposing the key. No key, `CONTEXT_LLM_ENABLED=0`, or local-only mode leaves the original deterministic parser active. ASI model inference uses the provider's API billing, not the x402 quote-payment wallet.
+
+The deterministic parser runs first. Only unrecognized turns use the LLM, so recognized requests add no model latency. Examples include “Keep as much cash as possible, waiting is fine,” “Any update on that?” and “Bump the budget to 6000” after a payment draft. Existing conversation records retain the supplier, amount, currency, deadline and routing preference. Ambiguous phrasing asks for clarification; the model does not estimate missing prices or rewrite payment amounts.
+
+The language boundary is deliberately narrow:
+
+- The router offers a menu of supported interpretations built from the latest user message and current conversation. The model returns one ID or `clarify`. It cannot return arbitrary text, a URL, tool name, amount, account, supplier ID, route, user role or approval.
+- The model sees at most six recent filtered turns, minimal task state and the menu. It does not see receiving credentials, bank records, quotes, raw provider/document payloads, service keys, approval tokens or the conversation binding. Known credential/address patterns are redacted; sensitive current messages and suspicious control instructions skip the model entirely. Redaction is defense in depth, not a guarantee that every form of sensitive free text will be detected.
+- The latest message and history are untrusted data beneath fixed system instructions. Strict JSON output is validated again locally. Tool calls, planner mode and web search are unavailable. The server reconstructs the selected action and runs its existing validation; it never executes generated prose.
+- Company, tenant, conversation revision and a server context digest bind each interpretation. A new turn, company switch or replay rejects a stale interpretation. The saved transcript preserves the original user message and the server-built normalized request.
+- `yes` is never routed through the LLM. ASI chat acceptance still requires the previously displayed, unexpired proposal and the linked user's existing authority; model output cannot manufacture consent.
+- Calls use a fixed HTTPS endpoint, no redirects, a seven-second total timeout, bounded input/output, at most four concurrent requests and twenty calls per minute per gateway. A provider error opens a short cooldown and falls back to the original response. No prompt, credential or raw provider error is logged.
+
+Prompt instructions and pattern checks cannot make an LLM immune to injection. The security boundary is the fixed menu, server validation and unchanged approval/execution controls. This is conversational intent classification, not unrestricted generated financial advice or autonomous payment execution.
+
+Offline validation (no model calls or payments): `python -m unittest test_context_llm test_context test_deadlines test_asi_chat test_chat_format test_chat_protocol`; in `payout-sim`, `npm run understanding:test`, `npm run context:test`, `npm run security:test`, and `npm run asi:test`.

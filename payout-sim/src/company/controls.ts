@@ -109,6 +109,12 @@ export function sessionUser(cookie?: string): User | undefined {
 }
 export function signOut(cookie?: string) { const t = cookieToken(cookie); if (!t) return; const all = loadSessions(); delete all[tokenHash(t)]; write(SESSIONS, all); }
 
+// Chat delegations retain a session fingerprint, never its bearer cookie. Signing out or expiry revokes them.
+export function activeSessionFingerprint(hash: string, userId: string): boolean {
+  const session = /^[a-f0-9]{64}$/.test(hash) ? loadSessions()[hash] : undefined;
+  return !!session && session.userId === userId && session.exp > Date.now() && !!user(userId);
+}
+
 // ------------------------------------------------------------------ payment requests (prepare -> verify -> approve -> release)
 export type ReqStatus = "NEEDS_CALLBACK" | "AWAITING_APPROVAL" | "AWAITING_DELIVERY" | "READY" | "PAUSED" | "EXECUTING" | "COMPLETED" | "FAILED" | "REJECTED" | "REFUNDED";
 export interface PaymentRequest {

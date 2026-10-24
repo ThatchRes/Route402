@@ -27,7 +27,7 @@ import { usdcPeg, usdcInFlight, usdcRouteAllowed, stablecoinPlanAllowed, issuerI
 import { allInCost, fxRisk, sendBy, transitDays } from "../company/economics.js";
 import { midInfo, rateHistory } from "./market.js";
 import { planningNow } from "./timing.js";
-import { executionPolicy, planForDispatch } from "./dispatch.js";
+import { executionPolicy, planForDispatch, validateDispatchDecision, providerForAllocations } from "./dispatch.js";
 import { confirmSupplier, conversationView, ConversationConflict } from "../assistant/conversation.js";
 import { supplierDirectory } from "../company/suppliers.js";
 import { publicData, validateChatRequest } from "../assistant/safety.js";
@@ -36,6 +36,7 @@ import { browserSecurity, browserRateLimit } from "./browserSecurity.js";
 import { cleanAdaptiveExposure } from "./exposure.js";
 import { exposureContext } from "./exposureState.js";
 import type { Intent } from "./optimizer.js";
+import { mountAsi } from "./asi.js";
 
 const NOW = planningNow;
 const PAID = "data/executed.json";
@@ -187,7 +188,9 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     res.setHeader("set-cookie", `r402=${token}; HttpOnly; SameSite=Strict; Path=/`); res.json({ user: publicUser(C.user(req.body.userId)) });
   });
   ui.post("/logout", (req, res) => { C.signOut(req.headers.cookie); res.setHeader("set-cookie", "r402=; Max-Age=0; Path=/"); res.json({ ok: true }); });
-  const need = (req: express.Request, res: express.Response) => { const u = me(req); if (!u) res.status(401).json({ error: "sign in first" }); return u; };
+  const need = (req: express.Request, res: express.Response): C.User | undefined => {
+    const u: C.User | undefined = res.locals.asiUser ?? me(req); if (!u) res.status(401).json({ error: "sign in first" }); return u;
+  };
 
   ui.post("/suppliers", (req, res) => {
     const u = need(req, res); if (!u) return;
@@ -238,14 +241,18 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
   const view = (r: C.PaymentRequest, u?: C.User) => { const p = C.loadPolicy(), n = C.nextActions(r, u, p);
     const transfer = r.transferId ? load().transfers[r.transferId] : null;
     if (transfer) {
+      // Render settled/executing terms from the transfer evidence, not stale pre-refresh request fields.
+      const plan = transfer.executionPlan ?? transfer.terms;
       r = { ...r, status: transfer.status === "COMPLETED" ? "COMPLETED" : transfer.status === "PAUSED" ? "PAUSED"
-        : transfer.status === "NEEDS_RECONCILIATION" ? "FAILED" : r.status, note: transfer.note ?? r.note, deadlineStatus: transfer.deadlineStatus };
+        : transfer.status === "NEEDS_RECONCILIATION" ? "FAILED" : r.status, note: transfer.note ?? r.note, deadlineStatus: transfer.deadlineStatus,
+        ...(plan?.allocations?.length && plan?.totals ? { provider: providerForAllocations(plan.allocations), route: plan.allocations.map((a: any) => a.routeId).join("+"),
+          recipientGets: plan.totals.recipientNet, debitUsd: Number(plan.totals.sourceDebit.split(" ")[0]), arrivalUtc: plan.totals.arrivalUtc } : {}) };
     }
     return { ...r, status: C.computeStatus(r, p), approvalsRequired: C.approvalsRequired(r, p), actions: C.nextActions(r, u, p).actions }; };
   ui.get("/requests", (req, res) => { const u = me(req); res.json(Object.values(C.loadRequests()).reverse().map((r) => view(r, u))); });
 
   // The preparer turns the agent's paid plan into payment requests. Nothing moves until the company's controls are met.
-  ui.post("/requests", async (req, res) => {
+  const prepareRequest: express.RequestHandler = async (req, res) => {
     const u = need(req, res); if (!u) return;
     if (!C.can(u, "preparer")) return res.status(403).json({ error: "your role cannot prepare payments" });
     if (req.body?.confirmed !== true) return res.status(400).json({ error: "confirm that you checked the supplier, invoice, fees and delivery estimate" });
@@ -282,7 +289,8 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
             it.decision.totals.sourceDebit, coinsOf(routeIds).join(">") || "USDC") : undefined;
       const r: C.PaymentRequest = { id: C.newRequestId(), payable: d.payable, supplier: it.intent.beneficiary?.name ?? bill?.beneficiary.name ?? d.payable,
         country: bill?.beneficiary.country ?? "-", ccy: it.intent.destCcy, amount: it.intent.amount, reference: it.intent.reference ?? d.payable,
-        intentId: d.intentId, provider: d.chosen, route: (d.routeIds ?? []).join("+"), debitUsd: Number(String(it.decision.totals.sourceDebit).split(" ")[0]),
+        intentId: d.intentId, provider: it.decision.allocations?.length ? providerForAllocations(it.decision.allocations) : d.chosen,
+        route: routeIds.join("+"), debitUsd: Number(String(it.decision.totals.sourceDebit).split(" ")[0]),
         recipientGets: it.decision.totals.recipientNet, arrivalUtc: it.decision.totals.arrivalUtc, agentReasons: (d.reasons ?? []).filter((x: string) => !x.startsWith("compared:")).slice(0, 4),
         preparedBy: u.id, preparedAt: new Date().toISOString(), detailsChanged: !!v.detailsChanged || !!d.detailsChanged || (d.needs ?? []).some((n: string) => n.includes("call-back")),
         costReview: (d.needs ?? []).some((n: string) => n.includes("cost")), allowReroute: req.body?.allowReroute === true, timing: it.decision.timing,
@@ -297,7 +305,8 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
       out.push({ payable: d.payable, requestId: r.id, status: r.status });
     }
     C.saveRequests(reqs); res.json({ requests: out });
-  });
+  };
+  ui.post("/requests", prepareRequest);
 
   const act = (fn: (r: C.PaymentRequest, u: C.User, body: any) => string | null) => async (req: express.Request, res: express.Response) => {
     const u = need(req, res); if (!u) return;
@@ -317,12 +326,14 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     r.callback = { by: u.id, at: new Date().toISOString(), phoneOnFile: String(b.phoneOnFile).slice(0, 40), contact: String(b.contact).slice(0, 80), outcome: "confirmed" };
     C.audit(u.id, "callback_verified", r.id, `${r.supplier}: new bank details confirmed by ${r.callback.contact} on ${r.callback.phoneOnFile}`); return null;
   }));
-  ui.post("/requests/:id/approve", act((r, u) => {
+  const approveRequest = act((r, u) => {
     const a = allowed(r, u, "approve"); if (!a.allowed) return a.why;
     r.approvals.push({ by: u.id, at: new Date().toISOString() });
     if (u.owner && u.id === r.preparedBy) C.audit(u.id, "owner_override", r.id, "the owner approved a payment they prepared (segregation of duties skipped by owner authority)");
     C.audit(u.id, "approved", r.id, `approval ${r.approvals.length} of ${C.approvalsRequired(r, C.loadPolicy())} for ${r.debitUsd.toLocaleString()} USD`); return null;
-  }));
+  });
+  ui.post("/requests/:id/approve", approveRequest);
+  mountAsi(app, { prepare: prepareRequest, approve: approveRequest, view });
   ui.post("/requests/:id/reject", act((r, u, b) => {
     const a = allowed(r, u, "reject"); if (!a.allowed) return a.why;
     r.rejected = { by: u.id, at: new Date().toISOString(), why: String(b.why ?? "").slice(0, 200) }; r.status = "REJECTED";
@@ -442,13 +453,12 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     const refreshIntent = { ...original.intent, issuerHeadroomUsd: issuerHeadroom(pol, r.id), provider: r.allowReroute ? undefined : original.intent.provider, allowedRouteIds: originalTerms.executionPolicy.allowedRouteIds };
     const refreshed = reprice ? reprice(refreshIntent, r.id) : await self("POST", "/v1/intents", refreshIntent);
     if (refreshed.decision?.status !== "OK") return pause(refreshed.decision?.reason ?? "No route can still meet the recipient deadline");
+    const finalCheck = validateDispatchDecision(originalTerms, refreshed.decision);
+    if (!finalCheck.ok) return pause(`${finalCheck.reason}. Nothing new was sent; review a fresh quote before approving different terms.`);
     const newDebit = Number(refreshed.decision.totals.sourceDebit.split(" ")[0]);
-    if (newDebit > r.debitUsd) {
-      r.status = "AWAITING_APPROVAL"; r.approvals = []; r.intentId = refreshed.intentId; r.debitUsd = newDebit;
-      r.note = "Current price exceeds the previously approved debit cap; review and approve the new amount"; saveR(); return;
-    }
     const intentId = refreshed.intentId;
-    Object.assign(r, { intentId, debitUsd: newDebit, provider: refreshed.decision.allocations[0].routeId.startsWith("bank:") ? "bank" : "stablecoin",
+    Object.assign(r, { intentId, debitUsd: newDebit, provider: providerForAllocations(refreshed.decision.allocations),
+      route: refreshed.decision.allocations.map((a: any) => a.routeId).join("+"), recipientGets: refreshed.decision.totals.recipientNet,
       arrivalUtc: refreshed.decision.totals.arrivalUtc, timing: refreshed.decision.timing }); saveR();
     if (r.provider === "stablecoin") {
       // depeg breaker always; issuer cap only if the money is not already sitting in escrow

@@ -36,6 +36,7 @@ import { exposureContext } from "./exposureState.js";
 import { planningNow } from "./timing.js";
 import { executionPolicy, planForDispatch } from "./dispatch.js";
 import { askConversation, conversationView, recordConversationReview, ConversationConflict } from "../assistant/conversation.js";
+import { understandingContext, applyUnderstanding } from "../assistant/understanding.js";
 import { validateChatRequest } from "../assistant/safety.js";
 
 export const app = express();
@@ -460,6 +461,16 @@ app.post("/v1/assistant/ask", (req, res) => {
   catch (e: any) { err(res, e instanceof ConversationConflict ? 409 : 422, "CONVERSATION_ERROR", e.message); }
 });
 app.get("/v1/assistant/conversations/:id", (req, res) => safe(res, () => conversationView(req.header("x-tenant-id") ?? "demo-tenant", String(req.params.id))));
+// Service-authenticated language adapter. Browser chat bodies still reject interpretation fields.
+app.post("/v1/assistant/conversations/:id/understanding", (req, res) => {
+  try {
+    const body = req.body, allowed = ["conversationRevision", "snapshotToken", "choice"];
+    if (!body || Object.keys(body).some((k) => !allowed.includes(k))) throw new Error("Invalid interpretation fields");
+    const tenant = req.header("x-tenant-id") ?? "demo-tenant", id = String(req.params.id);
+    res.json(body.choice === undefined ? understandingContext(tenant, id, body.conversationRevision)
+      : applyUnderstanding(tenant, id, body.conversationRevision, body.snapshotToken, body.choice));
+  } catch (e: any) { err(res, e instanceof ConversationConflict ? 409 : 422, "UNDERSTANDING_ERROR", e.message); }
+});
 app.post("/v1/assistant/conversations/:id/review", (req, res) => safe(res, () => ({ recorded: recordConversationReview(req.header("x-tenant-id") ?? "demo-tenant", String(req.params.id), req.body?.conversationRevision, (req.body?.decisions ?? []).slice(0, 25)) })));
 app.post("/v1/company/hedge", (req, res) => safe(res, () => runHedge(req.body?.payables ? req.body : DEMO_HEDGE)));
 app.post("/v1/company/discounts", (req, res) => safe(res, () => runDiscounts(req.body?.payables ? req.body : DEMO_DISCOUNTS)));

@@ -161,11 +161,17 @@ function planTask(c: Conversation, l: Linked): any {
   return { ...ask(`convert ${task.amount} ${task.sourceCurrency} to ${task.currency}`, l, { objective: routingObjective(task.policy) }), policy: task.policy };
 }
 
-export function askConversation(tenant: string, raw: string, id: string = randomUUID(), expectedRevision?: number): any {
+export function askConversation(tenant: string, raw: string, id: string = randomUUID(), expectedRevision?: number,
+  understanding?: { original: string }): any {
   if (typeof raw !== "string") throw new Error("A text message is required");
   const l = loadLinked(), c = read(l, tenant, id), text = clean(raw), t = text.toLowerCase();
   if (!text || text.length > 500) throw new Error("Use a request between 1 and 500 characters");
   if (expectedRevision != null && expectedRevision !== c.revision) throw new ConversationConflict("This conversation changed in another request. Reopen it before sending again.");
+  // Internal, server-built normalization only. The browser cannot supply this argument.
+  // Replace an unrecognized turn, preserving what the person actually said in the transcript.
+  if (understanding && (expectedRevision == null || c.turns.at(-1)?.reply.template !== "out_of_scope"
+    || c.turns.at(-1)?.user !== understanding.original || unsafeInstruction(understanding.original) || unsupported(understanding.original)))
+    throw new ConversationConflict("Only the current unrecognized message can be interpreted.");
   let result: any;
   const info = explanation(text, c.explanationTopic ?? (c.topic === "payment" ? "status" : c.topic?.startsWith("supplier") ? "suppliers" : undefined));
   const preference = isRoutingPreferenceTurn(text) ? routingPolicy(text) : undefined;
@@ -309,8 +315,10 @@ export function askConversation(tenant: string, raw: string, id: string = random
   else if (c.task?.kind === "send" && c.task.supplierId) c.mentioned = [c.task.supplierId];
   c.revision++;
   result = { source: l.source, ...result, ...context(c), company: l.input.company };
+  if (understanding) result.understanding = { provider: "asi1", normalizedRequest: text };
   const stored = publicData({ ...result }); delete stored.beneficiary; delete stored.company;
-  c.turns.push({ user: text, reply: stored }); c.turns = c.turns.slice(-40); save(l, c);
+  if (understanding) c.turns.pop();
+  c.turns.push({ user: understanding?.original ?? text, reply: stored }); c.turns = c.turns.slice(-40); save(l, c);
   return result;
 }
 

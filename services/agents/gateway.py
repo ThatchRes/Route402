@@ -11,13 +11,13 @@ asyncio.set_event_loop(asyncio.new_event_loop())   # Python 3.14: uAgents needs 
 
 import json
 import re
-import hashlib
 import time
 from decimal import Decimal
 from uagents import Agent, Context
 
 import backend
 import llm
+import context_llm
 import reasoning
 from local_network import configure_local_network
 configure_local_network()
@@ -37,7 +37,7 @@ README = os.path.join(os.path.dirname(__file__), "AGENT_README.md")
 kwargs = dict(name=os.getenv("AGENT_NAME", "Cross-Border AP Concierge"), seed=os.environ["GATEWAY_SEED"], port=GATEWAY_PORT,
               resolve=RESOLVER, handle_messages_concurrently=True,
               description="Plans a company's international supplier payments: buys route quotes and supplier screens "
-                          "with x402 (Base Sepolia test USDC), approves or holds each payment, explains why. Preview only in chat.",
+                          "with x402 (Base Sepolia test USDC). Linked users can review and accept demo payments in ASI:One; company approval controls still apply.",
               readme_path=README if os.path.exists(README) else None)
 if CHAT:
     kwargs.update(mailbox=True, publish_agent_details=True)
@@ -130,6 +130,7 @@ async def concierge_ask(ctx, tenant, corr, text, policy=None, conversation_id=No
     policy = reasoning.policy_from_text(text, policy)
     try:
         r = await backend.assistant_ask(tenant, corr, text, conversation_id, conversation_revision)
+        r = await context_llm.understand(backend, tenant, corr, r)
     except Exception as e:  # noqa: BLE001
         return AskResult(correlationId=corr, status="error", error=f"calculator (router) unavailable: {e}")
     if r.get("clarification"):
@@ -177,7 +178,8 @@ async def review(ctx: Context, req: ReviewBody) -> AskResult:
 
 @gateway.on_rest_get("/health", Health)
 async def health(ctx: Context) -> Health:
-    return Health(status="ok", mockApi=backend.MOCK, llmEnabled=llm.ENABLED,
+    return Health(status="ok", mockApi=backend.MOCK, llmEnabled=llm.ENABLED or context_llm.ENABLED,
+                  contextUnderstanding=context_llm.configuration(),
                   agents={"gateway": gateway.address, "routing": ROUTING, "liquidity": LIQUIDITY,
                           "executionCoordinator": EXECUTOR, "reconciliation": RECONCILIATION,
                           "investigation": INVESTIGATION, "compliance": COMPLIANCE})
@@ -305,71 +307,33 @@ if CHAT:
     from uagents import Protocol
     from uagents_core.contrib.protocols.chat import (ChatAcknowledgement, ChatMessage, TextContent,
                                                      EndSessionContent, chat_protocol_spec)
+    from asi_chat import AsiChatAdapter, is_end_session
+    from chat_format import format_answer
 
     chat = Protocol(spec=chat_protocol_spec)
     CHAT_TENANT = os.getenv("CHAT_TENANT", "demo-tenant")
 
     chat_limiter = RateLimiter(int(os.getenv("CHAT_PAID_PER_MIN", "3")))   # each chat review spends test USDC
 
-    def format_answer(a: AskResult) -> str:
-        if a.status != "ok":
-            return redact(a.clarification or a.error or "I couldn't plan that.")
-        out = [a.title or "Plan"]
-        p = a.preview or {}
-        run = p.get("preview") if isinstance(p.get("preview"), dict) else None
-        if run and run.get("savings"):
-            pct = (run.get("percent") or {}).get("keptOfFxVolume")
-            out.append(f"Savings vs your bank: {run['savings'].get('total')}; company keeps {run.get('companyKeeps')}"
-                       + (f" ({pct} of FX volume)." if pct else "."))
-        if a.decisions:
-            out.append(f"Policy: {a.policy} (say 'fastest' or 'lowest risk' to change it).")
-        for d in a.decisions:
-            out.append(redact(f"- {d['payable']}: {d['decision'].upper()} via {d.get('chosen') or '-'}. " + " ".join(d.get("reasons", [])[:2])))
-            for c in d.get("paidCalls", []):
-                out.append(f"    paid {c.get('service')} {c.get('priceUsdc')} test USDC: {c.get('explorer')}")
-        if a.paidCalls:
-            out.append(f"My agents paid for {len(a.paidCalls)} calls with x402 ({a.spentUsdc} test USDC on Base Sepolia).")
-        if not a.decisions and run is None:
-            rest = {k: v for k, v in p.items() if k not in ("template", "source", "title", "company")}
-            out.append(redact(json.dumps(rest)[:1200]))
-        out.append("Chat is preview-only: payments are sent only after approval in the company app.")
-        return "\n".join(out)
+    chat_adapter = AsiChatAdapter(backend, concierge_ask, format_answer, CHAT_TENANT,
+        app_url=(os.getenv("ASI_APP_URL", "http://localhost:8404").rstrip("/") + "/app/#/payments"),
+        paid_limiter=chat_limiter)
 
     @chat.on_message(ChatMessage)
     async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(sender, ChatAcknowledgement(timestamp=datetime.now(timezone.utc),
                                                    acknowledged_msg_id=msg.msg_id))
-        text = "".join(c.text for c in msg.content if isinstance(c, TextContent)).strip()
-        corr = f"chat-{uuid4().hex[:12]}"
-        parts = text.split()
-        if len(parts) == 2 and parts[0].lower() in ("status", "route"):
-            try:
-                ref = safe_id(parts[1], "id")
-                if parts[0].lower() == "status":
-                    r, _ = await ctx.send_and_receive(INVESTIGATION, InvestigateRequest(
-                        jobId=corr, tenantId=CHAT_TENANT, transferId=ref, correlationId=corr),
-                        response_type=InvestigateResult, timeout=30)
-                    answer = (f"{r.exceptionType}. Missing: {', '.join(r.missingEvidence) or 'nothing'}. "
-                              + " ".join(r.hypotheses)) if isinstance(r, InvestigateResult) else "Investigation agent did not reply."
-                else:
-                    r, _ = await ctx.send_and_receive(ROUTING, RouteRequest(
-                        jobId=corr, tenantId=CHAT_TENANT, intentId=ref, correlationId=corr),
-                        response_type=RouteResult, timeout=30)
-                    answer = r.explanation if isinstance(r, RouteResult) else "Routing agent did not reply."
-            except ValueError:
-                answer = "Invalid id."
-            answer = redact(answer)
-        elif not text:
-            answer = 'Try: "pay my Canadian suppliers this week", "send 50k CAD to Maple Freight by Friday", "how much can I save this month".'
-        elif not chat_limiter.allow(sender):
-            answer = "Rate limit: each plan buys paid quotes. Try again in a minute."
-        else:
-            ctx.logger.info(redact(f"[{corr}] chat from {sender[:16]}...: {text[:120]}"))
-            conversation_id = "fetch_" + hashlib.sha256(sender.encode()).hexdigest()[:32]
-            answer = format_answer(await concierge_ask(ctx, CHAT_TENANT, corr, text, conversation_id=conversation_id))
+        text = "\n".join(c.text for c in msg.content if isinstance(c, TextContent)).strip()
+        if not text and any(isinstance(c, EndSessionContent) for c in msg.content):
+            text = "end session"
+        if not text:
+            return  # Session-control-only messages are acknowledged, never interpreted as payment instructions.
+        answer = await chat_adapter.handle(ctx, sender, str(ctx.session), str(msg.msg_id), text)
+        content = [TextContent(type="text", text=answer)]
+        if is_end_session(text):
+            content.append(EndSessionContent(type="end-session"))
         await ctx.send(sender, ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(),
-                                           content=[TextContent(type="text", text=answer),   # parts redacted above; tx links kept
-                                                    EndSessionContent(type="end-session")]))
+                                           content=content))
 
     @chat.on_message(ChatAcknowledgement)
     async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):

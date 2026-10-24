@@ -225,6 +225,7 @@ class Health(Model):
     agents: dict
     mockApi: bool
     llmEnabled: bool
+    contextUnderstanding: dict = {}
 
 
 class Metrics(Model):

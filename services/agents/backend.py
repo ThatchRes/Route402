@@ -1,5 +1,7 @@
 """Fixed tool set for the agents: the ONLY way they reach Person A's API.
-Agents read, or ask A's gates. They never sign, approve, write ledger rows or mark delivery.
+Agents read, or ask A's gates. A linked ASI:One user's explicit confirmation can ask
+the same company preparation/approval gates as the website; no agent supplies user authority.
+Agents never sign, write ledger rows or mark delivery.
 All paths are fixed; IDs are validated before use. MOCK_API=1 serves labeled fixtures."""
 import os
 import time
@@ -284,3 +286,51 @@ async def assistant_ask(tenant, corr, text: str, conversation_id=None, conversat
 async def record_assistant_review(tenant, corr, conversation_id, revision, decisions):
     return await _call("assistant_review", "POST", f"/v1/assistant/conversations/{safe_id(conversation_id, 'conversationId')}/review",
                        tenant, corr, {"conversationRevision": revision, "decisions": decisions})
+
+
+async def assistant_understanding(tenant, corr, conversation_id, revision, choice=None, snapshot_token=None):
+    body = {"conversationRevision": revision}
+    if choice is not None:
+        body.update(choice=choice, snapshotToken=snapshot_token)
+    return await _call("assistant_understanding", "POST",
+                       f"/v1/assistant/conversations/{safe_id(conversation_id, 'conversationId')}/understanding",
+                       tenant, corr, body)
+
+
+# Fixed ASI:One adapter tools. No mock may manufacture payment authorization.
+async def _asi(action, tenant, corr, sender, session, **body):
+    return await _call("asi_" + action, "POST", "/internal/asi/" + action, tenant, corr,
+                       {"sender": sender, "session": session, **body})
+
+
+async def asi_context(tenant, corr, sender, session):
+    return await _asi("context", tenant, corr, sender, session)
+
+
+async def asi_link(tenant, corr, sender, session):
+    return await _asi("link", tenant, corr, sender, session)
+
+
+async def asi_offer(tenant, corr, sender, session, answer):
+    # This endpoint needs the selected review, not transcripts, receiving credentials or paid-call receipts.
+    review = {key: answer.get(key) for key in ("status", "conversationId", "conversationRevision")}
+    review["decisions"] = [{key: row.get(key) for key in (
+        "payable", "decision", "chosen", "intentId", "routeIds", "needs", "detailsChanged", "reasons")}
+        for row in answer.get("decisions", [])]
+    return await _asi("offer", tenant, corr, sender, session, answer=review)
+
+
+async def asi_confirm(tenant, corr, sender, session, confirmation_id):
+    return await _asi("confirm", tenant, corr, sender, session, confirmationId=confirmation_id)
+
+
+async def asi_cancel(tenant, corr, sender, session):
+    return await _asi("cancel", tenant, corr, sender, session)
+
+
+async def asi_status(tenant, corr, sender, session):
+    return await _asi("status", tenant, corr, sender, session)
+
+
+async def asi_disconnect(tenant, corr, sender, session):
+    return await _asi("disconnect", tenant, corr, sender, session)
