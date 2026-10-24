@@ -1,5 +1,5 @@
 // Payment controls for the company workspace: who may prepare, approve and release a payment, and a tamper-evident log.
-// These follow published treasury fraud-prevention practice (dual authorization, per-user limits, segregation of duties,
+// These use one authorized approver, per-user limits, segregation of duties,
 // call-back verification on a known number before acting on changed bank details, MFA). The thresholds below are COMPANY
 // SETTINGS the admin can change, not market data.
 import { createHash, randomBytes, randomInt } from "node:crypto";
@@ -19,7 +19,8 @@ export const USERS: User[] = [
 export const user = (id?: string) => USERS.find((u) => u.id === id);
 export const can = (u: User | undefined, r: Role) => !!u && (u.roles.includes(r) || u.roles.includes("admin"));
 
-export interface Policy { dualApprovalOverUsd: number; requireCallbackOnDetailsChange: boolean; requoteTolerancePct: number; quoteValidMinutes: number;
+export interface Policy { dualApprovalOverUsd: number; // legacy display field; dual approval is disabled
+  requireCallbackOnDetailsChange: boolean; requoteTolerancePct: number; quoteValidMinutes: number;
   depegBandPct: number;          // pause the USDC route if its live price is further than this from 1.00 USD
   depegFailClosed: boolean;      // pause it too when no live price can be read
   issuerCapUsd: number;          // most that may be in flight or in escrow with one stablecoin issuer at once
@@ -27,10 +28,12 @@ export interface Policy { dualApprovalOverUsd: number; requireCallbackOnDetailsC
   fxRiskLimitUsd: number }       // flag a currency when its 95% one-sided FX move on open bills exceeds this
 const POLICY_FILE = "data/policy.json";
 // Defaults are starting company settings, editable by the admin; none of them is market data.
-const DEFAULT_POLICY: Policy = { dualApprovalOverUsd: 100_000, requireCallbackOnDetailsChange: true, requoteTolerancePct: 0.5, quoteValidMinutes: 14,
+const DEFAULT_POLICY: Policy = { dualApprovalOverUsd: Number.MAX_SAFE_INTEGER, requireCallbackOnDetailsChange: true, requoteTolerancePct: 0.5, quoteValidMinutes: 14,
   depegBandPct: 0.5, depegFailClosed: true, issuerCapUsd: 250_000, escrowDeadlineDays: 30, fxRiskLimitUsd: 25_000 };
-export const loadPolicy = (): Policy => ({ ...DEFAULT_POLICY, ...(existsSync(POLICY_FILE) ? JSON.parse(readFileSync(POLICY_FILE, "utf8")) : {}) });
-export const savePolicy = (p: Policy) => write(POLICY_FILE, p);
+// Preserve the old response shape for the unchanged frontend, while disabling its legacy amount threshold.
+// The approval gate below always requires exactly one approval, including amounts above this display sentinel.
+export const loadPolicy = (): Policy => ({ ...DEFAULT_POLICY, ...(existsSync(POLICY_FILE) ? JSON.parse(readFileSync(POLICY_FILE, "utf8")) : {}), dualApprovalOverUsd: Number.MAX_SAFE_INTEGER });
+export const savePolicy = (p: Policy) => write(POLICY_FILE, { ...p, dualApprovalOverUsd: Number.MAX_SAFE_INTEGER });
 
 function write(file: string, v: unknown) { mkdirSync("data", { recursive: true }); writeFileSync(file, JSON.stringify(v, null, 2)); }
 const read = <T>(file: string, d: T): T => (existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : d);
@@ -90,7 +93,7 @@ export const loadRequests = (): Record<string, PaymentRequest> => read(REQS, {})
 export const saveRequests = (m: Record<string, PaymentRequest>) => write(REQS, m);
 export const newRequestId = () => `pr_${randomBytes(4).toString("hex")}`;
 
-export const approvalsRequired = (r: PaymentRequest, p: Policy) => (r.debitUsd > p.dualApprovalOverUsd ? 2 : 1);
+export const approvalsRequired = (_r: PaymentRequest, _p: Policy) => 1;
 
 /** Where a request stands, given the policy. Terminal states are kept. */
 export function computeStatus(r: PaymentRequest, p: Policy): ReqStatus {
@@ -99,6 +102,16 @@ export function computeStatus(r: PaymentRequest, p: Policy): ReqStatus {
   if (r.approvals.length < approvalsRequired(r, p)) return "AWAITING_APPROVAL";
   if (r.releaseOnDelivery && !r.delivery) return "AWAITING_DELIVERY";
   return "READY";
+}
+
+// Retain approvals made under the former two-approval policy without silently releasing an old quote.
+export function reconcileApprovalPolicy() {
+  const requests = loadRequests(), policy = loadPolicy(); let changed = false;
+  for (const r of Object.values(requests)) if (r.status === "AWAITING_APPROVAL" && computeStatus(r, policy) === "READY") {
+    r.status = "PAUSED"; r.note = "One approval is sufficient and your existing approval is retained. An authorized approver can re-check and release this request.";
+    audit("system", "single_approval_policy", r.id, r.note); changed = true;
+  }
+  if (changed) saveRequests(requests);
 }
 
 /** What the signed-in user is allowed to do next on this request, and why not otherwise. */
@@ -111,7 +124,7 @@ export function nextActions(r: PaymentRequest, u: User | undefined, p: Policy) {
   out.approve = st !== "AWAITING_APPROVAL" ? no(st === "NEEDS_CALLBACK" ? "verify the bank-detail change by call-back first" : "not awaiting approval")
     : !can(u, "approver") ? no("your role cannot approve payments")
     : u.id === r.preparedBy ? no("segregation of duties: the preparer cannot approve")
-    : r.approvals.some((a) => a.by === u.id) ? no("you already approved; a second, different approver is required")
+    : r.approvals.some((a) => a.by === u.id) ? no("you already approved")
     : u.approvalLimitUsd != null && r.debitUsd > u.approvalLimitUsd ? no(`above your approval limit (${u.approvalLimitUsd.toLocaleString()} USD)`)
     : { allowed: true };
   out.reject = ["NEEDS_CALLBACK", "AWAITING_APPROVAL", "AWAITING_DELIVERY"].includes(st) && can(u, "approver") ? { allowed: true } : no("cannot reject now");
