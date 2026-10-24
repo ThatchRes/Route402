@@ -29,8 +29,10 @@ import { MARKET, marketSummary } from "./market.js";
 import { mountUi } from "./ui.js";
 import { TOKENS } from "./registry.js";
 import { usdcRouteAllowed } from "./depeg.js";
+import { planningNow } from "./timing.js";
+import { executionPolicy, planForDispatch } from "./dispatch.js";
 
-const app = express();
+export const app = express();
 app.use(express.json());
 const TOKEN = () => process.env.ROUTER_TOKEN ?? "dev-token";
 const PAYOUT = process.env.PAYOUT_URL ?? "http://localhost:8403";
@@ -39,7 +41,7 @@ const X402_DIR = process.env.X402_DIR ?? path.resolve("..", "x402-spike");
 const QUOTE_TTL_MS = 15 * 60e3;
 const TREASURY_USD = toMinor(process.env.TREASURY_USD ?? "2000000.00", "USD");      // simulated operating balance
 const ID = /^[A-Za-z0-9_\-:.]{1,80}$/;
-const now = () => new Date().toISOString();
+const now = planningNow;
 
 mountUi(app, Number(process.env.ROUTER_PORT ?? 8404));   // browser demo (/app, /ui/*): local-only, mounted before the token check
 app.use((req, res, next) => (req.header("authorization") === `Bearer ${TOKEN()}` ? next() : res.status(401).json({ code: "UNAUTHORIZED" })));
@@ -48,6 +50,7 @@ const err = (res: express.Response, status: number, code: string, message: strin
 
 // ------------------------------------------------------------------ intents + decisions
 function createIntent(it: Intent) {
+  it = { ...it, nowUtc: now() }; // imported snapshots and browser-supplied dates cannot move the router's clock
   const decision: any = optimize(it);
   const intentId = `int_${randomUUID().slice(0, 8)}`;
   update((db) => { db.intents[intentId] = { intentId, intent: it, decision, createdAt: now() }; });
@@ -74,7 +77,8 @@ app.post("/v1/provider-quote", async (req, res) => {
   let r: any;
   try { r = createIntent({ ...it, provider, objective: it.objective ?? "cheapest" }); } catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
   const d = r.decision;
-  if (d.status !== "OK") return res.json({ provider, status: "NO_QUOTE", reason: d.reason || (d.missing ?? []).join("; ") || "no route from this provider" });
+  if (d.status !== "OK") return res.json({ provider, status: "NO_QUOTE", reason: d.reason || (d.missing ?? []).join("; ") || "no route from this provider",
+    deadlineUtc: it.deadlineUtc, earliestArrivalUtc: d.earliestArrivalUtc, excluded: (d.candidates ?? []).map((c: any) => ({ routeId: c.routeId, reason: c.reason })) });
   // Stablecoin safety: depeg circuit breaker + issuer cap. A paused rail returns no quote, so no agent can pick it.
   if (provider === "stablecoin") {
     const g = await usdcRouteAllowed(Number(String(d.totals.sourceDebit).split(" ")[0]));
@@ -85,9 +89,11 @@ app.post("/v1/provider-quote", async (req, res) => {
     && (!a.token || TOKENS.find((t) => t.id === a.token)?.peg === "USD"));
   const risk = provider !== "stablecoin" ? RISK[provider] : usdOnly ? RISK.stablecoin_live : RISK.stablecoin;
   res.json({ provider, status: "OK", intentId: r.intentId, quoteExpiresInSec: 900,
+    providerLabel: process.env.LOCAL_ROUTING === "1" ? "Local payout routes (synthetic simulation)" : provider === "bank" ? "Your bank" : "Our stablecoin rail",
     plan: { kind: d.plan, sourceDebit: d.totals.sourceDebit, recipientNet: d.totals.recipientNet, arrivalUtc: d.totals.arrivalUtc,
             allocations: d.allocations.map((a: any) => ({ routeId: a.routeId, label: a.label, x402Executable: a.x402Executable, amount: a.amount, arrivalUtc: a.arrivalUtc })) },
-    costVsMidBps: d.costVsMidBps, risk, baseline: d.baseline ? { sourceDebit: d.baseline.sourceDebit } : null, value: d.value, provenance: d.provenance });
+    timing: d.timing, simulation: d.simulation, costVsMidBps: d.costVsMidBps, risk,
+    baseline: d.baseline ? { sourceDebit: d.baseline.sourceDebit, meetsDeadline: d.baseline.meetsDeadline } : null, value: d.value, provenance: d.provenance });
 });
 app.get("/v1/intents/:id", (req, res) => { const i = load().intents[String(req.params.id)]; return i ? res.json(i) : err(res, 404, "NOT_FOUND", "intent"); });
 
@@ -101,12 +107,24 @@ app.post("/v1/transfers", (req, res) => {
   if (i.decision.status !== "OK") return err(res, 422, "NO_ROUTE", i.decision.reason ?? "no eligible route", i.decision.missing);
   const key = req.header("idempotency-key");
   if (key && load().idem[`create:${key}`]) return res.json(load().transfers[load().idem[`create:${key}`]]);
+  let policy;
+  try {
+    const fallbackIds = req.body?.allowReroute === true && Array.isArray(req.body?.fallbackIntentIds) ? req.body.fallbackIntentIds : [];
+    const alternatives = fallbackIds.map((id: string) => load().intents[id]);
+    if (alternatives.some((a: any) => !a)) throw new Error("fallback quote not found");
+    policy = executionPolicy(i.intent, i.decision, req.body?.allowReroute === true, alternatives);
+  } catch (e: any) { return err(res, 422, "INVALID_FALLBACK", e.message); }
   const terms = { intent: i.intent, allocations: i.decision.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input,
-    sourceDebit: a.quote.sourceDebit.display, recipientNet: a.quote.recipientNet.display })), totals: i.decision.totals };
+    sourceDebit: a.quote.sourceDebit.display, recipientNet: a.quote.recipientNet.display })), totals: i.decision.totals,
+    executionPolicy: policy, dispatchAtUtc: req.body?.dispatchAtUtc ?? now() };
+  const dispatchAtUtc = terms.dispatchAtUtc;
+  if (!Number.isFinite(Date.parse(dispatchAtUtc)) || (i.decision.timing?.latestStartUtc && Date.parse(dispatchAtUtc) > Date.parse(i.decision.timing.latestStartUtc)))
+    return err(res, 422, "DISPATCH_TOO_LATE", "dispatch must be no later than the route's latest safe start", i.decision.timing);
   const termsHash = createHash("sha256").update(canonical(terms)).digest("hex");
   const transferId = `tr_${randomUUID().slice(0, 8)}`;
   const t = { transferId, intentId: i.intentId, planVersion: 1, termsHash, terms, status: "AWAITING_APPROVAL",
     quoteExpiresAt: new Date(Date.parse(i.createdAt) + QUOTE_TTL_MS).toISOString(), decisionRecordId: i.decision.decisionRecordId,
+    dispatchAtUtc, timing: i.decision.timing,
     value: i.decision.value, children: [], steps: {}, history: [{ at: now(), status: "AWAITING_APPROVAL" }] };
   update((db) => { db.transfers[transferId] = t; if (key) db.idem[`create:${key}`] = transferId; });
   res.status(201).json(t);
@@ -117,7 +135,11 @@ app.post("/v1/transfers/:id/approvals", (req, res) => {
   if (!t) return err(res, 404, "NOT_FOUND", "transfer");
   const { planVersion, termsHash, approver } = req.body ?? {};
   if (planVersion !== t.planVersion || termsHash !== t.termsHash) return err(res, 409, "PLAN_CHANGED", "approval must match the displayed plan version and termsHash");
-  if (Date.parse(t.quoteExpiresAt) < Date.now()) return err(res, 409, "QUOTE_EXPIRED", "create a new intent for fresh quotes");
+  if (t.status === "APPROVED") return res.json(t);
+  if (t.status !== "AWAITING_APPROVAL") return err(res, 409, "INVALID_STATE", `cannot approve a transfer in ${t.status}; inspect existing evidence before a new plan`);
+  if (Date.parse(t.quoteExpiresAt) < Date.parse(now())) return err(res, 409, "QUOTE_EXPIRED", "create a new intent for fresh quotes");
+  const feasible = planForDispatch(t.terms, now());
+  if (!feasible.ok) return err(res, 409, feasible.code!, feasible.reason!);
   if (!ID.test(approver ?? "")) return err(res, 400, "INVALID", "approver required");
   update((db) => { const x = db.transfers[t.transferId]; x.status = "APPROVED"; x.approval = { approver, planVersion, termsHash, at: now() };
     x.history.push({ at: now(), status: "APPROVED", note: approver }); });
@@ -129,22 +151,58 @@ app.post("/v1/transfers/:id/execute", (req, res) => {
   if (!t) return err(res, 404, "NOT_FOUND", "transfer");
   const { planVersion, termsHash } = req.body ?? {};
   if (planVersion !== t.planVersion || termsHash !== t.termsHash) return err(res, 409, "PLAN_CHANGED", "execute must reference the approved plan");
-  if (["EXECUTING", "COMPLETED", "PARTIAL", "NEEDS_RECONCILIATION"].includes(t.status)) return res.status(200).json({ ...t, note: "already executing/executed: not re-sent" });
+  if (["SCHEDULED", "EXECUTING", "COMPLETED", "PARTIAL", "NEEDS_RECONCILIATION"].includes(t.status)) return res.status(200).json({ ...t, note: "already scheduled/executing/executed: not re-sent" });
   if (t.status !== "APPROVED") return err(res, 409, "NOT_APPROVED", `transfer is ${t.status}`);
-  if (Date.parse(t.quoteExpiresAt) < Date.now()) return err(res, 409, "QUOTE_EXPIRED", "approved quote expired before execution");
+  const feasible = planForDispatch(t.terms, now());
+  if (!feasible.ok) return err(res, 409, feasible.code!, feasible.reason!);
   // atomic reservation of source funds (simulated treasury), then async execution
   const debitUsd = t.terms.intent.srcCcy === "USD" ? toMinor(t.terms.totals.sourceDebit.split(" ")[0], "USD") : 0n;
   const ok = update((db) => {
     const reserved = BigInt(db.reservedUsdMinor);
-    if (reserved + debitUsd > TREASURY_USD) return false;
+    if (reserved + debitUsd + BigInt(db.spentUsdMinor ?? "0") > TREASURY_USD) return false;
     db.reservedUsdMinor = (reserved + debitUsd).toString();
-    const x = db.transfers[t.transferId]; x.status = "EXECUTING"; x.reservedUsdMinor = debitUsd.toString();
-    x.history.push({ at: now(), status: "EXECUTING", note: `reserved ${fmt(debitUsd, "USD")}` }); return true;
+    const x = db.transfers[t.transferId]; x.status = "SCHEDULED"; x.reservedUsdMinor = debitUsd.toString();
+    x.history.push({ at: now(), status: "SCHEDULED", note: `reserved ${fmt(debitUsd, "USD")}; dispatch ${x.dispatchAtUtc}` }); return true;
   });
   if (!ok) return err(res, 409, "INSUFFICIENT_FUNDS", "confirmed treasury balance minus reservations is too low");
   res.status(202).json(load().transfers[t.transferId]);
-  execute(t.transferId).catch((e) => update((db) => { const x = db.transfers[t.transferId]; x.status = "NEEDS_RECONCILIATION"; x.history.push({ at: now(), status: "NEEDS_RECONCILIATION", note: String(e).slice(0, 200) }); }));
+  void dispatchDue().catch((e) => console.error("dispatch check:", e.message));
 });
+
+function unreserve(db: ReturnType<typeof load>, t: any) {
+  db.reservedUsdMinor = (BigInt(db.reservedUsdMinor) - BigInt(t.reservedUsdMinor ?? "0")).toString(); t.reservedUsdMinor = "0";
+}
+const dispatching = new Set<string>();
+export async function dispatchDue() {
+  for (const t of Object.values(load().transfers)) {
+    if (t.status !== "SCHEDULED" || Date.parse(t.dispatchAtUtc) > Date.parse(now()) || dispatching.has(t.transferId)) continue;
+    dispatching.add(t.transferId);
+    try {
+      let check = planForDispatch(t.terms, now());
+      if (check.ok && check.decision.allocations.some((a: any) => a.token === "USDC")) {
+        const gate = await usdcRouteAllowed(Number(check.decision.totals.sourceDebit.split(" ")[0]));
+        if (!gate.ok) check = { ok: false, code: "RAIL_PAUSED", reason: gate.reason };
+      }
+      // Recheck after asynchronous rail checks; nothing has been funded yet, so a pause can safely free the reservation.
+      if (check.ok) check = planForDispatch(t.terms, now());
+      if (!check.ok) {
+        update((db) => { const x = db.transfers[t.transferId]; unreserve(db, x); x.status = "PAUSED"; x.note = check.reason;
+          x.history.push({ at: now(), status: "PAUSED", code: check.code, note: check.reason }); });
+        continue;
+      }
+      const d = check.decision;
+      update((db) => {
+        const x = db.transfers[t.transferId]; x.status = "EXECUTING"; x.dispatchedAtUtc = now();
+        x.executionPlan = { allocations: d.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input, arrivalUtc: a.arrivalUtc })), totals: d.totals, timing: d.timing };
+        x.executionQuoteExpiresAt = new Date(Date.parse(now()) + QUOTE_TTL_MS).toISOString();
+        x.history.push({ at: now(), status: "EXECUTING", note: "fresh deadline and price check passed; original signed terms retained",
+          routeIds: d.allocations.map((a: any) => a.routeId) });
+      });
+      void execute(t.transferId).catch((e) => update((db) => { const x = db.transfers[t.transferId]; x.status = "NEEDS_RECONCILIATION";
+        x.history.push({ at: now(), status: x.status, note: String(e).slice(0, 300) }); }));
+    } finally { dispatching.delete(t.transferId); }
+  }
+}
 
 function setStep(transferId: string, stepId: string, status: string, extra: any = {}) {
   update((db) => { const x = db.transfers[transferId]; x.steps[stepId] = { ...(x.steps[stepId] ?? {}), status, ...extra, at: now() }; });
@@ -161,7 +219,7 @@ function runX402Fund(childId: string): Promise<{ orderId: string; tx?: string }>
 
 async function execute(transferId: string) {
   const t = load().transfers[transferId];
-  for (const [i, a] of t.terms.allocations.entries()) {
+  for (const [i, a] of (t.executionPlan ?? t.terms).allocations.entries()) {
     const childId = `${transferId}_c${i + 1}`, input = a.input;
     const fundStep = `fund_${i + 1}`, payStep = `payout_${i + 1}`;
     let funding: any;
@@ -177,29 +235,57 @@ async function execute(transferId: string) {
       funding = { mode: input.route === "stablecoin" ? "simulated_token" : "simulated_bank" };
       setStep(transferId, fundStep, "CONFIRMED", { rail: `${funding.mode} (labeled simulation)` });
     }
+    const deadline = t.terms.intent.deadlineUtc;
+    const remaining: any = optimize({ ...t.terms.intent, amount: input.amount, nowUtc: now(), allowedRouteIds: [a.routeId], allowSplit: false });
+    if (remaining.status !== "OK") throw new Error(`route can no longer meet its approved deadline after funding: ${remaining.reason}. Reconcile existing funds; do not resend`);
     setStep(transferId, payStep, "REQUESTED");
+    // Persist the deterministic child before submission: a crash or timeout after provider acceptance must still be recoverable by reads.
+    update((db) => { const x = db.transfers[transferId]; if (!x.children.includes(childId)) x.children.push(childId); });
     const r = await fetch(`${PAYOUT}/payouts`, { method: "POST", headers: { ...PAYOUT_H(), "idempotency-key": `op_${childId}` },
-      body: JSON.stringify({ transferId: childId, custom: { ...input, outcome: "delivered" }, quoteExpiresAt: t.quoteExpiresAt, funding }) });
+      body: JSON.stringify({ transferId: childId, custom: { ...input, outcome: "delivered" }, quoteExpiresAt: t.executionQuoteExpiresAt ?? t.quoteExpiresAt, funding }) });
     const p = await r.json();
     if (!r.ok && r.status !== 202) { setStep(transferId, payStep, "REJECTED", { detail: p.error }); throw new Error(p.error); }
     setStep(transferId, payStep, p.status === "FUNDING_NOT_CONFIRMED" ? "REJECTED" : "PENDING", { payoutId: p.payoutId });
-    update((db) => { const x = db.transfers[transferId]; if (!x.children.includes(childId)) x.children.push(childId); });
   }
-  // wait for terminal payout states, then release the reservation
-  for (let k = 0; k < 40; k++) {
-    const recs = await Promise.all(load().transfers[transferId].children.map((c: string) => fetch(`${PAYOUT}/v1/transfers/${c}/reconciliation`, { headers: PAYOUT_H() }).then((r) => r.json())));
-    const done = recs.every((r: any) => ["DELIVERED", "PAYOUT_REJECTED", "FUNDING_NOT_CONFIRMED", "PAYOUT_UNKNOWN", "HOLD_QUOTE_EXPIRED"].includes(r.status));
-    recs.forEach((r: any, i: number) => setStep(transferId, `payout_${i + 1}`, r.status === "DELIVERED" ? "CONFIRMED" : r.status === "PAYOUT_REJECTED" ? "REJECTED" : r.status === "PAYOUT_UNKNOWN" ? "UNKNOWN" : "PENDING"));
-    if (done) {
-      const all = recs.every((r: any) => r.status === "DELIVERED" && !r.outstanding.fundedButUnpaid);
-      update((db) => { const x = db.transfers[transferId]; db.reservedUsdMinor = (BigInt(db.reservedUsdMinor) - BigInt(x.reservedUsdMinor ?? "0")).toString();
-        x.reservedUsdMinor = "0"; x.status = all ? "COMPLETED" : "NEEDS_RECONCILIATION"; x.history.push({ at: now(), status: x.status }); });
-      const ben = load().transfers[transferId].terms.intent.beneficiary;
-      if (all && ben?.name) recordPayment(ben, transferId);     // payee history: later bank-detail changes are held for a call-back
-      return;
-    }
-    await new Promise((r) => setTimeout(r, 1500));
-  }
+  await monitorTransfers();
+}
+
+let monitoring = false;
+export async function monitorTransfers() {
+  if (monitoring) return; monitoring = true;
+  try { for (const t of Object.values(load().transfers)) {
+    if (!["EXECUTING", "NEEDS_RECONCILIATION"].includes(t.status) || !t.children.length) continue;
+    const expected = (t.executionPlan ?? t.terms).allocations.length;
+    const recs = await Promise.all(t.children.map(async (c: string) => { const r = await fetch(`${PAYOUT}/v1/transfers/${c}/reconciliation`, { headers: PAYOUT_H(), signal: AbortSignal.timeout(5000) }); if (!r.ok) throw new Error(`reconciliation HTTP ${r.status}`); return r.json(); })).catch(() => null);
+    if (!recs) continue; // read failure is never permission to resend
+    const reconciled = (r: any) => Array.isArray(r.legs) && r.legs.some((l: any) => l.leg === "beneficiary_credit")
+      && r.legs.some((l: any) => l.leg === "ledger_postings") && r.legs.every((l: any) => {
+        if (/REJECTED|MISMATCH|UNKNOWN|PENDING/.test(l.status ?? "")) return false;
+        if (l.leg === "ledger_postings") return l.observed === "balanced per asset";
+        if (l.leg === "chain_settlement") return l.status === "MATCHED";
+        if (l.leg === "x402_records") return l.observed === "MATCHED";
+        return l.observed != null && l.observed === l.expected;
+      });
+    const complete = recs.length === expected && recs.every((r: any) => r.status === "DELIVERED" && r.outstanding?.fundedButUnpaid === false && reconciled(r));
+    const terminalProblem = recs.some((r: any) => ["PAYOUT_REJECTED", "FUNDING_NOT_CONFIRMED", "PAYOUT_UNKNOWN", "HOLD_QUOTE_EXPIRED"].includes(r.status) || (r.status === "DELIVERED" && !reconciled(r)));
+    recs.forEach((r: any, i: number) => setStep(t.transferId, `payout_${i + 1}`, r.status === "DELIVERED" && reconciled(r) ? "CONFIRMED" : r.status === "PAYOUT_UNKNOWN" ? "UNKNOWN" : terminalProblem ? "REVIEW" : "PENDING"));
+    update((db) => {
+      const x = db.transfers[t.transferId], deadline = x.terms.intent.deadlineUtc;
+      const creditTimes = recs.map((r: any) => r.creditedAtUtc).filter((v: any) => typeof v === "string" && Number.isFinite(Date.parse(v)));
+      const creditedAtUtc = creditTimes.length === recs.length ? creditTimes.sort().at(-1) : null;
+      x.deadlineStatus = !deadline ? "NOT_SET" : complete ? (creditedAtUtc ? (Date.parse(creditedAtUtc) <= Date.parse(deadline) ? "MET" : "MISSED") : "UNVERIFIED")
+        : Date.parse(now()) > Date.parse(deadline) ? "OVERDUE" : "IN_PROGRESS";
+      x.creditedAtUtc = creditedAtUtc;
+      if (complete) {
+        const actualDebit = x.terms.intent.srcCcy === "USD" ? toMinor((x.executionPlan ?? x.terms).totals.sourceDebit.split(" ")[0], "USD") : 0n;
+        db.spentUsdMinor = (BigInt(db.spentUsdMinor ?? "0") + actualDebit).toString();
+        unreserve(db, x); x.status = "COMPLETED"; x.confirmedAtUtc = now();
+      }
+      else if (terminalProblem) x.status = "NEEDS_RECONCILIATION";
+      if (complete || (terminalProblem && t.status !== x.status)) x.history.push({ at: now(), status: x.status, deadlineStatus: x.deadlineStatus });
+    });
+    if (complete && t.terms.intent.beneficiary?.name) recordPayment(t.terms.intent.beneficiary, t.transferId);
+  } } finally { monitoring = false; }
 }
 
 app.get("/v1/transfers/:id", (req, res) => { const t = load().transfers[String(req.params.id)]; return t ? res.json(t) : err(res, 404, "NOT_FOUND", "transfer"); });
@@ -244,7 +330,8 @@ app.get("/v1/transfers/:id/receipt", async (req, res) => {
   if (!t) return err(res, 404, "NOT_FOUND", "transfer");
   const kids = await Promise.all(t.children.map((c: string) => fetch(`${PAYOUT}/v1/transfers/${c}/receipt`, { headers: PAYOUT_H() }).then((r) => r.json())));
   res.json({ transferId: id, status: t.status, reference: t.terms.intent.reference ?? null, supplier: t.terms.intent.beneficiary?.name ?? null,
-    plan: t.terms, termsHash: t.termsHash, approval: t.approval, value: t.value, children: kids,
+    plan: t.terms, executionPlan: t.executionPlan, timing: t.timing, dispatchedAtUtc: t.dispatchedAtUtc,
+    creditedAtUtc: t.creditedAtUtc, deadlineStatus: t.deadlineStatus, termsHash: t.termsHash, approval: t.approval, value: t.value, children: kids,
     disclosure: `Mid rates: ${MARKET.mode} (ECB reference rates via Frankfurter when live). Bank baseline: measured bank pricing (Wise comparison data) when live. `
       + "Stablecoin rail: sourced fees (Circle Mint redemption terms, network fees); local-coin conversion only at an entered venue quote. Payouts: simulated. Each USDC-on-Base leg carries an x402 settlement proof: "
       + "a real 0.01 test USDC payment on Base Sepolia tied to this transfer's order and reconciled on chain. It proves the settlement path; it is not the transfer amount." });
@@ -277,7 +364,7 @@ app.post("/internal/events", (req, res) => { update((db) => { db.observations.pu
 
 function inventory() {
   const reserved = BigInt(load().reservedUsdMinor);
-  return { snapshotId: `snap_${Date.now().toString(36)}`, confirmed: { "US-Operating/USD": fmt(TREASURY_USD, "USD"), "acme-ca/CAD": "15000.00 CAD" },
+  return { snapshotId: `snap_${Date.now().toString(36)}`, confirmed: { "US-Operating/USD": fmt(TREASURY_USD - BigInt(load().spentUsdMinor ?? "0"), "USD"), "acme-ca/CAD": "15000.00 CAD" },
     reserved: { "US-Operating/USD": fmt(reserved, "USD") }, pendingIncoming: { "acme-ca/CAD": "70000.00 CAD (confirmed, arrives 2026-10-27T15:00Z)" },
     forecast: { "acme-eu/EUR": "40000.00 EUR (forecast only)" }, provenance: "simulated" };
 }
@@ -285,7 +372,7 @@ app.post("/internal/funding/check", (req, res) => {
   const i = load().intents[String(req.body?.intentId)];
   if (!i || i.decision.status !== "OK") return res.json({ feasible: false, notes: ["no decision for intent"] });
   const inv = inventory(), need = i.intent.srcCcy === "USD" ? toMinor(i.decision.totals.sourceDebit.split(" ")[0], "USD") : 0n;
-  const avail = TREASURY_USD - BigInt(load().reservedUsdMinor);
+  const avail = TREASURY_USD - BigInt(load().reservedUsdMinor) - BigInt(load().spentUsdMinor ?? "0");
   res.json({ feasible: need <= avail, snapshotId: inv.snapshotId, confirmedAvailable: { "US-Operating/USD": fmt(avail, "USD") }, reserved: inv.reserved,
     forecast: inv.forecast, blockedPools: ["client-trust (different owner)"], notes: [`needs ${fmt(need, "USD")}`, "forecast inflows excluded from available funds"] });
 });
@@ -322,7 +409,7 @@ app.post("/v1/company/payment-run", (req, res) => safe(res, () => runPaymentRun(
 // Port company data in: CSV text (accounting export) or a Nessie customer (bank sandbox), then run the payment run.
 app.post("/v1/company/import", async (req, res) => {
   try {
-    const now = req.body?.nowUtc ?? "2026-10-26T14:00:00Z";
+    const now = planningNow();
     const imp: any = req.body?.source === "nessie" ? await importFromNessie(String(req.body.customerId), DEMO_COMPANY, now)
       : req.body?.source === "csv" ? importCsv(String(req.body.csv ?? ""), DEMO_COMPANY, now) : null;
     if (!imp) return err(res, 400, "INVALID_SOURCE", "source must be csv or nessie");
@@ -336,4 +423,12 @@ app.post("/v1/company/discounts", (req, res) => safe(res, () => runDiscounts(req
 app.post("/v1/company/beneficiaries/validate", (req, res) => safe(res, () => (Array.isArray(req.body) && req.body.length ? req.body : DEMO_BENEFICIARIES).map(validateBeneficiary)));
 
 const port = Number(process.env.ROUTER_PORT ?? 8404);
-app.listen(port, () => console.log(`router on :${port} (optimizer + orchestration; market data: ${MARKET.mode})`));
+if (process.env.ROUTER_NO_LISTEN !== "1") {
+  app.listen(port, () => console.log(`router on :${port} (optimizer + orchestration; market data: ${MARKET.mode}${process.env.LOCAL_ROUTING === "1" ? "; LOCAL simulation" : ""})`));
+  // Recover scheduled work, but never replay an in-flight funding or payout request after a restart.
+  update((db) => { for (const t of Object.values(db.transfers)) if (t.status === "EXECUTING") {
+    t.status = "NEEDS_RECONCILIATION"; t.history.push({ at: now(), status: t.status, note: "router restarted; inspect existing evidence before any further send" });
+  } });
+  const tick = () => { void dispatchDue().catch((e) => console.error("dispatch check:", e.message)); void monitorTransfers().catch((e) => console.error("reconciliation check:", e.message)); };
+  setInterval(tick, 2000).unref(); tick();
+}

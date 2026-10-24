@@ -2,6 +2,7 @@
 // this machine (loopback), so the page needs no secret. It reuses the router's own endpoints and the agents' concierge.
 import express from "express";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { loadLinked, saveLinked } from "../assistant/linked.js";
 import { importFromNessie, seedDemo, writeBack } from "../connectors/nessieImport.js";
@@ -21,8 +22,10 @@ import { RAILS, TOKENIZED_NETWORKS, tokenizedQuote } from "./rails.js";
 import { usdcPeg, usdcInFlight, usdcRouteAllowed } from "./depeg.js";
 import { allInCost, fxRisk, sendBy, transitDays } from "../company/economics.js";
 import { midInfo, rateHistory } from "./market.js";
+import { planningNow } from "./timing.js";
+import { executionPolicy, planForDispatch } from "./dispatch.js";
 
-const NOW = () => process.env.DEMO_NOW_UTC ?? "2026-10-26T14:00:00Z";
+const NOW = planningNow;
 const PAID = "data/executed.json";
 const loadPaid = (): Record<string, any> => (existsSync(PAID) ? JSON.parse(readFileSync(PAID, "utf8")) : {});
 const savePaid = (m: Record<string, any>) => { mkdirSync("data", { recursive: true }); writeFileSync(PAID, JSON.stringify(m, null, 2)); };
@@ -33,7 +36,9 @@ export function mountUi(app: express.Express, port: number) {
   const self = async (method: string, p: string, body?: any, extra: Record<string, string> = {}) => {
     const r = await fetch(`http://127.0.0.1:${port}${p}`, { method, body: body ? JSON.stringify(body) : undefined,
       headers: { "content-type": "application/json", authorization: `Bearer ${process.env.ROUTER_TOKEN ?? "dev-token"}`, ...extra } });
-    return r.json();
+    const json = await r.json();
+    if (!r.ok) throw new Error(json.message ?? json.error ?? `router HTTP ${r.status}`);
+    return json;
   };
   // Release-on-delivery escrow service (x402-spike: npm run escrow), internal token like the agent wallet
   const esc = async (method: string, p: string, body?: any) => {
@@ -44,7 +49,7 @@ export function mountUi(app: express.Express, port: number) {
   const local = (req: express.Request, res: express.Response, next: express.NextFunction) =>
     ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "") ? next() : res.status(403).json({ error: "local only" });
 
-  app.use("/app", local, express.static(path.resolve("public")));
+  app.use("/app", local, express.static(fileURLToPath(new URL("../../public/", import.meta.url))));
   app.get("/", local, (_req, res) => res.redirect("/app/"));
   const ui = express.Router();
   ui.use(local);
@@ -64,7 +69,7 @@ export function mountUi(app: express.Express, port: number) {
         acceptsUsdc: !!p.beneficiary.usdcWallet, ready: readiness(p.beneficiary), check: v.status, issues: [...v.errors, ...v.warnings], detailsChanged: (v as any).detailsChanged,
         plan: line?.status ? "blocked" : line?.route ?? null, fromWallet: line?.fromWallet, paid: paid[`${l.input.company.companyId}:${p.id}`] ?? null };
     });
-    res.json({ connected: !l.source.startsWith("demo company"), source: l.source, linkedAt: l.linkedAt, usdAvailable: l.usdAvailable,
+    res.json({ localSimulation: process.env.LOCAL_ROUTING === "1", connected: !l.source.startsWith("demo company"), source: l.source, linkedAt: l.linkedAt, usdAvailable: l.usdAvailable,
       company: l.input.company.name, bills, receivables: l.input.receivables, run, market: marketSummary(), sources: SOURCES,
       payeesOnFile: Object.keys(loadPayees()).length, rails: RAILS, tokenizedNetworks: TOKENIZED_NETWORKS, policy: pol,
       fxRisk: fxRisk(exposures, rateHistory(), Date.now(), pol.fxRiskLimitUsd), costOfCashPct: l.input.company.costOfCashPct,
@@ -135,7 +140,12 @@ export function mountUi(app: express.Express, port: number) {
 
   // ---------------------------------------------------------------- payment requests: prepare -> verify -> approve -> release
   const view = (r: C.PaymentRequest, u?: C.User) => { const p = C.loadPolicy(), n = C.nextActions(r, u, p);
-    return { ...r, status: n.status, approvalsRequired: C.approvalsRequired(r, p), actions: n.actions }; };
+    const transfer = r.transferId ? load().transfers[r.transferId] : null;
+    if (transfer) {
+      r = { ...r, status: transfer.status === "COMPLETED" ? "COMPLETED" : transfer.status === "PAUSED" ? "PAUSED"
+        : transfer.status === "NEEDS_RECONCILIATION" ? "FAILED" : r.status, note: transfer.note ?? r.note, deadlineStatus: transfer.deadlineStatus };
+    }
+    return { ...r, status: C.computeStatus(r, p), approvalsRequired: C.approvalsRequired(r, p), actions: C.nextActions(r, u, p).actions }; };
   ui.get("/requests", (req, res) => { const u = me(req); res.json(Object.values(C.loadRequests()).reverse().map((r) => view(r, u))); });
 
   // The preparer turns the agent's paid plan into payment requests. Nothing moves until the company's controls are met.
@@ -157,7 +167,9 @@ export function mountUi(app: express.Express, port: number) {
         country: bill?.beneficiary.country ?? "-", ccy: it.intent.destCcy, amount: it.intent.amount, reference: it.intent.reference ?? d.payable,
         intentId: d.intentId, provider: d.chosen, route: (d.routeIds ?? []).join("+"), debitUsd: Number(String(it.decision.totals.sourceDebit).split(" ")[0]),
         recipientGets: it.decision.totals.recipientNet, arrivalUtc: it.decision.totals.arrivalUtc, agentReasons: (d.reasons ?? []).filter((x: string) => !x.startsWith("compared:")).slice(0, 4),
-        preparedBy: u.id, preparedAt: new Date().toISOString(), detailsChanged: !!v.detailsChanged || d.decision === "review",
+        preparedBy: u.id, preparedAt: new Date().toISOString(), detailsChanged: !!v.detailsChanged || !!d.detailsChanged || (d.needs ?? []).some((n: string) => n.includes("call-back")),
+        costReview: (d.needs ?? []).some((n: string) => n.includes("cost")), allowReroute: req.body?.allowReroute === true, timing: it.decision.timing,
+        fallbackIntentIds: (d.options ?? []).filter((o: any) => o.eligible && o.intentId && o.intentId !== d.intentId).map((o: any) => o.intentId),
         detailsNote: v.warnings?.find((w: string) => w.includes("changed")), approvals: [], releaseOnDelivery: onDelivery.has(d.payable), status: "AWAITING_APPROVAL",
         condition: onDelivery.has(d.payable) ? deliveryCondition(u.id, u.roles[0]) : undefined, msgId: `R402-${Date.now().toString(36).toUpperCase()}-${d.payable}`.slice(0, 35),
         purpose: String(req.body?.purpose ?? "").slice(0, 120) || "Invoice payment", mode: req.body?.mode === "budget" ? "budget" : "invoice",
@@ -250,7 +262,9 @@ export function mountUi(app: express.Express, port: number) {
   const releasing = new Set<string>();
   async function release(id: string) {
     if (releasing.has(id)) return; releasing.add(id);
-    try { await releaseOne(id); } finally { releasing.delete(id); }
+    try { await releaseOne(id); } catch (e: any) {
+      const all = C.loadRequests(); if (all[id]) { all[id].status = "PAUSED"; all[id].note = e.message; C.saveRequests(all); C.audit("system", "release_paused", id, e.message); }
+    } finally { releasing.delete(id); }
   }
   async function releaseOne(id: string) {
     const r = C.loadRequests()[id], pol = C.loadPolicy(); if (!r || r.status !== "READY") return;
@@ -259,6 +273,23 @@ export function mountUi(app: express.Express, port: number) {
     const l = loadLinked(), co = l.input.company, key = `${co.companyId}:${r.payable}`, paid = loadPaid();
     if (paid[key] && ["COMPLETED", "EXECUTING"].includes(paid[key].status)) { r.status = "FAILED"; r.note = "already paid (double-payment protection)"; saveR(); return; }
     const pause = (why: string) => { r.status = "PAUSED"; r.note = why; saveR(); C.audit("system", "paused", r.id, why); };
+    const original = await self("GET", `/v1/intents/${r.intentId}`);
+    const alternatives = r.allowReroute ? await Promise.all((r.fallbackIntentIds ?? []).map((id) => self("GET", `/v1/intents/${id}`))) : [];
+    const originalTerms = { intent: original.intent, allocations: original.decision.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input })),
+      totals: original.decision.totals, executionPolicy: executionPolicy(original.intent, original.decision, r.allowReroute, alternatives) };
+    const check = planForDispatch(originalTerms, NOW());
+    if (!check.ok) return pause(`${check.reason}. Nothing new was sent; request a new plan or approval.`);
+    // Refresh only within the routes and debit cap the company reviewed. No provider switch or higher debit is implicit.
+    const refreshed = await self("POST", "/v1/intents", { ...original.intent, provider: r.allowReroute ? undefined : original.intent.provider, allowedRouteIds: originalTerms.executionPolicy.allowedRouteIds });
+    if (refreshed.decision?.status !== "OK") return pause(refreshed.decision?.reason ?? "No route can still meet the recipient deadline");
+    const newDebit = Number(refreshed.decision.totals.sourceDebit.split(" ")[0]);
+    if (newDebit > r.debitUsd) {
+      r.status = "AWAITING_APPROVAL"; r.approvals = []; r.intentId = refreshed.intentId; r.debitUsd = newDebit;
+      r.note = "Current price exceeds the previously approved debit cap; review and approve the new amount"; saveR(); return;
+    }
+    const intentId = refreshed.intentId;
+    Object.assign(r, { intentId, debitUsd: newDebit, provider: refreshed.decision.allocations[0].routeId.startsWith("bank:") ? "bank" : "stablecoin",
+      arrivalUtc: refreshed.decision.totals.arrivalUtc, timing: refreshed.decision.timing }); saveR();
     if (r.provider === "stablecoin") {
       // depeg breaker always; issuer cap only if the money is not already sitting in escrow
       const g = r.escrow?.state === "LOCKED" ? { ok: (await usdcPeg(pol)).status !== "paused", reason: (await usdcPeg(pol)).reason } : await usdcRouteAllowed(r.debitUsd, r.id);
@@ -272,21 +303,8 @@ export function mountUi(app: express.Express, port: number) {
         } catch (e: any) { return pause(`Escrow release failed (${e.message}). Nothing else was sent.`); }
       }
     }
-    let intentId = r.intentId; const it = await self("GET", `/v1/intents/${intentId}`);
-    if (!it?.intentId || Date.now() - Date.parse(it.createdAt) > pol.quoteValidMinutes * 60e3) {
-      const { nowUtc, provider, ...body } = it?.intent ?? {};
-      const q = await self("POST", "/v1/provider-quote", { provider: provider ?? r.provider, ...body });
-      const newDebit = Number(String(q?.plan?.sourceDebit ?? "").split(" ")[0]);
-      if (!q?.intentId || !newDebit) { r.status = "AWAITING_APPROVAL"; r.approvals = []; r.note = "quote expired and could not be refreshed: approve again after a new quote"; saveR(); C.audit("system", "requote_failed", r.id); return; }
-      if (newDebit > r.debitUsd * (1 + pol.requoteTolerancePct / 100)) {
-        C.audit("system", "requote_outside_tolerance", r.id, `${r.debitUsd} -> ${newDebit} USD (tolerance ${pol.requoteTolerancePct}%): approvals reset`);
-        Object.assign(r, { intentId: q.intentId, debitUsd: newDebit, approvals: [], status: "AWAITING_APPROVAL", note: `price moved to ${newDebit.toLocaleString()} USD after the quote expired: approve again` });
-        saveR(); return;
-      }
-      C.audit("system", "requoted_within_tolerance", r.id, `${r.debitUsd} -> ${newDebit} USD`); intentId = q.intentId; r.intentId = intentId; r.debitUsd = newDebit;
-    }
     const approvers = r.approvals.map((a) => C.user(a.by)?.name ?? a.by).join(" + "), approverIds = r.approvals.map((a) => a.by).join(":");
-    const t = await self("POST", "/v1/transfers", { intentId }, { "idempotency-key": `ui_${r.id}_${intentId}` });
+    const t = await self("POST", "/v1/transfers", { intentId, allowReroute: r.allowReroute }, { "idempotency-key": `ui_${r.id}_${intentId}` });
     await self("POST", `/v1/transfers/${t.transferId}/approvals`, { planVersion: t.planVersion, termsHash: t.termsHash, approver: approverIds });
     await self("POST", `/v1/transfers/${t.transferId}/execute`, { planVersion: t.planVersion, termsHash: t.termsHash }, { "idempotency-key": `exec_${t.transferId}` });
     paid[key] = { transferId: t.transferId, status: "EXECUTING", at: new Date().toISOString() }; savePaid(paid);
@@ -295,15 +313,15 @@ export function mountUi(app: express.Express, port: number) {
     const meta = loadMeta(), cust = l.source.match(/Nessie customer (\S+)/)?.[1], opAcct = cust ? meta[`customer:${cust}`]?.operatingAccountId : undefined;
     for (let i = 0; i < 150; i++) {
       const st = await self("GET", `/v1/transfers/${t.transferId}`);
-      if (!["EXECUTING", "APPROVED"].includes(st.status)) {
+      if (!["SCHEDULED", "EXECUTING", "APPROVED"].includes(st.status)) {
         const p2 = loadPaid(); p2[key] = { transferId: t.transferId, status: st.status, at: new Date().toISOString() }; savePaid(p2);
-        const all = C.loadRequests(), rr = all[id]; rr.status = st.status === "COMPLETED" ? "COMPLETED" : "FAILED";
+        const all = C.loadRequests(), rr = all[id]; rr.status = st.status === "COMPLETED" ? "COMPLETED" : st.status === "PAUSED" ? "PAUSED" : "FAILED"; rr.deadlineStatus = st.deadlineStatus;
         rr.proof = Object.values<any>(st.steps ?? {}).find((x: any) => x.proofTx)?.explorer;
         if (rr.status === "FAILED") { const bad = Object.entries<any>(st.steps ?? {}).find(([, v]) => v.status !== "CONFIRMED");
           rr.note = `transfer ${st.status}${bad ? `: ${bad[0]} ${bad[1].status}${bad[1].detail ? ` (${String(bad[1].detail).split("\n")[0].slice(0, 140)})` : ""}` : ""}. Nothing was sent twice; resolve it, then re-run.`; }
         all[id] = rr; C.saveRequests(all);
         C.audit("system", st.status === "COMPLETED" ? "completed" : "needs_attention", id, `${t.transferId} ${st.status}${rr.proof ? ` proof ${rr.proof}` : ""}`);
-        if (st.status === "COMPLETED" && opAcct) await writeBack(opAcct, st.terms.totals.sourceDebit.split(" ")[0], t.transferId).catch(() => {});
+        if (st.status === "COMPLETED" && opAcct && process.env.LOCAL_ROUTING !== "1") await writeBack(opAcct, (st.executionPlan ?? st.terms).totals.sourceDebit.split(" ")[0], t.transferId).catch(() => {});
         return;
       }
       await new Promise((z) => setTimeout(z, 2000));
@@ -346,6 +364,7 @@ export function mountUi(app: express.Express, port: number) {
       const atMidUsd = getsDest / mid, days = transitDays(now, q.plan.arrivalUtc);
       const econ = allInCost({ youPayUsd, atMidUsd, amountUsd: atMidUsd, costOfCashPct: co.costOfCashPct, days });
       return { provider, status: "OK", intentId: q.intentId, youPay: q.plan.sourceDebit, supplierGets: q.plan.recipientNet, arrivalUtc: q.plan.arrivalUtc,
+        timing: q.timing, simulation: q.simulation,
         capturedAt: it.createdAt, expiresAt: new Date(Date.parse(it.createdAt) + C.loadPolicy().quoteValidMinutes * 60e3).toISOString(),
         costVsMidBps: q.costVsMidBps?.plan, fxRate: a.fxRate, risk: q.risk, routeIds: q.plan.allocations.map((x: any) => x.routeId),
         breakdown: { transferFeeUsd: transferUsd, payoutFeeUsd: payoutUsd, conversionCostUsd: Math.max(0, econ.pricedUsd - transferUsd - payoutUsd), convertedPrincipalUsd: youPayUsd - transferUsd },

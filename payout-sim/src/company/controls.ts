@@ -80,6 +80,7 @@ export interface PaymentRequest {
   condition?: ConditionSpec;           // portable release condition (enforced by Route402 today, by a tokenized ledger later)
   msgId?: string;                      // ISO 20022 message id for this payment's pain.001
   purpose?: string; mode?: "invoice" | "budget"; checkedBy?: { userId: string; at: string };   // preparer's deliberate confirmation
+  allowReroute?: boolean; fallbackIntentIds?: string[]; timing?: any; deadlineStatus?: string; costReview?: boolean;
   status: ReqStatus; note?: string; transferId?: string; proof?: string;
   escrow?: { chain: string; contract: string; lockId: string; amountUsdc: number; deadline: string; state: "LOCKING" | "LOCKED" | "RELEASED" | "REFUNDED" | "FAILED";
     lockTx?: string; releaseTx?: string; refundTx?: string; explorer?: string | null; error?: string };

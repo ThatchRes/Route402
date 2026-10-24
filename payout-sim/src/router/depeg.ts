@@ -17,6 +17,8 @@ async function price(url: string, pick: (j: any) => number, ms = 4000) {
 }
 
 export async function usdcPeg(p: Policy = loadPolicy()): Promise<PegCheck> {
+  if (process.env.LOCAL_ROUTING === "1") return { status: "paused", bandPct: p.depegBandPct, sources: [], at: new Date().toISOString(), test: true,
+    reason: "stablecoin settlement is disabled in local simulation; no live price feeds are requested" };
   if (cache && Date.now() - cache.at < 60_000 && cache.check.bandPct === p.depegBandPct) return cache.check;
   const at = new Date().toISOString(), sources: PegCheck["sources"] = [];
   if (process.env.DEPEG_TEST_PRICE) sources.push({ name: "test override (DEPEG_TEST_PRICE)", price: Number(process.env.DEPEG_TEST_PRICE) });

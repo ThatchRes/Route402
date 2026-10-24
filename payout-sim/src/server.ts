@@ -10,7 +10,7 @@ import { assertBalanced, balance, line, type Entry, type Line } from "./ledger.j
 import { load, update, type Payout, type ProviderEvent } from "./store.js";
 import { fmt, listCurrencies } from "./money.js";
 
-const app = express();
+export const app = express();
 const TOKEN = () => process.env.PAYOUT_INTERNAL_TOKEN ?? "dev-token";
 const SELLER = process.env.SELLER_URL ?? "http://localhost:8402";
 const ID = /^[A-Za-z0-9_\-:.]{1,80}$/;
@@ -251,7 +251,8 @@ async function reconciliation(transferId: string) {
   }
   const outstandingProvider = balance(db.entries.filter((e) => e.transferId === transferId), "provider:clearing", q.funding.ccy);
   const outstandingPayout = balance(db.entries.filter((e) => e.transferId === transferId), "payout:clearing", q.recipientNet.ccy);
-  return { transferId, payoutId: p.payoutId, status: p.status, legs,
+  const creditedAtUtc = p.status === "DELIVERED" ? db.events.filter((e) => e.opRef === p.opRef && e.applied && e.type === "BENEFICIARY_CREDITED").map((e) => e.occurredAt).sort().at(-1) : undefined;
+  return { transferId, payoutId: p.payoutId, status: p.status, creditedAtUtc, legs,
     outstanding: { providerClearing: fmt(outstandingProvider, q.funding.ccy), payoutClearing: fmt(outstandingPayout, q.recipientNet.ccy),
                    fundedButUnpaid: outstandingProvider > 0n || outstandingPayout > 0n } };
 }
@@ -305,4 +306,4 @@ app.post("/quotes/preview", express.json(), (req, res) => {
 });
 
 const port = Number(process.env.PORT ?? 8403);
-app.listen(port, () => { console.log(`payout-sim on :${port} (simulated provider, labeled synthetic rates)`); resumeAll(); });
+if (process.env.PAYOUT_NO_LISTEN !== "1") app.listen(port, () => { console.log(`payout-sim on :${port} (simulated provider, labeled synthetic rates)`); resumeAll(); });

@@ -224,6 +224,19 @@ async def paid_call(service: str, body: dict, corr: str, caller: str) -> dict:
     safe_id(corr, "correlationId")
     t0 = time.time()
     try:
+        if os.getenv("LOCAL_ROUTING", "0") == "1":
+            # Same router optimizer and validator as the live tools, without wallet, seller, network payment or fake intent IDs.
+            if service.startswith("quote"):
+                data = await _call("local_quote", "POST", "/v1/provider-quote", "demo-tenant", corr,
+                                   {**body, "provider": "bank" if service == "quote:bank" else "stablecoin"})
+            else:
+                rows = await _call("local_screen", "POST", "/v1/company/beneficiaries/validate", "demo-tenant", corr, [body["beneficiary"]])
+                v = rows[0]
+                data = {**v, "status": "PASS" if v["status"] == "OK" else v["status"],
+                        "notCovered": ["sanctions screening", "business identity verification"]}
+            return {"ok": True, "data": data, "mock": True,
+                    "payment": {"service": service, "priceUsdc": "0", "explorer": "local simulation: no payment"},
+                    "budget": {"spentUsdc": "0", "capUsdc": "0"}}
         if WALLET_MOCK:
             return {"ok": True, "data": _mock_paid(service, body), "mock": True,
                     "payment": {"service": service, "priceUsdc": "0.001", "transaction": "0xMOCK", "explorer": "(mock: no chain)"},

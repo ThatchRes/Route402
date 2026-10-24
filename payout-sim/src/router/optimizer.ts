@@ -2,7 +2,8 @@
 // Every candidate is priced through the SAME quoteFor() the payout service executes, so numbers match exactly.
 import { quoteFor, type QuoteInput } from "../scenarios.js";
 import { convert, decimals, fmt, toMinor } from "../money.js";
-import { BANKS, NETWORKS, OFFRAMPS, ONRAMPS, PLATFORM, STABILITY, SWAPS, TOKENS, MID_PER_USD, venueQuote, type Tier } from "./registry.js";
+import { BANKS, NETWORKS, OFFRAMPS, ONRAMPS, PLATFORM, STABILITY, SWAPS, TOKENS, MID_PER_USD, venueQuote, localBankRoutes, type Tier } from "./registry.js";
+import { latestStart, planningNow } from "./timing.js";
 import { div, lessBps, mul } from "./rates.js";
 import { bankMarkup, MARKET, midInfo } from "./market.js";   // live mids overwrite the demo table before any price is computed
 
@@ -15,6 +16,8 @@ export interface Intent {
   beneficiaryAcceptsUsdc?: boolean;   // supplier has a USDC wallet on file (USD-invoiced suppliers)
   reference?: string;                 // invoice reference carried with the payment (kept on the receipt)
   beneficiary?: any;                  // supplier details (payee history is updated when the payment completes)
+  deadlineBufferMinutes?: number;
+  allowedRouteIds?: string[];         // dispatcher restricts re-planning to the user's approved routes
   currentBank?: { label: string; fxMarkupBps: number; wireFeeUsd: number; businessDays: number; measured?: boolean };   // the company's own bank = baseline
   // measured: true -> the FX markup comes from measured bank pricing for this corridor (market.ts); fxMarkupBps is only the fallback
 }
@@ -54,7 +57,8 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
     ? [{ id: "current_bank", label: `${it.currentBank.label} (your current bank)`, fixedUsd: it.currentBank.wireFeeUsd, tiers: [{ upToUsd: Infinity, bps: cbBps }],
          businessDays: it.currentBank.businessDays, cutoffUtcHour: 21, capacityUsd: Infinity, dest: "*" as const, isBaseline: true },
        ...BANKS.filter((b) => !b.isBaseline)]
-    : BANKS;
+    : [...BANKS];
+  banks.push(...localBankRoutes());
   for (const b of banks) {
     if (b.dest !== "*" && !b.dest.includes(it.destCcy)) continue;
     routes.push({ routeId: `bank:${b.id}`, kind: "bank", label: b.label, x402Executable: false, capacityUsd: b.capacityUsd,
@@ -62,6 +66,7 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
       build: (amountType, amount, usd) => ({ route: "bank", srcCcy: it.srcCcy, destCcy: it.destCcy, amountType, amount,
         fxRate: lessBps(mid(it.srcCcy, it.destCcy, o), sameCcy ? 0 : tierBps(b.tiers, usd)), fundingFee: usdToCcy(b.fixedUsd, it.srcCcy, o), payoutFee: "0" }),
       arrival: (now) => {
+        if (b.id === "local_express") return new Date(now.getTime() + 4 * 3600e3); // fixture: 24/7, 4h, synthetic
         if (b.sameDayBeforeUtcHour !== undefined && isBiz(now) && now.getUTCHours() < b.sameDayBeforeUtcHour) return new Date(now.getTime() + 4 * 3600e3);
         const start = isBiz(now) && now.getUTCHours() < b.cutoffUtcHour ? now : nextBiz(now, 9);
         return addBizDays(start, b.businessDays);
@@ -148,7 +153,7 @@ function price(r: Route, it: Intent, amount: string, now: Date, deadline?: Date)
   const out: Priced = { ...base, quote, arrivalUtc: arrival.toISOString(), costMinor: binding, timeCostMinor: time, scoreMinor: score, eligible: true };
   const fail = (reason: string) => ({ ...out, eligible: false, reason });
   if (sizeUsd > r.capacityUsd) return fail(`exceeds provider capacity (${r.capacityUsd.toLocaleString()} USD-eq); a split may help`);
-  if (deadline && arrival > deadline) return fail(`arrives ${arrival.toISOString()} after deadline`);
+  if (deadline && arrival.getTime() + (it.deadlineBufferMinutes ?? 0) * 60_000 > deadline.getTime()) return fail(`arrives ${arrival.toISOString()}, cannot meet recipient deadline ${deadline.toISOString()}${it.deadlineBufferMinutes ? ` with ${it.deadlineBufferMinutes} min buffer` : ""}`);
   if (r.pegDeviation > STABILITY.maxPegDeviation) return fail(`${r.coins.join("/")} is ${r.pegDeviation} off peg (limit ${STABILITY.maxPegDeviation}): not stable enough`);
   return out;
 }
@@ -160,19 +165,23 @@ const pick = (xs: Priced[], cmp: (a: Priced, b: Priced) => number) => {
 };
 
 export function optimize(it: Intent) {
-  const now = it.nowUtc ? new Date(it.nowUtc) : new Date();
+  const now = new Date(it.nowUtc ?? planningNow());
   const deadline = it.deadlineUtc ? new Date(it.deadlineUtc) : undefined;
+  if (!Number.isFinite(now.getTime()) || (deadline && !Number.isFinite(deadline.getTime()))
+    || !Number.isFinite(it.deadlineBufferMinutes ?? 0) || (it.deadlineBufferMinutes ?? 0) < 0)
+    return { status: "MISSING_INPUT", missing: ["valid planning time, recipient deadline and non-negative buffer are required"] };
   const { routes, missing, unpriced } = enumerateRoutes(it);
   if (missing.length) return { status: "MISSING_INPUT", missing };
   const ofProvider = (id: string) => id.startsWith("coin:") ? "stablecoin" : "bank";
-  const usable = routes.filter((r) => (!it.liveOnly || r.kind === "bank" || r.x402Executable) && (!it.provider || ofProvider(r.routeId) === it.provider));
+  const usable = routes.filter((r) => (!it.liveOnly || r.kind === "bank" || r.x402Executable) && (!it.provider || ofProvider(r.routeId) === it.provider)
+    && (!it.allowedRouteIds || it.allowedRouteIds.includes(r.routeId)) && (process.env.LOCAL_ROUTING !== "1" || r.kind === "bank"));
   const priced = usable.map((r) => price(r, it, it.amount, now, deadline));
   const eligible = priced.filter((p) => p.eligible).sort((a, b) => (it.objective === "fastest"
     ? a.arrivalUtc.localeCompare(b.arrivalUtc) || Number(a.scoreMinor - b.scoreMinor) : Number(a.scoreMinor - b.scoreMinor)));
   const bestUnsplit = eligible[0];
 
   // ---- split search (A8): size-specific quotes per child, fixed fees counted per child, exposure caps
-  let bestSplit: { children: Priced[]; scoreMinor: bigint } | undefined;
+  let bestSplit: { children: Priced[]; scoreMinor: bigint; arrivalUtc: string } | undefined;
   if (it.allowSplit !== false) {
     const pool = priced.filter((p) => p.quote && (p.eligible || p.reason?.startsWith("exceeds provider capacity")))
       .sort((a, b) => Number(a.scoreMinor - b.scoreMinor)).slice(0, 6);
@@ -189,19 +198,26 @@ export function optimize(it: Intent) {
         kids.push(p);
       }
       const score = kids.reduce((s, k) => s + k.scoreMinor, 0n);
-      if (!bestSplit || better(score, bestSplit.scoreMinor)) bestSplit = { children: kids, scoreMinor: score };
+      const arrivalUtc = kids.map((k) => k.arrivalUtc).sort().at(-1)!;
+      if (!bestSplit || (it.objective === "fastest" ? arrivalUtc < bestSplit.arrivalUtc || (arrivalUtc === bestSplit.arrivalUtc && better(score, bestSplit.scoreMinor))
+        : better(score, bestSplit.scoreMinor))) bestSplit = { children: kids, scoreMinor: score, arrivalUtc };
     };
     const R = pool.map((p) => usable.find((r) => r.routeId === p.routeId)!);
     for (let i = 0; i < R.length; i++) for (let j = 0; j < R.length; j++) if (i !== j) for (const s of shares2) tryCombo([R[i], R[j]], s);
     for (let i = 0; i < R.length; i++) for (let j = i + 1; j < R.length; j++) for (let k = j + 1; k < R.length; k++) for (const s of shares3) tryCombo([R[i], R[j], R[k]], s);
   }
 
-  const useSplit = bestSplit && (!bestUnsplit || better(bestSplit.scoreMinor, bestUnsplit.scoreMinor));
+  const useSplit = bestSplit && (!bestUnsplit || (it.objective === "fastest" ? bestSplit.arrivalUtc < bestUnsplit.arrivalUtc
+    || (bestSplit.arrivalUtc === bestUnsplit.arrivalUtc && better(bestSplit.scoreMinor, bestUnsplit.scoreMinor)) : better(bestSplit.scoreMinor, bestUnsplit.scoreMinor)));
   const chosen: Priced[] | undefined = useSplit ? bestSplit!.children : bestUnsplit ? [bestUnsplit] : undefined;
   const baselineId = it.currentBank ? "bank:current_bank" : "bank:legacy_wire";
   const baseline = priced.find((p) => p.routeId === baselineId)
     ?? routes.filter((r) => r.routeId === baselineId).map((r) => price(r, it, it.amount, now, undefined))[0];   // baseline even if filtered by liveOnly
-  if (!chosen) return { status: "HOLD", reason: it.provider === "stablecoin" ? (unpriced.length ? unpriced.join("; ") : `our stablecoin rail has no published-price route to ${it.destCcy} yet`) : "no eligible route or allocation", unpriced, candidates: priced, baseline };
+  if (!chosen) return { status: "HOLD", reason: process.env.LOCAL_ROUTING === "1" && it.provider === "stablecoin" ? "stablecoin settlement disabled in LOCAL_ROUTING; use simulated bank routes"
+    : priced.length ? [...new Set(priced.map((p) => `${p.label}: ${p.reason}`))].join("; ")
+    : it.provider === "stablecoin" ? (unpriced.length ? unpriced.join("; ") : `our stablecoin rail has no published-price route to ${it.destCcy} yet`) : "no eligible route or allocation",
+    deadlineUtc: it.deadlineUtc, earliestArrivalUtc: priced.filter((p) => p.quote).map((p) => p.arrivalUtc).sort()[0] ?? null,
+    unpriced, candidates: priced, baseline };
 
   const sum = (k: "sourceDebit" | "recipientNet") => chosen.reduce((s, c) => s + BigInt(c.quote[k].minor), 0n);
   const debit = sum("sourceDebit"), net = sum("recipientNet");
@@ -226,6 +242,10 @@ export function optimize(it: Intent) {
   const bankBasis = it.srcCcy === it.destCcy ? { bps: 0, basis: "no FX (same currency): wire fee only" } : it.currentBank?.measured ? bankMarkup(it.srcCcy, it.destCcy, it.currentBank.fxMarkupBps) : it.currentBank ? { bps: it.currentBank.fxMarkupBps, basis: "company-entered rate" } : null;
   return {
     status: "OK", decisionRecordId: `dr_${Date.now().toString(36)}`, intent: it, unpriced,
+    timing: { plannedAtUtc: now.toISOString(), deadlineUtc: it.deadlineUtc ?? null, bufferMinutes: it.deadlineBufferMinutes ?? 0,
+      latestStartUtc: deadline ? chosen.map((c) => latestStart(usable.find((r) => r.routeId === c.routeId)!.arrival, now, deadline, it.deadlineBufferMinutes)).sort()[0] : null,
+      dispatch: "immediate_after_approval", arrivalUtc: latest, meetsDeadline: true },
+    simulation: process.env.LOCAL_ROUTING === "1",
     provenance: { midRates: `${MARKET.mode}: ${it.srcCcy} ${midInfo(it.srcCcy).source}, ${it.destCcy} ${midInfo(it.destCcy).source}`,
                   bankBaseline: bankBasis ? `${bankBasis.bps} bps: ${bankBasis.basis}` : "none", ourRouteCosts: "stablecoin rail: sourced fees (Circle Mint redemption terms, network fees); local-coin conversion only at an entered venue quote" },
     costVsMidBps: { plan: bps(debit, net), bank: baseline?.quote ? bps(BigInt(baseline.quote.sourceDebit.minor), BigInt(baseline.quote.recipientNet.minor)) : null },

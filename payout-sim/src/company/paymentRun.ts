@@ -16,7 +16,7 @@ export interface RunReceivable { id: string; ccy: string; amount: string; dateUt
 export interface PaymentRunInput { company: CompanyProfile; nowUtc: string; payables: RunPayable[]; receivables: RunReceivable[];
   receivablesScope?: "all" | "matched" }   // "matched": only receipts used to pay these bills count (for a filtered request)
 
-type Conv = { costHome: bigint; debitHome: bigint; route: string; arrivalUtc?: string; input?: any };
+type Conv = { costHome: bigint; debitHome: bigint; route: string; arrivalUtc?: string; input?: any; timing?: any; blocked?: boolean; why?: string };
 
 export function runPaymentRun(r: PaymentRunInput) {
   const co = r.company, H = co.homeCcy, now = r.nowUtc;
@@ -39,15 +39,15 @@ export function runPaymentRun(r: PaymentRunInput) {
     const atMid = midHome(amountMinor, ccy);
     if (viaBank) { const d = BigInt(o.baseline.sourceDebitMinor); return { costHome: d - atMid, debitHome: d, route: o.baseline.routeId }; }
     if (o.status !== "OK") {
-      // nothing meets the due date: it still has to be paid, through the company's bank (late). No saving is claimed.
+      // Retain the bank cost only for baseline accounting, never present a late fallback as a sendable plan.
       const bm = o.baseline?.sourceDebitMinor ?? o.baseline?.quote?.sourceDebit?.minor;   // HOLD returns the raw priced baseline
       if (bm) { const d = BigInt(bm);
-        return { costHome: d - atMid, debitHome: d, route: `${o.baseline.routeId} (arrives ${String(o.baseline.arrivalUtc).slice(0, 10)}, after the due date)` }; }
-      return { costHome: 0n, debitHome: 0n, route: `HOLD: ${o.reason ?? o.missing}` };
+        return { costHome: d - atMid, debitHome: d, route: "HOLD", blocked: true, why: o.reason ?? String(o.missing) }; }
+      return { costHome: 0n, debitHome: 0n, route: "HOLD", blocked: true, why: o.reason ?? String(o.missing) };
     }
     const d = toMinor(o.totals.sourceDebit.split(" ")[0], H);
     return { costHome: d - atMid, debitHome: d, route: o.allocations.map((a: any) => a.routeId).join("+"), arrivalUtc: o.totals.arrivalUtc,
-             input: o.allocations.map((a: any) => a.quote.input) };
+             input: o.allocations.map((a: any) => a.quote.input), timing: o.timing };
   };
   // cost of selling leftover foreign receivables back to home currency
   const sell = (ccy: string, amountMinor: bigint, viaBank: boolean): bigint => {
@@ -77,7 +77,9 @@ export function runPaymentRun(r: PaymentRunInput) {
       if (annual > co.costOfCashPct) {
         const amt = toMinor(p.amount, p.ccy), disc = (amt * BigInt(Math.round(p.discountPct * 100))) / 10000n;
         const cash = (amt * BigInt(Math.round(co.costOfCashPct * 100)) * BigInt(Math.round(daysEarly))) / (10000n * 365n);
-        discountGain += midHome(disc - cash, p.ccy); payOn = p.discountByUtc; note = `early-pay discount ${p.discountPct}% (${annual.toFixed(0)}%/yr)`;
+        const route = buy(p.ccy, amt, p.discountByUtc, false, p.beneficiary);
+        if (!route.blocked) { discountGain += midHome(disc - cash, p.ccy); payOn = p.discountByUtc; note = `early-pay discount ${p.discountPct}% (${annual.toFixed(0)}%/yr)`; }
+        else note = "early-payment deadline unavailable: use original invoice deadline; no discount saving claimed";
       } else note = `discount ${annual.toFixed(1)}%/yr < cost of cash: pay on due date`;
     }
     if (v.status === "REVIEW") note = [note, `REVIEW: ${v.warnings.join("; ")}`].filter(Boolean).join(" | ");
@@ -96,7 +98,7 @@ export function runPaymentRun(r: PaymentRunInput) {
     // C first: wallet in ccy, receivables that arrived before each payment fund it; buy the shortfall via our route
     let wallet = 0n, ri = 0, matchedRec = 0n;
     for (const p of pays) {
-      while (ri < recs.length && recs[ri].dateUtc <= p.payOnUtc) { if (recs[ri].status === "confirmed") wallet += toMinor(recs[ri].amount, ccy); ri++; }
+      while (ri < recs.length && recs[ri].dateUtc <= now) { if (recs[ri].status === "confirmed") wallet += toMinor(recs[ri].amount, ccy); ri++; }
       const need = toMinor(p.amount, ccy), use = ccy === H ? 0n : (wallet >= need ? need : wallet); wallet -= use; matchedRec += use;
       const c = buy(ccy, need - use, p.payOnUtc, false, p.beneficiary); C += c.costHome; if (ccy !== H) volC += midHome(need - use, ccy);
       if (c.route.startsWith("coin:")) {
@@ -110,6 +112,9 @@ export function runPaymentRun(r: PaymentRunInput) {
       lines.push({ payable: p.id, ccy, crossBorder, reference: p.id, beneficiary: p.beneficiary, convertedAmount: fmt(need - use, ccy).split(" ")[0], deadlineUtc: p.payOnUtc,
                    payOnUtc: p.payOnUtc.slice(0, 10), amount: `${p.amount} ${ccy}`, fromWallet: fmt(use, ccy), converted: fmt(need - use, ccy),
                    route: need - use > 0n ? c.route : "wallet only", arrivesUtc: c.arrivalUtc, note: (p as any)._note || undefined, plan: c.input });
+      const line = lines[lines.length - 1];
+      line.timing = c.timing; line.planningStatus = c.blocked ? "HOLD" : "READY";
+      if (c.blocked) { line.status = "HOLD"; line.why = c.why; }
     }
     for (; ri < recs.length; ri++) if (recs[ri].status === "confirmed") wallet += toMinor(recs[ri].amount, ccy);
     const scopeAll = (r.receivablesScope ?? "all") === "all";
@@ -142,6 +147,7 @@ export function runPaymentRun(r: PaymentRunInput) {
     expectedOnly: r.receivables.filter((x) => x.status === "expected").map((x) => `${x.id} ${x.amount} ${x.ccy} (expected, not relied on)`),
     fxVolume: { withYourBank: f(volA), withUs: f(volC) },
     costVsMid: { withYourBank: f(A), routingOnly: f(B), routingPlusWallets: f(C) },
+    savingsStatus: "projected_before_agent_review", heldPayments: lines.filter((l) => l.planningStatus === "HOLD").length,
     savings: { routing: f(routing), naturalHedge: f(hedge), earlyPayDiscounts: f(discountGain), failedPaymentsAvoided: f(validationAvoided), total: f(total) },
     savingsGroups: {
       routing: { label: "routing savings (our stablecoin rail vs your bank: FX markup + wire fees)", total: f(routing) },

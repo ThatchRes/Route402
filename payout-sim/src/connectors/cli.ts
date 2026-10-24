@@ -16,10 +16,11 @@ import { printRun, executeRun } from "../company/runner.js";
 import { DEMO_COMPANY } from "../company/profile.js";
 import { saveLinked } from "../assistant/linked.js";
 import { reviewWithAgents, paymentsOf, printAgents, policyFlag } from "../assistant/agents.js";
+import { planningNow } from "../router/timing.js";
 
 const [src, cmd, arg] = process.argv.slice(2);
 const flag = (n: string) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : undefined; };
-const NOW = process.env.DEMO_NOW_UTC ?? "2026-10-26T14:00:00Z";
+const NOW = planningNow();
 
 if (src === "nessie" && cmd === "seed") {
   const r = await seedDemo(process.argv.includes("--fresh"));
@@ -45,7 +46,7 @@ if (src === "nessie" && cmd === "seed") {
   if (process.argv.includes("--execute")) {
     const opAcct = meta[`customer:${customerId}`]?.operatingAccountId;
     await executeRun(r, imp.input.company, process.argv.includes("--writeback") && opAcct ? async (l, st) => {
-      await writeBack(opAcct, st.terms.totals.sourceDebit.split(" ")[0], st.transferId);
+      await writeBack(opAcct, (st.executionPlan ?? st.terms).totals.sourceDebit.split(" ")[0], st.transferId);
       console.log(`      recorded USD debit in Nessie account ${opAcct}`);
     } : undefined, decisions);
   }

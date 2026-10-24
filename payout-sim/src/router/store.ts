@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
 const FILE = "data/router.json";
 export interface RDb { intents: Record<string, any>; transfers: Record<string, any>; jobs: Record<string, any>;
-  observations: any[]; idem: Record<string, string>; reservedUsdMinor: string }
+  observations: any[]; idem: Record<string, string>; reservedUsdMinor: string; spentUsdMinor?: string }
 export function load(): RDb {
   if (!existsSync(FILE)) return { intents: {}, transfers: {}, jobs: {}, observations: [], idem: {}, reservedUsdMinor: "0" };
   return JSON.parse(readFileSync(FILE, "utf8"));

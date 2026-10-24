@@ -24,6 +24,14 @@ export const BANKS: BankProvider[] = [
     businessDays: 2, cutoffUtcHour: 21, capacityUsd: Infinity, dest: "*", isBaseline: true },
 ];
 
+// Optional local fixture: exercises an expedited payout without inventing a live provider or charging x402.
+// It is never enabled by default, and never represents a real bank connection.
+export function localBankRoutes(): BankProvider[] {
+  return process.env.LOCAL_ROUTING === "1" ? [{ id: "local_express", label: "Local express payout (synthetic simulation)",
+    fixedUsd: 15, tiers: [{ upToUsd: Infinity, bps: 80 }], businessDays: 0, cutoffUtcHour: 24,
+    capacityUsd: 1_000_000, dest: "*" }] : [];
+}
+
 // STABLECOIN CATALOG: fiat-reserved coins only (no algorithmic or synthetic-dollar designs). Issuer, peg,
 // networks, decimals and liquidity are DEMO ASSUMPTIONS: verify each contract, issuer status and venue before enabling.
 // A coin is used only when it is cheaper or faster AND passes the stability gate.

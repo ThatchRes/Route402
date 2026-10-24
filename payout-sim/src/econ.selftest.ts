@@ -8,7 +8,8 @@ eq(c.pricedUsd, 45); eq(c.sendingEarlyUsd, 100_000 * 0.06 * 2 / 365);
 const h: [string, number][] = []; let r = 1;
 for (let i = 0; i < 61; i++) { h.push([`d${i}`, r]); r *= Math.exp(i % 2 ? -0.01 : 0.01); }
 const v = dailyVol(h)!; if (Math.abs(v - 0.01) > 0.0005) throw new Error(`vol ${v}`);
-const [x] = fxRisk([{ ccy: "EUR", amountUsd: 1_000_000, dueUtc: new Date(Date.now() + 7 * 864e5).toISOString() }], { EUR: h }, Date.now(), 25_000);
+const testNow = Date.now();
+const [x] = fxRisk([{ ccy: "EUR", amountUsd: 1_000_000, dueUtc: new Date(testNow + 7 * 864e5).toISOString() }], { EUR: h }, testNow, 25_000);
 eq(x.riskUsd!, 1_000_000 * 1.645 * v * Math.sqrt(5), 1e-6);
 if (dailyVol(h.slice(0, 10)) !== null) throw new Error("short history should be null");
 console.log(`economics self-test passed (EUR 1M, 7 days, 1% daily vol -> 95% move ${(x.movePct!).toFixed(2)}%, ${Math.round(x.riskUsd!).toLocaleString()} USD)`);

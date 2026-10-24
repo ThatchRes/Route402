@@ -45,7 +45,7 @@ def guarded(handler):
 
 @routing.on_interval(period=10.0)
 async def write_metrics(ctx: Context):
-    with open(os.path.join(os.path.dirname(__file__), "metrics.json"), "w") as f:
+    with open(os.getenv("AGENT_METRICS_FILE", os.path.join(os.path.dirname(__file__), "metrics.json")), "w") as f:
         json.dump(USAGE.snapshot(), f)
 
 
@@ -243,7 +243,7 @@ async def on_procure(ctx: Context, sender: str, msg: ProcureRequest):
         # invoice payments fix what the supplier receives; a budget payment (amountType SOURCE_FIXED) fixes what the company sends
         amount_type = p.get("amountType") if p.get("amountType") in ("RECIPIENT_FIXED", "SOURCE_FIXED") else "RECIPIENT_FIXED"
         return {"srcCcy": msg.srcCcy, "destCcy": p["destCcy"], "amountType": amount_type, "amount": p["amount"],
-                "deadlineUtc": p.get("deadlineUtc"), "objective": "cheapest", "currentBank": msg.currentBank,
+                "deadlineUtc": p.get("deadlineUtc"), "objective": "fastest" if policy == "fastest" else "cheapest", "currentBank": msg.currentBank,
                 "beneficiary": ben, "beneficiaryAcceptsUsdc": bool(ben.get("usdcWallet")), "reference": p.get("reference") or p["payable"]}
     jobs = [(i, pid) for i in range(len(pays)) for pid in PROVIDER_IDS]
     quotes_task = asyncio.ensure_future(asyncio.gather(*(backend.paid_call(f"quote:{pid}", body(pays[i]), corr, "routing-agent") for i, pid in jobs)))
@@ -270,7 +270,7 @@ async def on_procure(ctx: Context, sender: str, msg: ProcureRequest):
         scr = screens.get(p["payable"])
         if scr and scr.get("payment"):
             paid.append(scr["payment"])
-        d = reasoning.choose_route(quotes, scr, policy)
+        d = reasoning.choose_route(quotes, scr, policy, deadline_utc=p.get("deadlineUtc"))
         log(ctx, corr, f"{p['payable']}: {d['decision']} -> {d['chosen'] or '-'} ({d['reasons'][0]})")
         results.append({"payable": p["payable"], **d, "screen": scr, "paidCalls": paid})
     hops.append({"from": "routing", "to": "concierge", "message": "ProcureResult",

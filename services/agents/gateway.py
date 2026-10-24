@@ -165,7 +165,7 @@ async def metrics(ctx: Context) -> Metrics:
     """Gateway counters merged with the workers' snapshot (workers write metrics.json every 10s)."""
     snap = USAGE.snapshot()
     try:
-        with open(os.path.join(os.path.dirname(__file__), "metrics.json")) as f:
+        with open(os.getenv("AGENT_METRICS_FILE", os.path.join(os.path.dirname(__file__), "metrics.json"))) as f:
             w = json.load(f)
         snap["toolCalls"] = w.get("toolCalls", {})
         snap["avgToolLatencyMs"] = w.get("avgToolLatencyMs", 0.0)

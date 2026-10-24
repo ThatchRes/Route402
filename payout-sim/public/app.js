@@ -1,5 +1,5 @@
-// Route402 workspace, structured as the Figma FinalUI: Overview, Payments (create -> compare -> review -> submitted ->
-// tracking), Suppliers (+ details), Activity. Talks only to the router's local /ui/* API.
+// Chat is the front door. Payment records, supplier details and approval controls remain available alongside it.
+// Talks only to the router's local /ui/* API.
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -63,12 +63,18 @@ async function loadAll() {
 let POLL = null;
 async function route() {
   clearTimeout(POLL);
-  const [, page = "overview", a, b] = (location.hash || "#/overview").split(/[/?]/);
+  const [, page = "chat", a, b] = (location.hash || "#/chat").split(/[/?]/);
   const q = new URLSearchParams(location.hash.split("?")[1] ?? "");
-  $$("#nav a").forEach((x) => x.classList.toggle("active", x.dataset.nav === page));
+  $$("#nav a").forEach((x) => x.classList.toggle("active", x.dataset.nav === (page === "overview" ? "chat" : page)));
+  document.body.classList.toggle("chat-mode", page === "chat" || page === "overview");
+  if (page === "chat" || page === "overview") {
+    pageChat($("#page"));
+    loadAll().then(updateChatContext).catch(() => updateChatContext(false));
+    return;
+  }
   try { await loadAll(); } catch (e) { $("#page").innerHTML = `<div class="alert bad">Router not reachable: ${esc(e.message)}</div>`; return; }
   const P = $("#page");
-  if (page === "payments" && a === "new") return pageCreate(P, q);
+  if (page === "payments" && a === "new") { location.hash = "#/chat"; return; }
   if (page === "payments" && a === "compare") return pageCompare(P);
   if (page === "payments" && a === "review") return pageReview(P);
   if (page === "payments" && a === "submitted") return pageSubmitted(P, b);
@@ -420,7 +426,7 @@ function pageTracking(P, id) {
   const block = ME ? Object.entries(A).find(([k, v]) => !v.allowed && ["approve", "callback", "confirmDelivery"].includes(k) && !/not awaiting|no call-back|not waiting/.test(v.why ?? ""))?.[1]?.why : "Sign in to act on this payment.";
   P.innerHTML = `${head("Payment tracking", `${r.payable} · ${r.supplier}`)}
   <div class="duo wide-left"><div class="panel2"><div class="ctrl" style="margin:0 0 10px"><div>${pill(statusKind(s), statusText(s))} <span class="small muted">${esc(nextStep(r))}</span></div><span class="small muted mono">${esc(r.id)}</span></div>
-      ${state(r)}<div class="tl">${evs.join("")}</div>
+      ${state(r)}${r.timing?.deadlineUtc ? `<p class="note">Recipient deadline: <b>${esc(when(r.timing.deadlineUtc))}</b> · Start by ${esc(when(r.timing.latestStartUtc))} · Arrival evidence: ${esc(r.deadlineStatus ?? "Awaiting dispatch")}</p>` : ""}<div class="tl">${evs.join("")}</div>
       <div class="actions">${btn("callback", "Record call-back")}${btn("approve", "Approve")}${btn("confirmDelivery", "Confirm delivery")}${btn("recheck", "Re-check and release")}${btn("refund", "Refund escrow", "")}${btn("reject", "Reject", "danger")}
         ${block && !["COMPLETED", "EXECUTING", "READY", "REJECTED", "REFUNDED", "FAILED"].includes(s) ? `<span class="why2">${esc(block)}</span>` : ""}</div><div id="act-form"></div></div>
     <div class="panel2"><span class="label accent">Payment details</span><h2 style="margin:6px 0">${usd(r.debitUsd, 2)}</h2><div class="small muted">${money(`${r.amount} ${r.ccy}`)} to ${esc(r.supplier)} · ${esc(RAIL[r.provider] ?? r.provider)}</div>

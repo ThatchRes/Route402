@@ -3,10 +3,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { PaymentRunInput } from "../company/paymentRun.js";
 import { DEMO_RUN } from "../company/demo.js";
+import { planningNow } from "../router/timing.js";
 const FILE = "data/linked.json";
 export interface Linked { source: string; linkedAt: string; usdAvailable?: string; input: PaymentRunInput }
 export function saveLinked(l: Linked) { mkdirSync("data", { recursive: true }); writeFileSync(FILE, JSON.stringify(l, null, 2)); }
 export function loadLinked(): Linked {
-  if (existsSync(FILE)) return JSON.parse(readFileSync(FILE, "utf8"));
-  return { source: "demo company (nothing linked yet)", linkedAt: "", input: DEMO_RUN };
+  const linked: Linked = existsSync(FILE) ? JSON.parse(readFileSync(FILE, "utf8"))
+    : { source: "demo company (nothing linked yet)", linkedAt: "", input: DEMO_RUN };
+  return { ...linked, input: { ...linked.input, nowUtc: planningNow() } };
 }

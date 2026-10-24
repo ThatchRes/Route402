@@ -74,10 +74,10 @@ export const TEMPLATES: Template[] = [
       const v = validate(ben); if (v.status === "BLOCK") return { blocked: v.errors, beneficiary: ben.name };
       const amount = fmt(toMinor(amt.toFixed(dest === "JPY" || dest === "KRW" ? 0 : 2), dest), dest).split(" ")[0];
       const q: any = optimize({ srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED", amount, deadlineUtc: w?.to, objective: "balanced",
-        nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank });
+        nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank, beneficiary: ben, beneficiaryAcceptsUsdc: !!ben.usdcWallet });
       return { title: `Send ${amount} ${dest} to ${ben.name}${w ? ` ${w.label}` : ""}`, beneficiaryCheck: v.status, beneficiary: ben, preview: q.status === "OK" ? {
         route: q.allocations.map((a: any) => a.routeId).join(" + "), youPay: q.totals.sourceDebit, theyGet: q.totals.recipientNet, arrives: q.totals.arrivalUtc,
-        yourBankWould: q.baseline?.sourceDebit, youSave: q.value.customerNetSaving } : q, intent: { srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED", amount, deadlineUtc: w?.to },
+        yourBankWould: q.baseline?.sourceDebit, youSave: q.value.customerNetSaving, timing: q.timing } : q, intent: { srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED", amount, deadlineUtc: w?.to },
         nextStep: "approve to execute (creates a plan with a termsHash; executes only after approval)" };
     } },
   { id: "convert", example: "convert 200k USD to EUR", match: /\b(convert|exchange|swap|change)\b.*\bto\b/i,

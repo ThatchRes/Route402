@@ -9,10 +9,11 @@ import { runPaymentRun } from "./paymentRun.js";
 import "dotenv/config";
 import { printRun, executeRun } from "./runner.js";
 import { DEMO_NETTING, DEMO_SWEEPS } from "../treasury/demo.js";
+import { planningNow } from "../router/timing.js";
 const cmd = process.argv[2];
 const hedge = () => runHedge(DEMO_HEDGE), disc = () => runDiscounts(DEMO_DISCOUNTS);
 if (cmd === "run" || cmd === "report") {
-  const r = runPaymentRun(DEMO_RUN);
+  const r = runPaymentRun({ ...DEMO_RUN, nowUtc: planningNow() });
   printRun(r);
   if (process.argv.includes("--execute")) await executeRun(r, DEMO_RUN.company);
 } else if (cmd === "hedge") {

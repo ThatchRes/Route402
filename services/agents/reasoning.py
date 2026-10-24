@@ -262,7 +262,7 @@ def _pct(bps):
     return f"{bps / 100:.2f}%"
 
 
-def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = POLICY):
+def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = POLICY, deadline_utc=None):
     """Pick ONE provider's paid quote under the company's policy. Deterministic; never invents a route, rate or amount.
     quotes: {provider_id: quote dict or {"status": "NO_QUOTE", ...}}. Returns a dict with decision, chosen, intentId, reasons, options."""
     policy = policy if policy in POLICIES else "cheapest"
@@ -287,14 +287,23 @@ def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = 
         cost, bank = c.get("plan"), c.get("bank")
         bank_bps = bank if bank is not None else bank_bps
         bank_basis = (q.get("provenance") or {}).get("bankBaseline", bank_basis)
-        o = {"provider": pid, "label": q.get("providerLabel", pid), "costBps": cost, "arrivalUtc": q["plan"].get("arrivalUtc", ""),
+        o = {"provider": pid, "label": q.get("providerLabel", pid), "costBps": cost, "arrivalUtc": q["plan"].get("arrivalUtc", ""), "timing": q.get("timing"),
              "risk": (q.get("risk") or {}).get("score", 3), "riskWhy": (q.get("risk") or {}).get("why", ""), "intentId": q.get("intentId"),
              "routeIds": [a["routeId"] for a in q["plan"].get("allocations", [])],
              "live": any(a.get("x402Executable") for a in q["plan"].get("allocations", [])), "eligible": True}
-        if cost is None or cost > limits["maxCostBps"]:
+        deadline = deadline_utc or (q.get("timing") or {}).get("deadlineUtc")
+        try:
+            arrival = datetime.fromisoformat(o["arrivalUtc"].replace("Z", "+00:00"))
+            late = bool(deadline and arrival + timedelta(minutes=(q.get("timing") or {}).get("bufferMinutes", 0)) > datetime.fromisoformat(deadline.replace("Z", "+00:00")))
+        except (ValueError, TypeError):
+            late = True
+        if late:
+            o.update(eligible=False, why=f"cannot meet recipient deadline {deadline}: arrives {o['arrivalUtc'] or 'unknown'}")
+        elif cost is None:
+            o.update(eligible=False, why="quote has no verified cost")
+        elif cost > limits["maxCostBps"]:
             o.update(eligible=False, why=f"cost {_pct(cost or 0)} above policy limit {_pct(limits['maxCostBps'])}")
-        elif bank is not None and cost > bank:
-            o.update(eligible=False, why="costs more than your bank")
+            o["requiresCostApproval"] = True
         options.append(o)
 
     ok = [o for o in options if o["eligible"]]
@@ -302,9 +311,14 @@ def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = 
            "fastest": lambda o: (o["arrivalUtc"], o["costBps"]),
            "lowest_risk": lambda o: (o["risk"], o["costBps"])}[policy]
     ok.sort(key=key)
-    if not ok:
+    # Deadline is hard. An available but over-budget route needs explicit human cost approval, never auto-execution.
+    review_options = sorted([o for o in options if o.get("requiresCostApproval")], key=key)
+    chosen = ok[0] if ok else review_options[0] if review_options else None
+    cost_review = bool(chosen and chosen.get("requiresCostApproval"))
+    if cost_review:
+        hold.append("explicit cost approval required: " + chosen["why"])
+    if chosen is None:
         hold.append("no provider quote meets the policy")
-    chosen = ok[0] if ok else None
     if chosen:
         reasons.insert(0, f"policy '{policy}': chose {chosen['label']}: {_pct(chosen['costBps'])} above mid, arrives "
                           f"{chosen['arrivalUtc'][:16]}Z, risk {chosen['risk']}/5 ({chosen['riskWhy']})")
@@ -312,14 +326,15 @@ def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = 
             reasons.append(f"your bank would cost {_pct(bank_bps)} ({bank_basis})")
         reasons.append("USDC-on-Base legs carry an x402 settlement proof" if chosen["live"] else "payout rail is simulated")
     reasons.append("compared: " + " | ".join(
-        f"{o['label']} {_pct(o['costBps'])}, {o['arrivalUtc'][:10]}, risk {o['risk']}" if o.get("costBps") is not None else f"{o['label']}: {o.get('why')}"
+        f"{o['label']} {_pct(o['costBps'])}, {o['arrivalUtc'][:10]}, risk {o['risk']}{': ' + o['why'] if o.get('why') else ''}" if o.get("costBps") is not None else f"{o['label']}: {o.get('why')}"
         for o in options))
     # A screen REVIEW (e.g. bank details changed since the last payment) with a valid route is not a dead end: it becomes
     # "review", carrying the quoted plan, and the company's controls require a call-back verification before anyone can
     # approve it. Only "approve" is ever sent automatically by the CLI; "review" never is.
-    review_only = chosen is not None and s == "REVIEW" and len(hold) == 1
+    review_only = chosen is not None and s in ("PASS", "REVIEW") and bool(cost_review or s == "REVIEW")
     decision = "review" if review_only else ("hold" if hold else "approve")
     return {"decision": decision, "policy": policy, "chosen": chosen["provider"] if chosen else None,
             "intentId": chosen["intentId"] if (chosen and decision in ("approve", "review")) else None,
-            "needs": ["call-back verification on a number already on file"] if review_only else [],
+            "needs": (["call-back verification on a number already on file"] if s == "REVIEW" else []) + (["explicit approval of the quoted cost above policy"] if cost_review else []),
+            "detailsChanged": s == "REVIEW", "timing": chosen.get("timing") if chosen else None,
             "routeIds": chosen["routeIds"] if chosen else [], "reasons": hold + reasons, "options": options}
