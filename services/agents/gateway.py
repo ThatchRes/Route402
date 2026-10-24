@@ -10,6 +10,7 @@ import asyncio
 asyncio.set_event_loop(asyncio.new_event_loop())   # Python 3.14: uAgents needs a loop to exist
 
 import json
+import hashlib
 import time
 from decimal import Decimal
 from uagents import Agent, Context
@@ -90,8 +91,8 @@ def payments_from_preview(r: dict) -> list:
                 and l.get("crossBorder", l.get("ccy") != home)]
     if r.get("template") == "send_to" and r.get("intent") and r.get("beneficiary"):
         it = r["intent"]
-        return [{"payable": f"send:{r['beneficiary'].get('name', 'beneficiary')}", "destCcy": it["destCcy"], "amount": it["amount"],
-                 "deadlineUtc": it.get("deadlineUtc"), "beneficiary": r["beneficiary"]}]
+        return [{"payable": r.get("paymentRef") or f"send:{r['beneficiary'].get('name', 'beneficiary')}", "destCcy": it["destCcy"], "amount": it["amount"],
+                 "deadlineUtc": it.get("deadlineUtc"), "beneficiary": r["beneficiary"], "reference": r.get("paymentRef")}]
     return []
 
 
@@ -112,25 +113,34 @@ def spent(paid):
     return str(sum((Decimal(str(c.get("priceUsdc", "0"))) for c in paid if not c.get("mock")), Decimal("0")))
 
 
-async def concierge_ask(ctx, tenant, corr, text, policy=None) -> AskResult:
+async def concierge_ask(ctx, tenant, corr, text, policy=None, conversation_id=None, conversation_revision=None) -> AskResult:
     policy = reasoning.policy_from_text(text, policy)
     try:
-        r = await backend.assistant_ask(tenant, corr, text)
+        r = await backend.assistant_ask(tenant, corr, text, conversation_id, conversation_revision)
     except Exception as e:  # noqa: BLE001
         return AskResult(correlationId=corr, status="error", error=f"calculator (router) unavailable: {e}")
     if r.get("clarification"):
-        return AskResult(correlationId=corr, status="clarification", template=r.get("template"), clarification=r["clarification"])
+        return AskResult(correlationId=corr, status="clarification", template=r.get("template"), clarification=r["clarification"], preview=r,
+                         conversationId=r.get("conversationId"), conversationRevision=r.get("conversationRevision"))
     if r.get("blocked"):
         return AskResult(correlationId=corr, status="blocked", template=r.get("template"), title=r.get("beneficiary"),
-                         clarification="; ".join(r["blocked"]))
+                         clarification="; ".join(r["blocked"]), preview=r,
+                         conversationId=r.get("conversationId"), conversationRevision=r.get("conversationRevision"))
     company = r.get("company") or {}
     home = (r.get("preview") or {}).get("homeCcy") or company.get("homeCcy", "USD")
     bank = company.get("currentBank") or {}
+    policy = r.get("policy") or policy
     decisions, paid, hops = await run_review(ctx, tenant, corr, home, bank, payments_from_preview(r), policy)
+    if r.get("conversationId") and decisions:
+        try:
+            await backend.record_assistant_review(tenant, corr, r["conversationId"], r["conversationRevision"], decisions)
+        except Exception as e:
+            ctx.logger.warning(f"Could not store conversation review: {type(e).__name__}")
     hops = [{"from": "user", "to": "concierge", "message": "ask"}, {"from": "concierge", "to": "router", "message": "calculator preview"}] + hops
     return AskResult(correlationId=corr, status="ok", template=r.get("template"), title=r.get("title"), preview=r,
                      decisions=decisions, paidCalls=paid, spentUsdc=spent(paid), hops=hops, policy=policy,
-                     next="execution needs approval in the app (npm run ask -- \"...\" --execute); only approved payments are sent")
+                     next="execution needs approval in the app (npm run ask -- \"...\" --execute); only approved payments are sent",
+                     conversationId=r.get("conversationId"), conversationRevision=r.get("conversationRevision"))
 
 
 @gateway.on_rest_post("/ask", AskBody, AskResult)
@@ -138,7 +148,7 @@ async def ask(ctx: Context, req: AskBody) -> AskResult:
     err = check(req, "ask")
     if err:
         return AskResult(correlationId=req.correlationId, status="error", error=err)
-    return await concierge_ask(ctx, req.tenantId, req.correlationId, req.text[:500], req.policy)
+    return await concierge_ask(ctx, req.tenantId, req.correlationId, req.text[:500], req.policy, req.conversationId, req.conversationRevision)
 
 
 @gateway.on_rest_post("/review", ReviewBody, AskResult)
@@ -342,7 +352,8 @@ if CHAT:
             answer = "Rate limit: each plan buys paid quotes. Try again in a minute."
         else:
             ctx.logger.info(redact(f"[{corr}] chat from {sender[:16]}...: {text[:120]}"))
-            answer = format_answer(await concierge_ask(ctx, CHAT_TENANT, corr, text[:500]))
+            conversation_id = "fetch_" + hashlib.sha256(sender.encode()).hexdigest()[:32]
+            answer = format_answer(await concierge_ask(ctx, CHAT_TENANT, corr, text[:500], conversation_id=conversation_id))
         await ctx.send(sender, ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(),
                                            content=[TextContent(type="text", text=answer),   # parts redacted above; tx links kept
                                                     EndSessionContent(type="end-session")]))

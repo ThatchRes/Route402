@@ -31,9 +31,12 @@ import { TOKENS } from "./registry.js";
 import { usdcRouteAllowed } from "./depeg.js";
 import { planningNow } from "./timing.js";
 import { executionPolicy, planForDispatch } from "./dispatch.js";
+import { askConversation, conversationView, recordConversationReview, ConversationConflict } from "../assistant/conversation.js";
+import { validateChatRequest } from "../assistant/safety.js";
 
 export const app = express();
-app.use(express.json());
+app.disable("x-powered-by");
+app.use(express.json({ limit: "100kb", strict: true }));
 const TOKEN = () => process.env.ROUTER_TOKEN ?? "dev-token";
 const PAYOUT = process.env.PAYOUT_URL ?? "http://localhost:8403";
 const PAYOUT_H = () => ({ authorization: `Bearer ${process.env.PAYOUT_INTERNAL_TOKEN ?? "dev-token"}`, "content-type": "application/json" });
@@ -417,7 +420,12 @@ app.post("/v1/company/import", async (req, res) => {
   } catch (e: any) { err(res, 422, "IMPORT_FAILED", e.message); }
 });
 // Everyday prompts -> ready-made plan from the linked data (preview only; execution needs approval)
-app.post("/v1/assistant/ask", (req, res) => safe(res, () => { const l = loadLinked(); return { ...ask(String(req.body?.text ?? ""), l), company: l.input.company }; }));
+app.post("/v1/assistant/ask", (req, res) => {
+  try { validateChatRequest(req.body); res.json(askConversation(req.header("x-tenant-id") ?? "demo-tenant", req.body.text, req.body.conversationId ?? undefined, req.body.conversationRevision)); }
+  catch (e: any) { err(res, e instanceof ConversationConflict ? 409 : 422, "CONVERSATION_ERROR", e.message); }
+});
+app.get("/v1/assistant/conversations/:id", (req, res) => safe(res, () => conversationView(req.header("x-tenant-id") ?? "demo-tenant", String(req.params.id))));
+app.post("/v1/assistant/conversations/:id/review", (req, res) => safe(res, () => ({ recorded: recordConversationReview(req.header("x-tenant-id") ?? "demo-tenant", String(req.params.id), req.body?.conversationRevision, (req.body?.decisions ?? []).slice(0, 25)) })));
 app.post("/v1/company/hedge", (req, res) => safe(res, () => runHedge(req.body?.payables ? req.body : DEMO_HEDGE)));
 app.post("/v1/company/discounts", (req, res) => safe(res, () => runDiscounts(req.body?.payables ? req.body : DEMO_DISCOUNTS)));
 app.post("/v1/company/beneficiaries/validate", (req, res) => safe(res, () => (Array.isArray(req.body) && req.body.length ? req.body : DEMO_BENEFICIARIES).map(validateBeneficiary)));

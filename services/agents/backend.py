@@ -275,6 +275,12 @@ def _mock_paid(service, body):
 
 
 # ------------------------------------------------------------------ the calculator (router), for the concierge
-async def assistant_ask(tenant, corr, text: str):
+async def assistant_ask(tenant, corr, text: str, conversation_id=None, conversation_revision=None):
     """Router's deterministic prompt templates + payment-run calculator over the company's linked data (preview only)."""
-    return await _call("assistant_ask", "POST", "/v1/assistant/ask", tenant, corr, {"text": text[:500]})
+    return await _call("assistant_ask", "POST", "/v1/assistant/ask", tenant, corr,
+                       {"text": text[:500], "conversationId": conversation_id, "conversationRevision": conversation_revision})
+
+
+async def record_assistant_review(tenant, corr, conversation_id, revision, decisions):
+    return await _call("assistant_review", "POST", f"/v1/assistant/conversations/{safe_id(conversation_id, 'conversationId')}/review",
+                       tenant, corr, {"conversationRevision": revision, "decisions": decisions})

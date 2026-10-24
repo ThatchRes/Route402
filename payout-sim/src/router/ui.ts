@@ -24,6 +24,11 @@ import { allInCost, fxRisk, sendBy, transitDays } from "../company/economics.js"
 import { midInfo, rateHistory } from "./market.js";
 import { planningNow } from "./timing.js";
 import { executionPolicy, planForDispatch } from "./dispatch.js";
+import { confirmSupplier, conversationView, ConversationConflict } from "../assistant/conversation.js";
+import { supplierDirectory } from "../company/suppliers.js";
+import { publicData, validateChatRequest } from "../assistant/safety.js";
+import { recordUiReview, trustedUiDecision } from "../assistant/reviews.js";
+import { browserSecurity, browserRateLimit } from "./browserSecurity.js";
 
 const NOW = planningNow;
 const PAID = "data/executed.json";
@@ -49,10 +54,13 @@ export function mountUi(app: express.Express, port: number) {
   const local = (req: express.Request, res: express.Response, next: express.NextFunction) =>
     ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "") ? next() : res.status(403).json({ error: "local only" });
 
-  app.use("/app", local, express.static(fileURLToPath(new URL("../../public/", import.meta.url))));
-  app.get("/", local, (_req, res) => res.redirect("/app/"));
+  app.use("/app", browserSecurity, express.static(fileURLToPath(new URL("../../public/", import.meta.url))));
+  app.get("/", browserSecurity, (_req, res) => res.redirect("/app/"));
   const ui = express.Router();
-  ui.use(local);
+  ui.use(browserSecurity);
+  ui.use((_req, res, next) => { const json = res.json.bind(res); res.json = (body: any) => json(publicData(body)); next(); });
+  ui.use(["/ask", "/review"], browserRateLimit(30));
+  ui.use(["/login", "/login/code"], browserRateLimit(15));
 
   // Everything the dashboard shows: connection, bills, checks, market data, sources, recent transfers
   ui.get("/state", async (_req, res) => {
@@ -71,6 +79,7 @@ export function mountUi(app: express.Express, port: number) {
     });
     res.json({ localSimulation: process.env.LOCAL_ROUTING === "1", connected: !l.source.startsWith("demo company"), source: l.source, linkedAt: l.linkedAt, usdAvailable: l.usdAvailable,
       company: l.input.company.name, bills, receivables: l.input.receivables, run, market: marketSummary(), sources: SOURCES,
+      suppliers: supplierDirectory(l),
       payeesOnFile: Object.keys(loadPayees()).length, rails: RAILS, tokenizedNetworks: TOKENIZED_NETWORKS, policy: pol,
       fxRisk: fxRisk(exposures, rateHistory(), Date.now(), pol.fxRiskLimitUsd), costOfCashPct: l.input.company.costOfCashPct,
       usdc: { peg, inFlightUsd: usdcInFlight(), capUsd: pol.issuerCapUsd }, escrow,
@@ -100,13 +109,21 @@ export function mountUi(app: express.Express, port: number) {
 
   // Prompt -> the Fetch.ai concierge (agents buy quotes + screens with x402, then approve/hold)
   ui.post("/ask", async (req, res) => {
+    try { validateChatRequest(req.body); } catch (e: any) { return res.status(422).json({ error: e.message }); }
     try {
       const r = await fetch(`${process.env.AGENT_GATEWAY_URL ?? "http://127.0.0.1:8100"}/ask`, { method: "POST", signal: AbortSignal.timeout(280_000),
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: String(req.body?.text ?? "").slice(0, 500), policy: req.body?.policy || undefined, tenantId: process.env.AGENT_TENANT ?? "demo-tenant",
+        body: JSON.stringify({ text: req.body.text, conversationId: req.body?.conversationId,
+          conversationRevision: req.body?.conversationRevision, policy: req.body?.policy || undefined, tenantId: process.env.AGENT_TENANT ?? "demo-tenant",
           correlationId: `ui-${Date.now().toString(36)}`, serviceToken: process.env.AGENT_SERVICE_TOKEN ?? process.env.ROUTER_TOKEN ?? "dev-token" }) });
-      res.json(await r.json());
+      const answer: any = await r.json(); if (r.ok) recordUiReview(process.env.AGENT_TENANT ?? "demo-tenant", answer);
+      res.status(r.ok ? 200 : 502).json(answer);
     } catch (e: any) { res.status(502).json({ status: "error", error: `agents not reachable (${e.cause?.code ?? e.message}): start workers.py and gateway.py` }); }
+  });
+
+  ui.get("/conversations/:id", (req, res) => {
+    try { res.json(conversationView(process.env.AGENT_TENANT ?? "demo-tenant", String(req.params.id))); }
+    catch (e: any) { res.status(400).json({ error: e.message }); }
   });
 
   // ---------------------------------------------------------------- sign-in (demo users + one-time code)
@@ -125,6 +142,16 @@ export function mountUi(app: express.Express, port: number) {
   });
   ui.post("/logout", (req, res) => { C.signOut(req.headers.cookie); res.setHeader("set-cookie", "r402=; Max-Age=0; Path=/"); res.json({ ok: true }); });
   const need = (req: express.Request, res: express.Response) => { const u = me(req); if (!u) res.status(401).json({ error: "sign in first" }); return u; };
+
+  ui.post("/suppliers", (req, res) => {
+    const u = need(req, res); if (!u) return;
+    if (!C.can(u, "preparer")) return res.status(403).json({ error: "your role cannot add suppliers" });
+    if (req.body?.confirmed !== true) return res.status(400).json({ error: "confirm the supplier details before saving" });
+    try {
+      const result = confirmSupplier(process.env.AGENT_TENANT ?? "demo-tenant", String(req.body?.conversationId), req.body?.conversationRevision, req.body?.details ?? {}, u.id);
+      C.audit(u.id, "supplier_created", result.suppliers[0].id, result.suppliers[0].name); res.json({ status: "ok", preview: result, ...result });
+    } catch (e: any) { res.status(e instanceof ConversationConflict ? 409 : 422).json({ error: e.message }); }
+  });
 
   ui.post("/policy", (req, res) => {
     const u = need(req, res); if (!u) return;
@@ -152,16 +179,26 @@ export function mountUi(app: express.Express, port: number) {
   ui.post("/requests", async (req, res) => {
     const u = need(req, res); if (!u) return;
     if (!C.can(u, "preparer")) return res.status(403).json({ error: "your role cannot prepare payments" });
-    if (!req.body?.confirmed) return res.status(400).json({ error: "confirm that you checked the supplier, invoice, fees and delivery estimate" });
+    if (req.body?.confirmed !== true) return res.status(400).json({ error: "confirm that you checked the supplier, invoice, fees and delivery estimate" });
+    if (!Array.isArray(req.body?.decisions) || req.body.decisions.length > 25) return res.status(422).json({ error: "Provide up to 25 reviewed payment choices" });
+    let decisions: any[];
+    try { decisions = req.body.decisions.map((d: any) => trustedUiDecision(process.env.AGENT_TENANT ?? "demo-tenant", d)); }
+    catch (e: any) { return res.status(409).json({ error: e.message }); }
+    if (req.body?.conversationId) {
+      const conversation = conversationView(process.env.AGENT_TENANT ?? "demo-tenant", req.body.conversationId);
+      if (conversation.conversationRevision !== req.body.conversationRevision || (req.body.decisions ?? []).some((d: any) => d.intentId && !conversation.activeIntentIds.includes(d.intentId)))
+        return res.status(409).json({ error: "This plan has changed. Ask for a fresh preview in this conversation before preparing it." });
+    }
     const l = loadLinked(), co = l.input.company, paid = loadPaid(), reqs = C.loadRequests(), out: any[] = [];
     const onDelivery = new Set<string>(req.body?.releaseOnDelivery ?? []);
-    for (const d of (req.body?.decisions ?? []) as any[]) {
+    for (const d of decisions) {
       if (!["approve", "review"].includes(d.decision) || !d.intentId) { out.push({ payable: d.payable, skipped: "held by the routing agent" }); continue; }
       const prev = paid[`${co.companyId}:${d.payable}`];
       if (prev && ["COMPLETED", "EXECUTING"].includes(prev.status)) { out.push({ payable: d.payable, skipped: `already ${prev.status.toLowerCase()}` }); continue; }
       if (Object.values(reqs).some((r) => r.payable === d.payable && !["REJECTED", "FAILED"].includes(r.status))) { out.push({ payable: d.payable, skipped: "already has an open payment request" }); continue; }
       const it = await self("GET", `/v1/intents/${d.intentId}`);
       if (!it?.intentId) { out.push({ payable: d.payable, skipped: "quote not found on this router: ask again" }); continue; }
+      if (it.decision?.status !== "OK") { out.push({ payable: d.payable, skipped: "router has no eligible plan" }); continue; }
       const bill = l.input.payables.find((p) => p.id === d.payable), v: any = bill ? validate(bill.beneficiary) : { warnings: [] };
       const r: C.PaymentRequest = { id: C.newRequestId(), payable: d.payable, supplier: it.intent.beneficiary?.name ?? bill?.beneficiary.name ?? d.payable,
         country: bill?.beneficiary.country ?? "-", ccy: it.intent.destCcy, amount: it.intent.amount, reference: it.intent.reference ?? d.payable,
@@ -389,7 +426,8 @@ export function mountUi(app: express.Express, port: number) {
           currentBank: { label: bank.label, fxMarkupBps: bank.fxMarkupBps, wireFeeUsd: bank.wireFeeUsd, businessDays: bank.businessDays, measured: bank.measured },
           payments: [{ payable: bill.id, destCcy: bill.ccy, amount: budget ? Number(req.body.usd).toFixed(2) : bill.amount, amountType: budget ? "SOURCE_FIXED" : "RECIPIENT_FIXED",
             deadlineUtc: req.body?.due ?? bill.dueUtc, beneficiary: bill.beneficiary, reference: bill.id }] }) });
-      res.json(await r.json());
+      const answer: any = await r.json(); if (r.ok) recordUiReview(process.env.AGENT_TENANT ?? "demo-tenant", answer);
+      res.status(r.ok ? 200 : 502).json(answer);
     } catch (e: any) { res.status(502).json({ status: "error", error: `agents not reachable (${e.cause?.code ?? e.message}): start workers.py and gateway.py` }); }
   });
 

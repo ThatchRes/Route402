@@ -4,8 +4,9 @@
 import { runPaymentRun } from "../company/paymentRun.js";
 import { validate } from "../company/validate.js";
 import { optimize } from "../router/optimizer.js";
-import { fmt, toMinor } from "../money.js";
+import { decimals, fmt, toMinor } from "../money.js";
 import type { Linked } from "./linked.js";
+import { supplierRecords } from "../company/suppliers.js";
 
 const PLACES: Record<string, { country: string; ccy: string }> = {
   german: { country: "DE", ccy: "EUR" }, germany: { country: "DE", ccy: "EUR" }, french: { country: "FR", ccy: "EUR" }, france: { country: "FR", ccy: "EUR" },
@@ -18,9 +19,9 @@ const PLACES: Record<string, { country: string; ccy: string }> = {
 };
 const CCY = /\b(USD|EUR|CAD|MXN|GBP|SGD|BRL|JPY|INR|AUD|CHF|PHP|NGN|ZAR|TRY|KRW|IDR)\b/i;
 const WORDS: Record<string, string> = { euro: "EUR", euros: "EUR", dollar: "USD", dollars: "USD", "canadian dollars": "CAD", pesos: "MXN", peso: "MXN",
-  pound: "GBP", pounds: "GBP", sterling: "GBP", yen: "JPY", reais: "BRL", real: "BRL", rupees: "INR", "singapore dollars": "SGD" };
-function currencyOf(text: string): string | undefined {
-  const c = text.match(CCY)?.[1]?.toUpperCase(); if (c) return c;
+  pound: "GBP", pounds: "GBP", sterling: "GBP", yen: "JPY", reais: "BRL", "brazilian real": "BRL", lira: "TRY", rupees: "INR", "singapore dollars": "SGD" };
+export function currencyOf(text: string): string | undefined {
+  const c = [...text.matchAll(new RegExp(CCY.source, "gi"))].find((m) => m[1].toUpperCase() !== "TRY" || m[1] === "TRY")?.[1]?.toUpperCase(); if (c) return c;
   const t = text.toLowerCase(); const k = Object.keys(WORDS).sort((a, b) => b.length - a.length).find((w) => new RegExp(`\\b${w}\\b`).test(t));
   return k ? WORDS[k] : undefined;
 }
@@ -40,11 +41,29 @@ export function window(text: string, nowUtc: string): { from: string; to: string
   if (wd >= 0) { const n = (wd - now.getUTCDay() + 7) % 7 || 7; return { from: nowUtc, to: end(day(n)), label: `by ${DAYS[wd]}` }; }
   return null;
 }
-function place(text: string) { const t = text.toLowerCase(); const k = Object.keys(PLACES).find((p) => new RegExp(`\\b${p}\\b`).test(t)); return k ? PLACES[k] : null; }
-function amountOf(text: string) {
+export function place(text: string) { const t = text.toLowerCase(); const k = Object.keys(PLACES).find((p) => (p !== "us" || /\bUS\b/.test(text)) && new RegExp(`\\b${p}\\b`).test(t)); return k ? PLACES[k] : null; }
+export function amountOf(text: string) {
   const m = text.replace(/\$/g, "").match(AMOUNT); if (!m) return null;
   let n = Number(m[1].replace(/,/g, "")); if (m[2]?.toLowerCase() === "k") n *= 1e3; if (m[2]?.toLowerCase() === "m") n *= 1e6;
   return n > 0 ? n : null;
+}
+
+export function planSend(l: Linked, supplierId: string, value: string | number, currency?: string, deadlineUtc?: string) {
+  const ben = supplierRecords(l).find((b) => b.id === supplierId);
+  if (!ben) return { clarification: "Choose a saved supplier before planning a payment." };
+  const dest = currency ?? ben.currency;
+  const receivingCurrencies = new Set([ben.currency, ...l.input.payables.filter((p) => p.beneficiary.id === ben.id).map((p) => p.ccy)]);
+  if (!receivingCurrencies.has(dest)) return { template: "send_to", clarification: `${ben.name} has receiving details on file for ${[...receivingCurrencies].join(", ")}. Choose one of those currencies before planning this payment.` };
+  let amount: string;
+  try { amount = Number(value).toFixed(decimals(dest)); toMinor(String(value), dest); if (!(Number(value) > 0)) throw new Error("positive amount required"); }
+  catch { return { clarification: `Enter a positive amount with valid precision for ${dest}.` }; }
+  const v = validate(ben); if (v.status === "BLOCK") return { blocked: v.errors, beneficiary: ben.name };
+  const intent = { srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED" as const, amount, deadlineUtc };
+  const q: any = optimize({ ...intent, objective: "balanced", nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank, beneficiary: ben, beneficiaryAcceptsUsdc: !!ben.usdcWallet });
+  return { template: "send_to", title: `Send ${amount} ${dest} to ${ben.name}`, beneficiaryCheck: v.status, beneficiary: ben,
+    preview: q.status === "OK" ? { route: q.allocations.map((a: any) => a.routeId).join(" + "), youPay: q.totals.sourceDebit,
+      theyGet: q.totals.recipientNet, arrives: q.totals.arrivalUtc, yourBankWould: q.baseline?.sourceDebit, youSave: q.value.customerNetSaving, timing: q.timing } : q,
+    intent, nextStep: "A new preview only: review and approve before execution." };
 }
 
 export interface Template { id: string; example: string; match: RegExp; build: (text: string, l: Linked) => any }
@@ -65,10 +84,10 @@ export const TEMPLATES: Template[] = [
     build: (text, l) => {
       const amt = amountOf(text), ccy = currencyOf(text), w = window(text, l.input.nowUtc);
       const name = text.split(/\bto\b/i)[1]?.replace(/\b(by|on|before)\b.*$/i, "").trim().toLowerCase() ?? "";
-      const known = [...new Map(l.input.payables.map((x) => [x.beneficiary.name, x])).values()].filter((x) => name && x.beneficiary.name.toLowerCase().includes(name.split(" ")[0]));
+      const known = supplierRecords(l).filter((x) => name && x.name.toLowerCase().includes(name.split(" ")[0]));
       if (!amt) return { clarification: "How much should be sent?" };
-      if (known.length > 1) return { clarification: `Which one: ${known.map((k) => k.beneficiary.name).join(", ")}?` };
-      const ben = known[0]?.beneficiary;
+      if (known.length > 1) return { clarification: `Which one: ${known.map((k) => k.name).join(", ")}?` };
+      const ben = known[0];
       if (!ben) return { clarification: `"${name}" isn't a linked beneficiary yet. Add their bank details first (validation runs before any payment).` };
       const dest = ccy ?? ben.currency;
       const v = validate(ben); if (v.status === "BLOCK") return { blocked: v.errors, beneficiary: ben.name };

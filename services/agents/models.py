@@ -271,6 +271,8 @@ class AskBody(Model):
     serviceToken: str
     text: str
     policy: Optional[str] = None     # overrides the policy read from the text
+    conversationId: Optional[str] = None
+    conversationRevision: Optional[int] = None
 
 
 class ReviewBody(Model):
@@ -297,3 +299,5 @@ class AskResult(Model):
     hops: List[dict] = []
     next: Optional[str] = None
     error: Optional[str] = None
+    conversationId: Optional[str] = None
+    conversationRevision: Optional[int] = None

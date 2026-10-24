@@ -461,6 +461,7 @@ async function act(r, kind, P) {
 // ------------------------------------------------------------------ suppliers
 let SUPF = { q: "", ccy: "", status: "" };
 function pageSuppliers(P) {
+  if (STATE.suppliers) return pageSupplierDirectory(P);
   const bills = STATE.bills, ccys = [...new Set(bills.map((b) => b.ccy))];
   const list = bills.filter((b) => (!SUPF.q || `${b.supplier} ${b.id} ${COUNTRY[b.country] ?? b.country}`.toLowerCase().includes(SUPF.q.toLowerCase()))
     && (!SUPF.ccy || b.ccy === SUPF.ccy) && (!SUPF.status || (SUPF.status === "ok" ? b.check === "OK" : b.check !== "OK")));
@@ -481,6 +482,14 @@ function pageSuppliers(P) {
   $$("[data-go]").forEach((tr) => tr.onclick = () => (location.hash = tr.dataset.go));
 }
 function pageSupplier(P, id) {
+  const supplier = STATE.suppliers?.find((s) => s.id === id);
+  if (supplier) {
+    P.innerHTML = `${head(supplier.name, `${COUNTRY[supplier.country] ?? supplier.country} · ${supplier.currencies.join(", ")}`)}
+      <div class="panel2"><h2>Supplier profile</h2><p>${esc(supplier.maskedAccount)} · ${esc(supplier.check)}</p>
+      <p>${esc(supplier.issues.join("; ") || "Receiving details passed format checks.")}</p>
+      <p>${supplier.billIds.length} linked invoice(s).</p><div class="actions"><a class="btn" href="#/suppliers">All suppliers</a><button class="btn primary" id="ask-about-supplier">Plan a payment in chat</button></div></div>`;
+    $("#ask-about-supplier").onclick = () => { CHAT_INPUT = `Send an amount to ${supplier.name}`; location.hash = "#/chat"; }; return;
+  }
   const b = billOf(id); if (!b) { location.hash = "#/suppliers"; return; }
   const reqs = REQS.filter((r) => r.supplier === b.supplier || r.payable === b.id), tx = STATE.transfers.filter((t) => t.supplier === b.supplier || t.reference === b.id);
   P.innerHTML = `${head(b.supplier, `${COUNTRY[b.country] ?? b.country} · paid in ${b.ccy}`)}
@@ -497,6 +506,20 @@ function pageSupplier(P, id) {
     ${tx.filter((t) => !reqs.some((r) => r.transferId === t.transferId)).map((t) => `<tr><td>${esc(t.reference ?? "-")}<div class="note mono">${esc(t.transferId)}</div></td><td>${money(t.debit)}</td><td>${pill(t.status === "COMPLETED" ? "ok" : "warn", t.status)}</td><td>-</td></tr>`).join("")}</tbody></table>`
     : `<p class="muted" style="margin-top:8px">No payments to this supplier yet.</p>`}</div>${foot()}`;
   $$("[data-go]").forEach((tr) => tr.onclick = () => (location.hash = tr.dataset.go));
+}
+
+function pageSupplierDirectory(P) {
+  const suppliers = STATE.suppliers, ccys = [...new Set(suppliers.flatMap((s) => s.currencies))];
+  const rows = suppliers.filter((s) => (!SUPF.q || `${s.name} ${s.country}`.toLowerCase().includes(SUPF.q.toLowerCase()))
+    && (!SUPF.ccy || s.currencies.includes(SUPF.ccy)) && (!SUPF.status || (SUPF.status === "ok" ? s.check === "OK" : s.check !== "OK")));
+  P.innerHTML = `${head("Suppliers", "Your saved supplier companies, including suppliers without open invoices.")}
+    <div class="panel2"><div class="actions"><input class="search" id="directory-search" placeholder="Search supplier companies" value="${esc(SUPF.q)}"/>
+    <button class="btn primary" id="directory-add">Add supplier in chat</button></div><div class="filters">${["", ...ccys].map((ccy) => `<button data-directory-ccy="${ccy}" class="${SUPF.ccy === ccy ? "on" : ""}">${ccy || "All currencies"}</button>`).join("")}</div>
+    <div class="scroll"><table class="tbl"><thead><tr><th>Company</th><th>Country</th><th>Currencies</th><th>Receiving details</th><th>Invoices</th></tr></thead><tbody>
+    ${rows.map((s) => `<tr class="click" data-go="#/suppliers/${esc(s.id)}"><td>${esc(s.name)}</td><td>${esc(COUNTRY[s.country] ?? s.country)}</td><td>${esc(s.currencies.join(", "))}</td><td>${esc(s.check)} · ${esc(s.maskedAccount)}</td><td>${s.billIds.length}</td></tr>`).join("") || '<tr><td colspan="5">No suppliers match.</td></tr>'}</tbody></table></div></div>${foot()}`;
+  $("#directory-search").onchange = (e) => { SUPF.q = e.target.value; pageSupplierDirectory(P); };
+  $$("[data-directory-ccy]").forEach((b) => b.onclick = () => { SUPF.ccy = b.dataset.directoryCcy; pageSupplierDirectory(P); });
+  $("#directory-add").onclick = () => { CHAT_INPUT = "Add a supplier"; location.hash = "#/chat"; };
 }
 
 // ------------------------------------------------------------------ activity

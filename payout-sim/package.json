@@ -20,7 +20,8 @@
     "ask": "tsx src/assistant/cli.ts",
     "demo:reset": "tsx src/demoReset.ts",
     "econ:test": "tsx src/econ.selftest.ts",
-    "deadline:test": "tsx src/deadline.selftest.ts"
+    "deadline:test": "tsx src/deadline.selftest.ts",
+    "context:test": "tsx src/context.selftest.ts"
   },
   "dependencies": {
     "dotenv": "16.4.5",
@@ -30,7 +31,7 @@
   "devDependencies": {
     "@types/express": "5.0.0",
     "@types/node": "22.10.2",
-    "tsx": "4.19.2",
+    "tsx": "4.23.15",
     "typescript": "5.6.3"
   }
 }
