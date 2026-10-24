@@ -1,0 +1,6 @@
+<svg preserveAspectRatio="none" overflow="visible" style="display: block;" width="46" height="53" viewBox="0 0 46 53" fill="none" xmlns="http://www.w3.org/2000/svg">
+<mask id="stroke0_0_27" fill="white">
+<path d="M0 0H46L44 34C42.6667 41.3333 35.6667 47.6667 23 53C10.3333 47.6667 3.33333 41.3333 2 34L0 0Z"/>
+</mask>
+<path id="Shield inset" d="M0 0H46L44 34C42.6667 41.3333 35.6667 47.6667 23 53C10.3333 47.6667 3.33333 41.3333 2 34L0 0Z" stroke-width="2.8" stroke="#193B42" mask="url(#stroke0_0_27)"/>
+</svg>

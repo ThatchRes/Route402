@@ -25,6 +25,12 @@ export function recordUiReview(tenant: string, answer: any) {
   mkdirSync("data", { recursive: true }); writeFileSync(`${file}.tmp`, JSON.stringify(kept)); renameSync(`${file}.tmp`, file);
 }
 
+// Read-only: was this quote returned by the agents to this workspace within the review window?
+export function reviewedIntent(tenant: string, intentId: string) {
+  const row = /^[A-Za-z0-9_-]{1,80}$/.test(intentId) ? read()[key(tenant, intentId)] : undefined;
+  return row && Date.now() - row.at < 24 * 60 * 60e3 ? row : undefined;
+}
+
 export function trustedUiDecision(tenant: string, client: any) {
   const row = typeof client?.intentId === "string" ? read()[key(tenant, client.intentId)] : undefined;
   if (!row || row.decision.payable !== client.payable || Date.now() - row.at >= 24 * 60 * 60e3) throw new Error("No current agent review for this quote. Request a fresh preview.");

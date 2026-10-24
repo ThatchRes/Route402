@@ -9,38 +9,49 @@
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="app.css" />
   <link rel="stylesheet" href="chat.css" />
+  <link rel="stylesheet" href="screens.css" />
 </head>
 <body>
 <div class="shell">
-  <aside class="side">
-    <div class="logo">
-      <!-- Route402 highway shield (redrawn from the Figma logo) -->
-      <svg viewBox="0 0 64 70" aria-hidden="true">
-        <path d="M32 3c8 4 18 4 28 1 2 13 1.5 24-2 34C53 53 43 61 32 67 21 61 11 53 6 38 2.5 28 2 17 4 4c10 3 20 3 28-1z" fill="#f1fbf5" stroke="#acc8c7" stroke-width="1.5"/>
-        <text x="32" y="20" text-anchor="middle" font-family="Manrope, sans-serif" font-weight="800" font-size="8.5" fill="#193b42">ROUTE</text>
-        <text x="32" y="47" text-anchor="middle" font-family="Manrope, sans-serif" font-weight="800" font-size="25" fill="#193b42">402</text>
-      </svg>
-    </div>
-    <button class="new-chat" id="new-chat"><span aria-hidden="true">＋</span> New chat</button>
-    <nav class="nav" id="nav">
-      <a href="#/chat" data-nav="chat">Chat</a>
-      <a href="#/payments" data-nav="payments">Payments</a>
-      <a href="#/suppliers" data-nav="suppliers">Suppliers</a>
-      <a href="#/activity" data-nav="activity">Activity</a>
-    </nav>
-    <div class="chat-history" id="chat-history" aria-label="Previous chats"></div>
+  <aside class="side" id="side">
+    <!-- Route 402 highway shield: Figma layers (Shield, Shield inset, Shield divider) + live text -->
+    <a class="logo" href="#/chat" aria-label="Route402 Agent home">
+      <img class="logo-shield" src="assets/shield.svg" width="60" height="66" alt="" />
+      <img class="logo-inset" src="assets/shield-inset.svg" width="46" height="53" alt="" />
+      <img class="logo-divider" src="assets/shield-divider.svg" width="44" height="3" alt="" />
+      <span class="logo-route" aria-hidden="true">ROUTE</span><span class="logo-402" aria-hidden="true">402</span>
+    </a>
     <div class="company"><b id="co-name">Your company</b><span id="co-sub">Importer</span></div>
+    <nav class="nav" id="nav">
+      <a href="#/chat" data-nav="chat"><img class="ico on" src="assets/sparkles-nav.svg" width="17" height="17" alt="" />Agent</a>
+      <a href="#/payments" data-nav="payments"><img class="ico" src="assets/arrow-left-right.svg" width="17" height="17" alt="" />Payments</a>
+      <a href="#/suppliers" data-nav="suppliers"><img class="ico" src="assets/users.svg" width="17" height="17" alt="" />Suppliers</a>
+    </nav>
+    <div class="chat-history" id="chat-history" aria-label="Recent work"></div>
     <div class="side-foot">
-      <div>Testnet workspace</div>
+      <nav class="side-more" aria-label="Workspace tools">
+        <a href="#/activity" data-nav="activity">Activity</a>
+        <button class="link" id="open-policy">Policy &amp; people</button>
+        <button class="link" id="open-connect">Connect bank</button>
+      </nav>
+      <div class="side-note" id="side-note">Testnet workspace</div>
       <div id="who" class="who"></div>
-      <button class="link" id="open-policy">Policy &amp; people</button>
-      <button class="link" id="open-connect">Connect bank</button>
     </div>
   </aside>
-  <main class="main" id="page"></main>
+  <div class="workspace">
+    <header class="topbar">
+      <div class="crumbs">
+        <button class="icon-btn" id="toggle-side" aria-controls="side" aria-expanded="true" aria-label="Hide sidebar"><img src="assets/panel-left.svg" width="16" height="16" alt="" /></button>
+        <span id="crumbs">Route402</span>
+      </div>
+      <div class="snapshot"><span class="badge" id="mode-badge">TESTNET DEMO</span><span id="clock"></span></div>
+    </header>
+    <main class="main" id="page"></main>
+  </div>
 </div>
 <div class="modal hidden" id="modal" role="dialog" aria-modal="true"><div class="modal-box" id="modal-box"></div></div>
 <script src="chat.js"></script>
+<script src="screens.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

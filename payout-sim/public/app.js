@@ -34,12 +34,34 @@ const saveDraft = () => { try { sessionStorage.setItem("r402-draft", JSON.string
 
 // ------------------------------------------------------------------ shell
 const head = (title, sub, extra = "") => `<div class="page-head"><div><h1>${esc(title)}</h1><p>${esc(sub)}</p></div>
-  <div class="snap"><span class="chip-tag">TESTNET DEMO</span><small>${new Date().toUTCString().slice(0, 22)} UTC</small>${extra}</div></div>
+  ${extra ? `<div class="snap">${extra}</div>` : ""}</div>
   <div class="notice wide">${STATE?.connected ? `Connected: ${esc(STATE.source.replace("Nessie customer", "Capital One ·"))} · ` : "Demo company data · "}Testnet money only · Supplier payouts simulated · x402 and escrow transactions are real testnet or local-chain transactions</div>`;
 const steps = (n) => `<div class="steps3">${["Payment details", "Compare routes", "Review & approve"].map((t, i) =>
   `<div class="${i + 1 === n ? "on" : ""}"><b>${i + 1 < n ? "✓" : `0${i + 1}`}</b>${esc(t)}</div>`).join("")}</div>`;
 const foot = () => `<div class="foot2"><span>Route 402 · ${esc(STATE?.company ?? "")}</span><span>All timestamps UTC · Testnet only · <a href="#" data-sources>sources</a></span></div>`;
 const pill = (k, t) => `<span class="pill ${k}">${esc(t)}</span>`;
+const initials = (name) => String(name ?? "").split(/\s+/).filter(Boolean).map((x) => x[0]).join("").slice(0, 2).toUpperCase();
+const PAGE_LABEL = { chat: "Agent", payments: "Payments", suppliers: "Suppliers", activity: "Activity" };
+const stamp = (d = new Date()) => `${d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" })} · ${d.toISOString().slice(11, 16)} UTC`;
+// Workspace header: company / section / (conversation). The mode badge reflects the router's real mode.
+function setCrumbs(...parts) {
+  const co = STATE?.company?.replace(/ Inc\.?$/, "") ?? "Route402";
+  $("#crumbs").textContent = [co, parts.filter(Boolean).join(" / ")].join("   /   ");
+}
+function shellStatus() {
+  if (!STATE) return;
+  $("#mode-badge").textContent = STATE.localSimulation ? "SIMULATED DEMO" : STATE.connected ? "TESTNET · BANK CONNECTED" : "TESTNET DEMO";
+  $("#side-note").textContent = STATE.localSimulation ? "Local simulation workspace" : "Testnet workspace";
+}
+const tickClock = () => { $("#clock").textContent = stamp(); };
+tickClock(); setInterval(tickClock, 30_000);
+function setSide(open) {
+  document.body.classList.toggle("side-hidden", !open);
+  $("#toggle-side").setAttribute("aria-expanded", String(open)); $("#toggle-side").setAttribute("aria-label", open ? "Hide sidebar" : "Show sidebar");
+  try { localStorage.setItem("r402-side", open ? "open" : "hidden"); } catch {}
+}
+try { if (localStorage.getItem("r402-side") === "hidden") setSide(false); } catch {}
+$("#toggle-side").addEventListener("click", () => setSide(document.body.classList.contains("side-hidden")));
 const statusText = (s) => ({ NEEDS_CALLBACK: "Call-back needed", AWAITING_APPROVAL: "Awaiting approval", AWAITING_DELIVERY: "Awaiting delivery", READY: "Releasing",
   PAUSED: "Paused", EXECUTING: "Processing", COMPLETED: "Completed", FAILED: "Needs attention", REJECTED: "Rejected", REFUNDED: "Refunded" })[s] ?? s;
 const statusKind = (s) => ({ COMPLETED: "ok", FAILED: "bad", REJECTED: "bad", REFUNDED: "draft", EXECUTING: "info", READY: "info", AWAITING_DELIVERY: "info", PAUSED: "warn" })[s] ?? "warn";
@@ -53,8 +75,9 @@ async function loadAll() {
   STATE = s; ME = m.user; USERS = m.users; POLICY = m.policy; REQS = r;
   $("#co-name").textContent = s.company.replace(/ Inc\.?$/, "");
   $("#co-sub").textContent = s.connected ? "Importer · bank connected" : "Importer · demo data";
-  $("#who").innerHTML = ME ? `<b>${esc(ME.name.split(" ").map((x) => x[0]).join(""))} · ${esc(ME.name)}</b><span class="small">${esc(ME.title)}</span> · <button class="link" id="signout">Sign out</button>`
-    : `<button class="link strong" id="signin">Sign in →</button>`;
+  $("#who").innerHTML = ME ? `<span class="avatar" aria-hidden="true">${esc(initials(ME.name))}</span><span class="id"><b>${esc(ME.name)}</b><span>${esc(ME.title)} · <button class="link" id="signout">Sign out</button></span></span>`
+    : `<span class="avatar" aria-hidden="true">–</span><span class="id"><b>Not signed in</b><button class="link strong" id="signin">Sign in →</button></span>`;
+  shellStatus();
   $("#signout")?.addEventListener("click", async () => { await api("/logout", {}); await route(); });
   $("#signin")?.addEventListener("click", () => signIn(route));
 }
@@ -65,8 +88,10 @@ async function route() {
   clearTimeout(POLL);
   const [, page = "chat", a, b] = (location.hash || "#/chat").split(/[/?]/);
   const q = new URLSearchParams(location.hash.split("?")[1] ?? "");
-  $$("#nav a").forEach((x) => x.classList.toggle("active", x.dataset.nav === (page === "overview" ? "chat" : page)));
+  const current = page === "overview" ? "chat" : page;
+  $$(".side [data-nav]").forEach((x) => { x.classList.toggle("active", x.dataset.nav === current); x.toggleAttribute("aria-current", x.dataset.nav === current); });
   document.body.classList.toggle("chat-mode", page === "chat" || page === "overview");
+  setCrumbs(PAGE_LABEL[current] ?? "Agent");
   if (page === "chat" || page === "overview") {
     pageChat($("#page"));
     loadAll().then(updateChatContext).catch(() => updateChatContext(false));
@@ -74,7 +99,7 @@ async function route() {
   }
   try { await loadAll(); } catch (e) { $("#page").innerHTML = `<div class="alert bad">Router not reachable: ${esc(e.message)}</div>`; return; }
   const P = $("#page");
-  if (page === "payments" && a === "new") { location.hash = "#/chat"; return; }
+  if (page === "payments" && a === "new") return pageCreate(P, q);
   if (page === "payments" && a === "compare") return pageCompare(P);
   if (page === "payments" && a === "review") return pageReview(P);
   if (page === "payments" && a === "submitted") return pageSubmitted(P, b);
@@ -196,50 +221,7 @@ function nextStep(r) {
     EXECUTING: "Settling", COMPLETED: "Done", FAILED: "Check the reference before any retry", REJECTED: "-", REFUNDED: "-" })[r.status] ?? "";
 }
 
-// ------------------------------------------------------------------ STEP 1: payment details
-function pageCreate(P, q) {
-  const startable = STATE.bills.filter((b) => b.check !== "BLOCK" && !reqFor(b.id) && b.paid?.status !== "COMPLETED");
-  if (q.get("bill") && q.get("bill") !== DRAFT.billId) DRAFT = { billId: q.get("bill") };
-  const d = DRAFT, b = billOf(d.billId);
-  P.innerHTML = `${head("Create payment", "Choose the supplier and what this payment must achieve.")}${steps(1)}
-  <div class="duo wide-left"><div class="panel2"><form class="form" id="f" novalidate>
-      <div class="field2" id="ff-bill"><label for="bill">Saved supplier and invoice</label><select id="bill"><option value="">Choose a saved supplier</option>
-        ${startable.map((x) => `<option value="${esc(x.id)}" ${x.id === d.billId ? "selected" : ""}>${esc(x.supplier)} · ${esc(x.id)} · ${money(`${x.amount} ${x.ccy}`)}</option>`).join("")}</select><span class="e"></span></div>
-      <div class="field2"><label>Amount</label><div class="radio">
-        <label class="${d.mode !== "budget" ? "on" : ""}"><input type="radio" name="mode" value="invoice" ${d.mode !== "budget" ? "checked" : ""}/> <span><b>Supplier receives the invoice amount</b><div class="note">Best for bills: you pay whatever the route costs; the supplier gets exactly the invoice.</div></span></label>
-        <label class="${d.mode === "budget" ? "on" : ""}"><input type="radio" name="mode" value="budget" ${d.mode === "budget" ? "checked" : ""}/> <span><b>Send a fixed budget (USD)</b><div class="note">You fix the debit; the supplier receives what is left after fees and conversion.</div></span></label></div></div>
-      <div class="field2 ${d.mode === "budget" ? "" : "hidden"}" id="ff-usd"><label for="usd">Total source debit · USD (fees included)</label><input id="usd" inputmode="decimal" value="${esc(d.budgetUsd ?? "")}" placeholder="0.00" /><span class="e"></span></div>
-      <div class="field2"><label>From</label><input value="${esc(STATE.connected ? "Operating account (Capital One)" : "USD operating account (demo)")}" disabled /></div>
-      <div class="field2" id="ff-purpose"><label for="purpose">Purpose</label><input id="purpose" value="${esc(d.purpose ?? "Invoice payment")}" placeholder="Enter purpose" /><span class="e"></span></div>
-      <div class="field2" id="ff-due"><label for="due">Requested delivery</label><input id="due" type="date" value="${esc((d.due ?? b?.dueUtc ?? "").slice(0, 10))}" /><span class="h">Defaults to the invoice due date.</span><span class="e"></span></div>
-      <label class="confirm"><input type="checkbox" id="deliver" ${d.deliver ? "checked" : ""}/> <span><b>Release only after delivery is confirmed</b> (bill of lading or goods receipt). On our stablecoin rail the money is locked in an on-chain escrow at approval: the supplier can see it is committed, and it is released on delivery or returned after ${POLICY.escrowDeadlineDays} days.</span></label>
-    </form></div>
-    <div class="panel2" id="sum">${createSummary(b)}</div></div>
-  <div class="actionbar"><a class="btn" href="#/payments">← Back to payments</a><div class="mid"><b>Next: compare routes</b><span>Agents buy a paid quote from each rail and screen the supplier. Nothing is sent.</span></div><button class="btn primary" id="go">Continue to route comparison</button></div>${foot()}`;
-  $("#bill").onchange = () => { DRAFT = { ...DRAFT, billId: $("#bill").value, due: undefined }; saveDraft(); pageCreate(P, new URLSearchParams()); };
-  $$("[name=mode]").forEach((r) => r.onchange = () => { DRAFT.mode = r.value; saveDraft(); pageCreate(P, new URLSearchParams()); });
-  $("#go").onclick = () => {
-    const errs = {}, mode = $("[name=mode]:checked").value, usdV = Number($("#usd").value);
-    if (!$("#bill").value) errs.bill = "Select a supplier to continue.";
-    if (mode === "budget" && !(usdV > 0)) errs.usd = "Enter an amount greater than 0.00 USD.";
-    if (!$("#purpose").value.trim()) errs.purpose = "Purpose is required.";
-    if (!$("#due").value) errs.due = "Choose a requested delivery date.";
-    $$(".field2").forEach((f) => { f.classList.remove("err"); const e = $(".e", f); if (e) e.textContent = ""; });
-    for (const [k, m] of Object.entries(errs)) { const f = $(`#ff-${k}`); f?.classList.add("err"); if (f) $(".e", f).textContent = m; }
-    if (Object.keys(errs).length) return;
-    DRAFT = { billId: $("#bill").value, mode, budgetUsd: mode === "budget" ? usdV : undefined, purpose: $("#purpose").value.trim(), due: new Date(`${$("#due").value}T20:00:00Z`).toISOString(), deliver: $("#deliver").checked };
-    saveDraft(); location.hash = "#/payments/compare";
-  };
-}
-function createSummary(b) {
-  if (!b) return `<span class="label accent">Supplier</span><p class="muted" style="margin-top:8px">Choose a saved supplier to see their details.</p>`;
-  return `<span class="label accent">Saved supplier</span><h2 style="margin:6px 0">${esc(b.supplier)}</h2><div class="small muted">${esc(b.id)} · ${esc(COUNTRY[b.country] ?? b.country)} · ${esc(b.ccy)}</div>
-    <div class="grid2x" style="margin-top:14px"><div class="kv2"><div class="k">INVOICE AMOUNT</div><div class="v">${money(`${b.amount} ${b.ccy}`)}</div></div><div class="kv2"><div class="k">DUE</div><div class="v">${dayY(b.dueUtc)}</div></div>
-      <div class="kv2"><div class="k">PRE-SEND CHECK</div><div class="v">${checkPill(b)}</div></div><div class="kv2"><div class="k">ACCEPTS USDC</div><div class="v">${b.acceptsUsdc ? "Yes" : "No"}</div></div></div>
-    ${b.issues.length ? `<div class="alert ${b.detailsChanged ? "warn" : "info"}">${esc(b.issues[0])}</div>` : ""}
-    ${b.plan === "wallet only" ? `<div class="alert ok">This bill can be paid from the ${esc(b.ccy)} you already hold: no conversion is needed.</div>` : ""}
-    ${b.ready && !b.ready.complete ? `<p class="note" style="margin-top:8px">Supplier record missing for some rails: ${esc(b.ready.missing.join(", "))}.</p>` : ""}`;
-}
+// ------------------------------------------------------------------ STEP 1: payment details -> pageCreate in screens.js (Figma "Manual payment")
 
 // ------------------------------------------------------------------ STEP 2: compare routes
 let SORT = "cost";
@@ -256,8 +238,9 @@ async function pageCompare(P) {
   }
   if (!DRAFT.agent && !DRAFT.agentErr) runAgents(P);
 }
-async function runAgents(P) {
-  DRAFT.agentBusy = true; renderCompare(P);
+// Agents for the draft (paid quotes + supplier screen); shared by the compare step and the Manual payment page
+async function runAgents(P, render = renderCompare, page = "#/payments/compare") {
+  DRAFT.agentBusy = true; render(P);
   try {
     const a = await api("/review", { payable: DRAFT.billId, mode: DRAFT.mode, usd: DRAFT.budgetUsd, due: DRAFT.due, policy: SORT === "speed" ? "fastest" : "cheapest" });
     if (a.status === "error") throw new Error(a.error);
@@ -265,7 +248,7 @@ async function runAgents(P) {
     if (!DRAFT.selected && DRAFT.agent.decision?.chosen) DRAFT.selected = DRAFT.agent.decision.chosen;
   } catch (e) { DRAFT.agentErr = e.message; }
   DRAFT.agentBusy = false; saveDraft();
-  if (location.hash.startsWith("#/payments/compare")) renderCompare(P);
+  if (location.hash.startsWith(page)) render(P);
 }
 function ranked() {
   const R = DRAFT.routes; if (!R) return [];
@@ -343,55 +326,7 @@ function chosenDecision() {
 }
 const canContinue = () => !!chosenDecision() && DRAFT.routes?.routes?.some((r) => r.provider === DRAFT.selected && r.status === "OK");
 
-// ------------------------------------------------------------------ STEP 3: review and approve
-function pageReview(P) {
-  const d = DRAFT, b = billOf(d.billId), r = d.routes?.routes?.find((x) => x.provider === d.selected && x.status === "OK"), dec = chosenDecision();
-  if (!b || !r || !dec) { location.hash = "#/payments/compare"; return; }
-  const expired = Date.now() > Date.parse(r.expiresAt), e = r.economics, x = r.breakdown, budget = d.mode === "budget";
-  const twoApprovals = num(r.youPay) > POLICY.dualApprovalOverUsd, escrow = d.deliver && r.provider === "stablecoin";
-  P.innerHTML = `${head("Review and approve", "One final check before this payment goes to your approvers.")}${steps(3)}
-  ${expired ? `<div class="panel2 state"><span class="label accent">Blocked approval · ${utc(new Date().toISOString())}</span><h2>Quote expired</h2>${pill("warn", "Expired")}
-      <p class="small muted" style="margin:8px 0">Captured ${utc(r.capturedAt)}; expired ${utc(r.expiresAt)}. Refresh and review the new quote before submitting. Your payment details are kept.</p>
-      <button class="btn primary" id="refresh">Refresh quotes</button></div>`
-    : `<div class="notice wide">Quote valid for <b data-exp="${esc(r.expiresAt)}"></b> · captured ${utc(r.capturedAt)} · expires ${utc(r.expiresAt)}. Submitting is unavailable after expiry until a new quote is reviewed.</div>`}
-  <div class="duo wide-left"><div>
-    <div class="panel2"><span class="label accent">Supplier &amp; payment</span><h2 style="margin:6px 0 10px">${esc(b.supplier)}</h2>
-      <div class="flowbox"><div class="ends"><div><div class="label">Source debit</div><div class="v">${money(r.youPay)}</div></div><div><div class="label">${budget ? "Estimated recipient" : "Supplier receives"}</div><div class="v">${money(r.supplierGets)}</div></div></div>
-        <div class="convline" style="justify-content:flex-start;gap:12px"><span class="mono-chip">${esc(b.country)}</span><div style="flex:1"><b>${esc(b.supplier)}</b><div class="note">${esc(b.id)} · ${esc(d.purpose)}</div></div><span class="pill draft">${utc(new Date().toISOString())}</span></div>
-        <div class="row2"><span>Transfer fee</span><b>${usd(x.transferFeeUsd, 2)}</b></div><div class="row2"><span>Conversion cost vs mid-market</span><b>${usd(x.conversionCostUsd, 2)}</b></div>
-        <div class="row2"><span>Total fees · included</span><b>${usd(e.pricedUsd, 2)}</b></div><div class="row2"><span>Converted principal</span><b>${usd(x.convertedPrincipalUsd, 2)}</b></div>
-        <div class="label">Conversion</div><div class="convline"><span>${usd(x.convertedPrincipalUsd, 2)}</span><i>→</i><span>${b.ccy === "USD" ? "no conversion" : `1 USD = ${Number(r.fxRate).toFixed(4)} ${esc(b.ccy)}`}</span><b>${money(r.supplierGets)}</b></div></div>
-      <div class="grid2x" style="margin-top:14px">
-        <div class="kv2"><div class="k">DESTINATION</div><div class="v">${esc(COUNTRY[b.country] ?? b.country)} · ${esc(b.ccy)}</div></div><div class="kv2"><div class="k">RECEIVING DETAILS</div><div class="v">${esc(d.routes.bill.maskedAccount)}</div></div>
-        <div class="kv2"><div class="k">SOURCE ACCOUNT</div><div class="v">${esc(d.routes.sourceAccount)}</div></div><div class="kv2"><div class="k">PURPOSE</div><div class="v">${esc(d.purpose)}</div></div>
-        <div class="kv2"><div class="k">REQUESTED DELIVERY</div><div class="v">${dayY(d.due)}</div></div><div class="kv2"><div class="k">QUOTE CAPTURE</div><div class="v">${utc(r.capturedAt)}</div></div></div></div>
-    <div class="rcard sel"><div class="lbl">SELECTED ROUTE</div><div class="nm">${RAIL[r.provider]}</div><div>${pill("ok", d.agent.decision.chosen === r.provider ? "Recommended for this payment" : "Chosen by you")} ${pill("ok", r.provider === "stablecoin" ? "Supplier accepts USDC" : "Saved receiving details")}</div>
-      <div class="grid2x"><div class="kv2"><div class="k">ESTIMATED ARRIVAL</div><div class="v">${e.transitDays < 0.05 ? "Minutes · 24/7" : `${dayY(r.arrivalUtc)} · ${e.transitDays.toFixed(1)} days`}</div></div><div class="kv2"><div class="k">ALL-IN COST</div><div class="v">${usd(e.allInUsd, 2)}</div></div></div>
-      <p class="small">Delivery is not guaranteed; verified historical reliability is not available.</p><a class="btn select" href="#/payments/compare">← Change route</a></div></div>
-    <div><div class="panel2"><span class="label accent">Quote snapshot · ${utc(r.capturedAt)}</span><h2 style="margin:6px 0">Confirm the full cost</h2>
-      <div class="row2"><span>Total fees · included</span><b>${usd(e.pricedUsd, 2)}</b></div><div class="row2"><span>Cost of sending early</span><b>${usd(e.sendingEarlyUsd, 2)}</b></div><div class="row2 total"><span>All-in cost</span><b>${usd(e.allInUsd, 2)}</b></div>
-      <div class="label" style="margin-top:12px">${budget ? "Estimated recipient amount" : "Total source debit"}</div><div class="formula2" style="font-size:34px">${money(budget ? r.supplierGets : r.youPay)}</div>
-      <p class="note">What happens after you submit:</p><ul class="reasons">
-        ${dec.decision === "review" ? "<li>Bank details changed: someone other than you calls the supplier on a number already on file.</li>" : ""}
-        <li>${twoApprovals ? `Two different approvers (over ${usd(POLICY.dualApprovalOverUsd)})` : "One approver other than you"}.</li>
-        ${d.deliver ? `<li>${escrow ? `Funds lock in an on-chain escrow (${esc(STATE.escrow.chain ?? "escrow")}) at approval, and release when receiving confirms delivery.` : "Release waits until receiving confirms delivery."}</li>` : ""}
-        ${r.provider === "stablecoin" ? `<li>The USDC route re-checks the peg (±${POLICY.depegBandPct}%) and the issuer cap right before sending.</li>` : ""}</ul>
-      <label class="confirm" style="margin:12px 0"><input type="checkbox" id="ok" /> <span>I have checked the supplier, invoice, fees and delivery estimate. I understand this sends testnet money and a simulated payout only.</span></label>
-      <button class="btn primary" id="submit" ${expired ? "disabled" : ""}>Submit for approval</button><div id="sub-err"></div>
-      <p class="note" style="margin-top:8px">Viewing this screen or choosing a route never submits a payment. Only a deliberate submission starts the approval.</p></div>
-      <p class="note">${ME ? `Preparer: ${esc(ME.name)} · ${esc(ME.title)}. Recorded in the audit history.` : "Sign in to submit."}</p></div></div>
-  <div><a class="btn" href="#/payments/compare">← Back to route comparison</a></div>${foot()}`;
-  $("#refresh")?.addEventListener("click", () => { DRAFT.key = null; saveDraft(); location.hash = "#/payments/compare"; });
-  $("#submit")?.addEventListener("click", async () => {
-    if (!ME) return signIn(() => pageReview(P));
-    if (!$("#ok").checked) { $("#sub-err").innerHTML = `<div class="alert warn">Tick the confirmation first.</div>`; return; }
-    try {
-      const out = await api("/requests", { decisions: [chosenDecision()], releaseOnDelivery: d.deliver ? [b.id] : [], confirmed: true, purpose: d.purpose, mode: d.mode });
-      const one = out.requests?.[0]; if (!one?.requestId) throw new Error(one?.skipped ?? out.error ?? "not submitted");
-      DRAFT = {}; saveDraft(); location.hash = `#/payments/submitted/${one.requestId}`;
-    } catch (err) { $("#sub-err").innerHTML = `<div class="alert bad">${esc(err.message)}</div>`; }
-  });
-}
+// ------------------------------------------------------------------ STEP 3: review -> pageReview in screens.js (Figma "Review & approve")
 
 // ------------------------------------------------------------------ submitted
 function pageSubmitted(P, id) {
@@ -408,44 +343,9 @@ function pageSubmitted(P, id) {
       <li>Every step is written to the tamper-evident audit log.</li></ul></div></div>${foot()}`;
 }
 
-// ------------------------------------------------------------------ tracking
-function pageTracking(P, id) {
-  const r = REQS.find((x) => x.id === id); if (!r) { P.innerHTML = `${head("Payment", "")}<div class="alert bad">No such payment request.</div>`; return; }
-  const s = r.status, ev = (t, cls, m) => `<div class="ev ${cls}"><div class="dot"></div><div><b>${t}</b><div class="m">${m ?? ""}</div></div></div>`;
-  const evs = [ev("Prepared", "done", `${esc(nameOf(r.preparedBy))} · ${when(r.preparedAt)} · ${esc(r.purpose ?? "")}`)];
-  if (r.detailsChanged) evs.push(ev("Call-back verified", r.callback ? "done" : s === "NEEDS_CALLBACK" ? "now" : "", r.callback ? `${esc(nameOf(r.callback.by))} · ${esc(r.callback.contact)} on ${esc(r.callback.phoneOnFile)}` : "verify the new bank details on a number already on file"));
-  evs.push(ev(`Approved ${r.approvals.length}/${r.approvalsRequired}`, r.approvals.length >= r.approvalsRequired ? "done" : s === "AWAITING_APPROVAL" ? "now" : "", r.approvals.map((a) => `${esc(nameOf(a.by))} · ${when(a.at)}`).join("<br>")));
-  if (r.escrow) evs.push(ev("Funds locked in escrow", ["LOCKED", "RELEASED", "REFUNDED"].includes(r.escrow.state) ? "done" : r.escrow.state === "FAILED" ? "bad" : "now",
-    r.escrow.state === "FAILED" ? esc(r.escrow.error) : `${r.escrow.amountUsdc} test USDC · ${esc(r.escrow.chain)} · refundable after ${dayY(r.escrow.deadline)}${r.escrow.lockTx ? ` · ${txLink(r.escrow, r.escrow.lockTx)}` : ""}`));
-  if (r.releaseOnDelivery) evs.push(ev("Delivery confirmed", r.delivery ? "done" : s === "AWAITING_DELIVERY" ? "now" : "", r.delivery ? `${esc(r.delivery.documentRef)} · ${esc(nameOf(r.delivery.by))} · ${when(r.delivery.at)}` : "bill of lading or goods receipt"));
-  if (r.escrow?.state === "RELEASED") evs.push(ev("Escrow released to the supplier", "done", txLink(r.escrow, r.escrow.releaseTx)));
-  if (r.escrow?.state === "REFUNDED") evs.push(ev("Escrow refunded to the company", "done", txLink(r.escrow, r.escrow.refundTx)));
-  evs.push(ev("Sent", ["EXECUTING", "COMPLETED", "FAILED"].includes(s) ? "done" : ["READY", "PAUSED"].includes(s) ? "now" : "", r.transferId ? `<span class="mono">${esc(r.transferId)}</span>` : ""));
-  evs.push(ev(s === "FAILED" ? "Needs attention" : "Completed", s === "COMPLETED" ? "done" : s === "FAILED" ? "bad" : s === "EXECUTING" ? "now" : "", r.proof ? `<a href="${esc(r.proof)}" target="_blank" rel="noopener">settlement proof ↗</a>` : ""));
-  const A = r.actions ?? {}, btn = (k, label, cls = "primary") => A[k]?.allowed ? `<button class="btn sm ${cls}" data-act="${k}">${label}</button>` : "";
-  const block = ME ? Object.entries(A).find(([k, v]) => !v.allowed && ["approve", "callback", "confirmDelivery"].includes(k) && !/not awaiting|no call-back|not waiting/.test(v.why ?? ""))?.[1]?.why : "Sign in to act on this payment.";
-  P.innerHTML = `${head("Payment tracking", `${r.payable} · ${r.supplier}`)}
-  <div class="duo wide-left"><div class="panel2"><div class="ctrl" style="margin:0 0 10px"><div>${pill(statusKind(s), statusText(s))} <span class="small muted">${esc(nextStep(r))}</span></div><span class="small muted mono">${esc(r.id)}</span></div>
-      ${state(r)}${r.timing?.deadlineUtc ? `<p class="note">Recipient deadline: <b>${esc(when(r.timing.deadlineUtc))}</b> · Start by ${esc(when(r.timing.latestStartUtc))} · Arrival evidence: ${esc(r.deadlineStatus ?? "Awaiting dispatch")}</p>` : ""}<div class="tl">${evs.join("")}</div>
-      <div class="actions">${btn("callback", "Record call-back")}${btn("approve", "Approve")}${btn("confirmDelivery", "Confirm delivery")}${btn("recheck", "Re-check and release")}${btn("refund", "Refund escrow", "")}${btn("reject", "Reject", "danger")}
-        ${block && !["COMPLETED", "EXECUTING", "READY", "REJECTED", "REFUNDED", "FAILED"].includes(s) ? `<span class="why2">${esc(block)}</span>` : ""}</div><div id="act-form"></div></div>
-    <div class="panel2"><span class="label accent">Payment details</span><h2 style="margin:6px 0">${usd(r.debitUsd, 2)}</h2><div class="small muted">${money(`${r.amount} ${r.ccy}`)} to ${esc(r.supplier)} · ${esc(RAIL[r.provider] ?? r.provider)}</div>
-      <div class="grid2x" style="margin-top:12px"><div class="kv2"><div class="k">SUPPLIER RECEIVES</div><div class="v">${money(r.recipientGets)}</div></div><div class="kv2"><div class="k">ESTIMATED ARRIVAL</div><div class="v">${when(r.arrivalUtc)}</div></div>
-        <div class="kv2"><div class="k">PURPOSE</div><div class="v">${esc(r.purpose ?? "-")}</div></div><div class="kv2"><div class="k">MESSAGE</div><div class="v"><a href="/ui/requests/${esc(r.id)}/iso20022" download>pain.001 ↓</a></div></div></div>
-      ${r.condition ? `<div class="alert info"><b>Release condition</b>: ${esc(r.condition.proof.evidence.replaceAll("_", " "))}, confirmed by someone other than the preparer; haltable by ${esc(r.condition.haltableBy.join(" or "))}. ${r.escrow?.state === "LOCKED" || r.escrow?.state === "RELEASED" ? "Enforced on-chain by the escrow contract." : "Enforced by Route402 before sending."}</div>` : ""}
-      <details class="sources" style="margin-top:10px"><summary>Why the agent chose this route</summary><ul>${(r.agentReasons ?? []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details></div></div>${foot()}`;
-  $$("[data-act]").forEach((x) => x.onclick = () => act(r, x.dataset.act, P));
-  if (["READY", "EXECUTING"].includes(s) || r.escrow?.state === "LOCKING") POLL = setTimeout(route, 2500);
-}
+// ------------------------------------------------------------------ tracking -> pageTracking / pageApprove in screens.js (Figma "Payment tracking", "Review & approve")
 const txLink = (e, tx) => (e.explorer && tx ? `<a href="${esc(e.explorer.replace(/0x[0-9a-f]+$/i, tx))}" target="_blank" rel="noopener">${esc(tx.slice(0, 12))}… ↗</a>` : `<span class="mono">${esc((tx ?? "").slice(0, 14))}…</span>`);
-function state(r) {   // Figma supporting states, shown when they apply
-  if (r.status === "PAUSED") return `<div class="alert warn"><b>Paused by your safety policy.</b> ${esc(r.note ?? "")}</div>`;
-  if (r.status === "FAILED") return `<div class="alert bad"><b>Check ${esc(r.payable)} / ${esc(r.transferId ?? r.id)} before any retry.</b> ${esc(r.note ?? "")} If the status is uncertain, do not submit again: a new request for this bill is blocked until this one is resolved.</div>`;
-  if (r.status === "REFUNDED") return `<div class="alert info">${esc(r.note ?? "Refunded.")}</div>`;
-  if (r.note) return `<div class="alert info">${esc(r.note)}</div>`;
-  if (r.detailsChanged && !r.callback) return `<div class="alert warn">${esc(r.detailsNote ?? "Bank details changed since the last payment.")} Call on a number from your vendor master, not one from the change request.</div>`;
-  return "";
-}
+
 async function act(r, kind, P) {
   if (!ME) return signIn(route);
   const f = $("#act-form"), send = async (p, body) => { try { await api(`/requests/${r.id}/${p}`, body); await route(); } catch (e) { f.innerHTML = `<div class="alert bad">${esc(e.message)}</div>`; } };
@@ -458,69 +358,7 @@ async function act(r, kind, P) {
   if (kind === "reject") form([["why", "Reason"]], "Reject payment", "reject", () => ({ why: $("#f-why").value }), "danger");
 }
 
-// ------------------------------------------------------------------ suppliers
-let SUPF = { q: "", ccy: "", status: "" };
-function pageSuppliers(P) {
-  if (STATE.suppliers) return pageSupplierDirectory(P);
-  const bills = STATE.bills, ccys = [...new Set(bills.map((b) => b.ccy))];
-  const list = bills.filter((b) => (!SUPF.q || `${b.supplier} ${b.id} ${COUNTRY[b.country] ?? b.country}`.toLowerCase().includes(SUPF.q.toLowerCase()))
-    && (!SUPF.ccy || b.ccy === SUPF.ccy) && (!SUPF.status || (SUPF.status === "ok" ? b.check === "OK" : b.check !== "OK")));
-  P.innerHTML = `${head("Suppliers", "Bank details are checked before every payment and compared with the last details you paid.")}
-  <div class="stats4">${[["Suppliers", bills.length], ["Verified", bills.filter((b) => b.check === "OK").length], ["Need attention", bills.filter((b) => b.check !== "OK").length], ["Accept USDC", bills.filter((b) => b.acceptsUsdc).length]]
-    .map(([k, v]) => `<div><div class="label">${k}</div><div class="big" style="font-size:30px">${v}</div></div>`).join("")}</div>
-  <div class="panel2"><span class="label accent">Your supplier directory</span>
-    <div class="filters"><input class="search" id="sq" style="margin:0;max-width:320px" placeholder="Search suppliers" value="${esc(SUPF.q)}" />
-      ${["", ...ccys].map((c) => `<button data-ccy="${c}" class="${SUPF.ccy === c ? "on" : ""}">${c ? `Currency · ${c}` : "All currencies"}</button>`).join("")}
-      ${[["", "Any status"], ["ok", "Verified"], ["attn", "Needs attention"]].map(([k, t]) => `<button data-st="${k}" class="${SUPF.status === k ? "on" : ""}">${t}</button>`).join("")}</div>
-    ${list.length ? `<div class="scroll"><table class="tbl"><thead><tr><th>Supplier</th><th>Country</th><th>Paid in</th><th>Check</th><th>Open bill</th></tr></thead><tbody>
-      ${list.map((b) => `<tr class="click" data-go="#/suppliers/${b.id}"><td><b>${esc(b.supplier)}</b><div class="note">${esc(b.id)}</div></td><td>${esc(COUNTRY[b.country] ?? b.country)}</td><td>${esc(b.ccy)}${b.acceptsUsdc ? `<div class="note">accepts USDC</div>` : ""}</td><td>${checkPill(b)}</td><td>${money(`${b.amount} ${b.ccy}`)}<div class="note">due ${day(b.dueUtc)}</div></td></tr>`).join("")}</tbody></table></div>`
-      : `<div class="state"><h2>Nothing matches these filters</h2><p>Try another search or clear the filters. Your ${bills.length} saved suppliers have not been removed.</p><div class="actions"><button class="btn primary" id="clear">Clear filters</button></div><p class="note">0 results</p></div>`}</div>${foot()}`;
-  $("#sq").addEventListener("change", (e) => { SUPF.q = e.target.value; pageSuppliers(P); });
-  $$("[data-ccy]").forEach((x) => x.onclick = () => { SUPF.ccy = x.dataset.ccy; pageSuppliers(P); });
-  $$("[data-st]").forEach((x) => x.onclick = () => { SUPF.status = x.dataset.st; pageSuppliers(P); });
-  $("#clear")?.addEventListener("click", () => { SUPF = { q: "", ccy: "", status: "" }; pageSuppliers(P); });
-  $$("[data-go]").forEach((tr) => tr.onclick = () => (location.hash = tr.dataset.go));
-}
-function pageSupplier(P, id) {
-  const supplier = STATE.suppliers?.find((s) => s.id === id);
-  if (supplier) {
-    P.innerHTML = `${head(supplier.name, `${COUNTRY[supplier.country] ?? supplier.country} · ${supplier.currencies.join(", ")}`)}
-      <div class="panel2"><h2>Supplier profile</h2><p>${esc(supplier.maskedAccount)} · ${esc(supplier.check)}</p>
-      <p>${esc(supplier.issues.join("; ") || "Receiving details passed format checks.")}</p>
-      <p>${supplier.billIds.length} linked invoice(s).</p><div class="actions"><a class="btn" href="#/suppliers">All suppliers</a><button class="btn primary" id="ask-about-supplier">Plan a payment in chat</button></div></div>`;
-    $("#ask-about-supplier").onclick = () => { CHAT_INPUT = `Send an amount to ${supplier.name}`; location.hash = "#/chat"; }; return;
-  }
-  const b = billOf(id); if (!b) { location.hash = "#/suppliers"; return; }
-  const reqs = REQS.filter((r) => r.supplier === b.supplier || r.payable === b.id), tx = STATE.transfers.filter((t) => t.supplier === b.supplier || t.reference === b.id);
-  P.innerHTML = `${head(b.supplier, `${COUNTRY[b.country] ?? b.country} · paid in ${b.ccy}`)}
-  <div class="actions" style="margin-bottom:14px"><a class="btn" href="#/suppliers">← All suppliers</a></div>
-  <div class="duo"><div class="panel2"><span class="label accent">Supplier profile</span><div class="top" style="display:flex;gap:12px;align-items:center;margin:10px 0"><span class="mono-chip">${esc(b.country)}</span><div><h2>${esc(b.supplier)}</h2><div class="small muted">${esc(COUNTRY[b.country] ?? b.country)}</div></div></div>
-      <div class="grid2x"><div class="kv2"><div class="k">PRE-SEND CHECK</div><div class="v">${checkPill(b)}</div></div><div class="kv2"><div class="k">ACCEPTS USDC</div><div class="v">${b.acceptsUsdc ? "Yes · 24/7, no intermediary banks" : "No · paid through your bank"}</div></div>
-        <div class="kv2"><div class="k">RECORD COMPLETE FOR ALL RAILS</div><div class="v">${b.ready?.complete ? "Yes" : `Missing: ${esc((b.ready?.missing ?? []).join(", "))}`}</div></div><div class="kv2"><div class="k">ROUTE IN THE PLAN</div><div class="v">${esc(b.plan ?? "-")}</div></div></div>
-      ${b.issues.length ? `<div class="alert ${b.check === "BLOCK" ? "bad" : "warn"}">${b.issues.map(esc).join("<br>")}</div>` : `<p class="note" style="margin-top:10px">Account format and checksum pass; details match the last payment.</p>`}
-      ${b.detailsChanged ? `<div class="alert warn">Changed bank details are the most common setup for payment fraud against companies. Payments are held until someone other than the preparer calls the supplier on a number already on file.</div>` : ""}</div>
-    <div class="panel2"><span class="label accent">Supplier payment context</span><h2 style="margin:6px 0">Open bill</h2><div class="row2"><span>${esc(b.id)}</span><b>${money(`${b.amount} ${b.ccy}`)}</b></div><div class="row2"><span>Due</span><b>${dayY(b.dueUtc)}</b></div>
-      <div class="actions" style="margin-top:12px">${b.check === "BLOCK" ? `<span class="why2">Fix the bank details in your accounting system and re-import before paying.</span>` : reqFor(b.id) ? `<a class="btn" href="#/payments/${reqFor(b.id).id}">Track payment</a>` : `<a class="btn primary" href="#/payments/new?bill=${b.id}">Start payment</a>`}</div></div></div>
-  <div class="panel2 scroll"><span class="label accent">Recent transactions</span>${reqs.length || tx.length ? `<table class="tbl" style="margin-top:8px"><thead><tr><th>Reference</th><th>Debit</th><th>Status</th><th>When</th></tr></thead><tbody>
-    ${reqs.map((r) => `<tr class="click" data-go="#/payments/${r.id}"><td>${esc(r.payable)}<div class="note mono">${esc(r.id)}</div></td><td>${usd(r.debitUsd, 2)}</td><td>${pill(statusKind(r.status), statusText(r.status))}</td><td>${when(r.preparedAt)}</td></tr>`).join("")}
-    ${tx.filter((t) => !reqs.some((r) => r.transferId === t.transferId)).map((t) => `<tr><td>${esc(t.reference ?? "-")}<div class="note mono">${esc(t.transferId)}</div></td><td>${money(t.debit)}</td><td>${pill(t.status === "COMPLETED" ? "ok" : "warn", t.status)}</td><td>-</td></tr>`).join("")}</tbody></table>`
-    : `<p class="muted" style="margin-top:8px">No payments to this supplier yet.</p>`}</div>${foot()}`;
-  $$("[data-go]").forEach((tr) => tr.onclick = () => (location.hash = tr.dataset.go));
-}
-
-function pageSupplierDirectory(P) {
-  const suppliers = STATE.suppliers, ccys = [...new Set(suppliers.flatMap((s) => s.currencies))];
-  const rows = suppliers.filter((s) => (!SUPF.q || `${s.name} ${s.country}`.toLowerCase().includes(SUPF.q.toLowerCase()))
-    && (!SUPF.ccy || s.currencies.includes(SUPF.ccy)) && (!SUPF.status || (SUPF.status === "ok" ? s.check === "OK" : s.check !== "OK")));
-  P.innerHTML = `${head("Suppliers", "Your saved supplier companies, including suppliers without open invoices.")}
-    <div class="panel2"><div class="actions"><input class="search" id="directory-search" placeholder="Search supplier companies" value="${esc(SUPF.q)}"/>
-    <button class="btn primary" id="directory-add">Add supplier in chat</button></div><div class="filters">${["", ...ccys].map((ccy) => `<button data-directory-ccy="${ccy}" class="${SUPF.ccy === ccy ? "on" : ""}">${ccy || "All currencies"}</button>`).join("")}</div>
-    <div class="scroll"><table class="tbl"><thead><tr><th>Company</th><th>Country</th><th>Currencies</th><th>Receiving details</th><th>Invoices</th></tr></thead><tbody>
-    ${rows.map((s) => `<tr class="click" data-go="#/suppliers/${esc(s.id)}"><td>${esc(s.name)}</td><td>${esc(COUNTRY[s.country] ?? s.country)}</td><td>${esc(s.currencies.join(", "))}</td><td>${esc(s.check)} · ${esc(s.maskedAccount)}</td><td>${s.billIds.length}</td></tr>`).join("") || '<tr><td colspan="5">No suppliers match.</td></tr>'}</tbody></table></div></div>${foot()}`;
-  $("#directory-search").onchange = (e) => { SUPF.q = e.target.value; pageSupplierDirectory(P); };
-  $$("[data-directory-ccy]").forEach((b) => b.onclick = () => { SUPF.ccy = b.dataset.directoryCcy; pageSupplierDirectory(P); });
-  $("#directory-add").onclick = () => { CHAT_INPUT = "Add a supplier"; location.hash = "#/chat"; };
-}
+// ------------------------------------------------------------------ suppliers -> pageSuppliers in screens.js (Figma "Recipients")
 
 // ------------------------------------------------------------------ activity
 async function pageActivity(P) {

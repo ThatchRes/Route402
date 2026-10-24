@@ -27,7 +27,7 @@ import { executionPolicy, planForDispatch } from "./dispatch.js";
 import { confirmSupplier, conversationView, ConversationConflict } from "../assistant/conversation.js";
 import { supplierDirectory } from "../company/suppliers.js";
 import { publicData, validateChatRequest } from "../assistant/safety.js";
-import { recordUiReview, trustedUiDecision } from "../assistant/reviews.js";
+import { recordUiReview, reviewedIntent, trustedUiDecision } from "../assistant/reviews.js";
 import { browserSecurity, browserRateLimit } from "./browserSecurity.js";
 
 const NOW = planningNow;
@@ -411,6 +411,25 @@ export function mountUi(app: express.Express, port: number) {
     res.json({ bill: { id: bill.id, supplier: bill.beneficiary.name, country: bill.beneficiary.country, ccy: bill.ccy, amount: bill.amount, dueUtc: due,
       maskedAccount: mask(bill.beneficiary), acceptsUsdc: !!bill.beneficiary.usdcWallet, mode: budget ? "budget" : "invoice", budgetUsd: budget ? Number(req.query.usd) : undefined },
       routes: [stablecoin, bankQ, tokenizedQuote()], ready: readiness(bill.beneficiary), sourceAccount: l.source.startsWith("Nessie") ? "Operating account (Capital One)" : "USD operating account (demo)" });
+  });
+
+  // Read-only priced terms of a quote the agents returned to this workspace, or one a payment request is bound to
+  // (Agent home proposal card, Review & approve). Never prices anything new: amounts, fees and rates come from the stored intent.
+  ui.get("/quotes/:intentId", async (req, res) => {
+    const id = String(req.params.intentId);
+    if (!reviewedIntent(process.env.AGENT_TENANT ?? "demo-tenant", id) && !Object.values(C.loadRequests()).some((r) => r.intentId === id))
+      return res.status(404).json({ error: "no current agent review for this quote" });
+    const it = await self("GET", `/v1/intents/${encodeURIComponent(id)}`).catch(() => null), d = it?.decision;
+    if (!d || d.status !== "OK") return res.status(404).json({ error: "quote not found on this router: ask again" });
+    const l = loadLinked(), ben = it.intent.beneficiary ?? {};
+    res.json({ intentId: id, capturedAt: it.createdAt, expiresAt: new Date(Date.parse(it.createdAt) + C.loadPolicy().quoteValidMinutes * 60e3).toISOString(),
+      sourceDebit: d.totals.sourceDebit, recipientNet: d.totals.recipientNet, arrivalUtc: d.totals.arrivalUtc, deadlineUtc: d.timing?.deadlineUtc ?? null,
+      amountType: it.intent.amountType, simulation: !!d.simulation, plan: d.plan, reference: it.intent.reference ?? null,
+      recipient: { name: ben.name ?? null, country: ben.country ?? null, ccy: it.intent.destCcy, maskedAccount: mask(ben) },
+      sourceAccount: l.source.startsWith("Nessie") ? "Operating account (Capital One)" : `${l.input.company.homeCcy} operating account (demo)`,
+      legs: d.allocations.map((a: any) => ({ label: a.label, routeId: a.routeId, arrivalUtc: a.arrivalUtc, sourceDebit: a.quote.sourceDebit.display,
+        fundingFee: a.quote.fundingFee.display, payoutFee: a.quote.payoutFee.display, funded: a.quote.funding.display, onrampRate: a.quote.funding.rate,
+        fxRate: a.quote.converted.rate, converted: a.quote.converted.display, recipientNet: a.quote.recipientNet.display })) });
   });
 
   // Agents for ONE payment (compare step): paid quotes from both providers + supplier screen, via the concierge's /review
