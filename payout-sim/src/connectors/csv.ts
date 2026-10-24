@@ -1,6 +1,6 @@
 // CSV import: how a company ports in data exported from its accounting system (QuickBooks, Xero, NetSuite...).
 // One row per payable (bill to pay) or receivable (money coming in). Header names are case-insensitive.
-//   type,id,counterparty,country,currency,amount,due_date,iban,account,swift,routing,discount_pct,discount_by,status
+//   type,id,counterparty,country,currency,amount,due_date,iban,account,swift,routing,discount_pct,discount_by,status[,usdc_wallet]
 import type { PaymentRunInput, RunPayable, RunReceivable } from "../company/paymentRun.js";
 import type { CompanyProfile } from "../company/profile.js";
 
@@ -26,7 +26,8 @@ export function importCsv(text: string, company: CompanyProfile, nowUtc: string)
     if (!/^\d+(\.\d+)?$/.test(amount) || !/^[A-Z]{3}$/.test(ccy)) { problems.push(`row ${i + 2}: bad amount or currency`); return; }
     if (type === "payable") payables.push({ id, ccy, amount, dueUtc: iso(col(r, "due_date")),
       beneficiary: { id: col(r, "counterparty"), name: col(r, "counterparty"), country: col(r, "country").toUpperCase(), currency: ccy,
-        iban: col(r, "iban") || undefined, accountNumber: col(r, "account") || undefined, swift: col(r, "swift") || undefined, routing: col(r, "routing") || undefined },
+        iban: col(r, "iban") || undefined, accountNumber: col(r, "account") || undefined, swift: col(r, "swift") || undefined, routing: col(r, "routing") || undefined,
+        usdcWallet: col(r, "usdc_wallet") || undefined },
       discountPct: col(r, "discount_pct") ? Number(col(r, "discount_pct")) : undefined, discountByUtc: col(r, "discount_by") ? iso(col(r, "discount_by")) : undefined });
     else if (type === "receivable") receivables.push({ id, ccy, amount, dateUtc: iso(col(r, "due_date")),
       status: col(r, "status").toLowerCase() === "expected" ? "expected" : "confirmed" });

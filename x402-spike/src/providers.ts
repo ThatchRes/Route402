@@ -1,4 +1,5 @@
-// Three independent quote providers, each its own x402 seller with its OWN receiving wallet (port 8411-8413).
+// Two quote providers, each its own x402 seller with its OWN receiving wallet: our stablecoin rail (8411) and the
+// company's own bank (8413, priced from measured bank pricing and the bank's fee schedule).
 // The routing agent pays each one 0.001 test USDC per quote and then chooses between them.
 // Usage: npm run providers     (needs the router running: quotes are priced by its optimizer, per provider)
 import express from "express";

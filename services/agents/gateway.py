@@ -85,8 +85,9 @@ def payments_from_preview(r: dict) -> list:
         run = r.get("preview") or {}
         home = run.get("homeCcy", "USD")
         return [{"payable": l["payable"], "destCcy": l["ccy"], "amount": l["convertedAmount"], "deadlineUtc": l.get("deadlineUtc"),
-                 "beneficiary": l.get("beneficiary") or {"name": l["payable"], "country": "??"}}
-                for l in run.get("lines", []) if l.get("convertedAmount") and float(l["convertedAmount"]) > 0 and l.get("ccy") != home]
+                 "beneficiary": l.get("beneficiary") or {"name": l["payable"], "country": "??"}, "reference": l.get("reference") or l["payable"]}
+                for l in run.get("lines", []) if l.get("convertedAmount") and float(l["convertedAmount"]) > 0
+                and l.get("crossBorder", l.get("ccy") != home)]
     if r.get("template") == "send_to" and r.get("intent") and r.get("beneficiary"):
         it = r["intent"]
         return [{"payable": f"send:{r['beneficiary'].get('name', 'beneficiary')}", "destCcy": it["destCcy"], "amount": it["amount"],

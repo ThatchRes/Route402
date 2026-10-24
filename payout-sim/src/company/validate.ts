@@ -1,6 +1,8 @@
 // Beneficiary validation BEFORE sending: catches the details that cause returns (return fees, double FX, delays).
 // Format checks only; a production version adds account-name verification and sanctions screening via a provider.
-export interface Beneficiary { id: string; name: string; country: string; currency: string; iban?: string; swift?: string; accountNumber?: string; routing?: string }
+export interface Beneficiary { id: string; name: string; country: string; currency: string; iban?: string; swift?: string; accountNumber?: string; routing?: string;
+  usdcWallet?: string }   // supplier accepts USDC at this address (USD-invoiced suppliers)
+import { detailsChanged } from "./payees.js";
 const IBAN_OPTIONAL = new Set(["BR"]);   // IBAN exists but local account details are common
 
 const IBAN_LEN: Record<string, number> = { DE: 22, FR: 27, GB: 22, ES: 24, IT: 27, NL: 18, BE: 16, CH: 21, AT: 20, IE: 22, PT: 25, PL: 28, SE: 24,
@@ -45,5 +47,8 @@ export function validate(b: Beneficiary) {
     const d = b.routing.split("").map(Number), sum = 3 * (d[0] + d[3] + d[6]) + 7 * (d[1] + d[4] + d[7]) + (d[2] + d[5] + d[8]);
     if (sum % 10 !== 0) errors.push("US routing number checksum fails");
   }
-  return { beneficiary: b.id, status: errors.length ? "BLOCK" : warnings.length ? "REVIEW" : "OK", errors, warnings };
+  if (b.usdcWallet && !/^0x[0-9a-fA-F]{40}$/.test(b.usdcWallet)) errors.push("USDC wallet address is not a valid EVM address");
+  const changed = detailsChanged(b);
+  if (changed) warnings.push(changed);
+  return { beneficiary: b.id, status: errors.length ? "BLOCK" : warnings.length ? "REVIEW" : "OK", errors, warnings, detailsChanged: !!changed };
 }

@@ -21,9 +21,9 @@ export function printRun(r: any) {
     console.log(`    ${g.routing.label.padEnd(66)} ${g.routing.total}`);
     console.log(`    ${g.treasury.label}`); for (const [k, v] of Object.entries(g.treasury.items)) console.log(`      ${k.padEnd(64)} ${v}`);
     console.log(`    ${g.checks.label}`); for (const [k, v] of Object.entries(g.checks.items)) console.log(`      ${k.padEnd(64)} ${v}`);
-    console.log(`    ${"total".padEnd(66)} ${r.savings.total}   (${r.percent.savedOfFxVolume} of FX volume)`);
+    console.log(`    ${"total".padEnd(66)} ${r.savings.total}   (${r.percent.savedOfFxVolume} of cross-border volume)`);
     console.log(`\n  our fee ${r.ourFee} = ${r.feeRule}`);
-    console.log(`  company keeps ${r.companyKeeps}  (${r.percent.keptOfFxVolume} of FX volume; your bank's conversion cost was ${r.percent.bankCostOfFxVolume}, ours ${r.percent.ourCostOfFxVolume})\n  ${r.multiEntity}`);
+    console.log(`  company keeps ${r.companyKeeps}  (${r.percent.keptOfFxVolume} of cross-border volume; your bank's conversion cost was ${r.percent.bankCostOfFxVolume}, ours ${r.percent.ourCostOfFxVolume})\n  ${r.multiEntity}`);
   } else {
     console.log(`\n  savings this run:`);
     for (const [k, v] of Object.entries(r.savings)) console.log(`    ${k.padEnd(24)} ${v}`);
@@ -31,11 +31,11 @@ export function printRun(r: any) {
   }
   if (r.market) {
     console.log(`\n  market data (${r.market.mode}, loaded ${r.market.loadedAt.slice(0, 16)}Z)`);
-    for (const c of r.market.corridors) console.log(`    ${c.pair.padEnd(8)} mid ${String(c.mid).padEnd(11)} ${c.midSource.padEnd(42)} bank +${(c.bankMarkupBps / 100).toFixed(2)}%  partner rail ${c.partnerRail}`);
+    for (const c of r.market.corridors) console.log(`    ${c.pair.padEnd(8)} mid ${String(c.mid).padEnd(11)} ${c.midSource.padEnd(42)} bank +${(c.bankMarkupBps / 100).toFixed(2)}%  stablecoin: ${c.stablecoin}`);
     for (const c of r.market.corridors.filter((x: any) => !x.bankBasis.includes("Wise comparison"))) console.log(`      ${c.pair}: ${c.bankBasis}`);
     for (const n of r.market.notes) console.log(`    note: ${n}`);
     if (r.market.sources.length) console.log(`    sources: ${r.market.sources.join(" | ")}`);
-    console.log(`    measured: mid rates, bank baseline, partner rail price | synthetic: stablecoin rail costs (registry.ts) | payouts: simulated`);
+    console.log(`    measured: mid rates, bank FX markup | sourced: wire fee, USDC mint/redeem, network fees | local-coin conversion: venue quote only | payouts: simulated`);
   }
 }
 
@@ -48,13 +48,14 @@ export async function executeRun(r: any, company: CompanyProfile, onDone?: (line
     const res = await fetch(`${BASE}${p}`, { method: m, headers: { ...H, ...x }, body: b ? JSON.stringify(b) : undefined }); return res.json(); };
   const bank = company.currentBank;
   console.log("\n  executing converted payments (needs: npm run server, npm run router, x402 seller)");
-  console.log("    payout of the full amount: simulated payout partner | USDC-on-Base legs: real x402 settlement proof on Base Sepolia");
+  console.log("    payout of the full amount: simulated | USDC-on-Base legs: real x402 settlement proof on Base Sepolia");
   const paid = loadPaid(), retry = process.argv.includes("--retry-failed");
-  for (const l of r.lines.filter((x: any) => x.convertedAmount && Number(x.convertedAmount) > 0 && x.ccy !== r.homeCcy)) {
+  for (const l of r.lines.filter((x: any) => x.convertedAmount && Number(x.convertedAmount) > 0 && (x.crossBorder ?? x.ccy !== r.homeCcy))) {
     const key = `${company.companyId}:${l.payable}`, prev = paid[key];
     if (prev && ["COMPLETED", "EXECUTING"].includes(prev.status)) { console.log(`    ${l.payable.padEnd(18)} already ${prev.status.toLowerCase()} as ${prev.transferId}: skipped (no double payment)`); continue; }
     if (prev && !retry) { console.log(`    ${l.payable.padEnd(18)} previous attempt ${prev.transferId} is ${prev.status}: resolve it, then re-run with --retry-failed`); continue; }
     const d = decisions?.find((x) => x.payable === l.payable);
+    if (d?.decision === "review") { console.log(`    ${l.payable.padEnd(18)} NEEDS CALL-BACK: bank details changed. Verify and approve it in the workspace (Approvals); the CLI never sends it`); continue; }
     if (decisions && d?.decision !== "approve") { console.log(`    ${l.payable.padEnd(18)} HELD by routing agent: ${d?.reasons?.[0] ?? "no agent decision"} (not sent)`); continue; }
     let it: any = null, requoted = false;
     if (d?.intentId) {                                   // the exact plan the agent paid for, if its quote is still valid
@@ -62,7 +63,8 @@ export async function executeRun(r: any, company: CompanyProfile, onDone?: (line
       if (prevIt?.intentId && Date.now() - Date.parse(prevIt.createdAt) < 14 * 60e3) it = prevIt; else requoted = true;
     }
     it ??= await call("POST", "/v1/intents", { srcCcy: r.homeCcy, destCcy: l.ccy, amountType: "RECIPIENT_FIXED", amount: l.convertedAmount,
-      deadlineUtc: l.deadlineUtc, objective: "balanced", currentBank: { label: bank.label, fxMarkupBps: bank.fxMarkupBps, wireFeeUsd: bank.wireFeeUsd, businessDays: bank.businessDays, measured: bank.measured } });
+      deadlineUtc: l.deadlineUtc, objective: "balanced", currentBank: { label: bank.label, fxMarkupBps: bank.fxMarkupBps, wireFeeUsd: bank.wireFeeUsd, businessDays: bank.businessDays, measured: bank.measured },
+      beneficiary: l.beneficiary, beneficiaryAcceptsUsdc: !!l.beneficiary?.usdcWallet, reference: l.reference ?? l.payable });
     if (!it.intentId) { console.log(`    ${l.payable}: ${JSON.stringify(it).slice(0, 160)}`); continue; }
     if (requoted) console.log(`    ${l.payable.padEnd(18)} agent's quote expired: re-quoted at current rates`);
     const t = await call("POST", "/v1/transfers", { intentId: it.intentId }, { "idempotency-key": `run_${l.payable}_${it.intentId}` });

@@ -30,8 +30,8 @@ export const policyFlag = () => { const i = process.argv.indexOf("--policy"); re
 
 /** Payments that need conversion in a payment run (wallet-funded bills need no quote). */
 export function paymentsOf(run: any) {
-  return run.lines.filter((l: any) => l.convertedAmount && Number(l.convertedAmount) > 0 && l.ccy !== run.homeCcy)
-    .map((l: any) => ({ payable: l.payable, destCcy: l.ccy, amount: l.convertedAmount, deadlineUtc: l.deadlineUtc, beneficiary: l.beneficiary }));
+  return run.lines.filter((l: any) => l.convertedAmount && Number(l.convertedAmount) > 0 && (l.crossBorder ?? l.ccy !== run.homeCcy))
+    .map((l: any) => ({ payable: l.payable, destCcy: l.ccy, amount: l.convertedAmount, deadlineUtc: l.deadlineUtc, beneficiary: l.beneficiary, reference: l.reference ?? l.payable }));
 }
 
 export function printAgents(a: AgentAnswer) {
@@ -43,5 +43,5 @@ export function printAgents(a: AgentAnswer) {
     for (const r of d.reasons.slice(1)) console.log(`    ${"".padEnd(41)} ${r}`);
     for (const c of d.paidCalls ?? []) console.log(`    ${"".padEnd(41)} ${c.buyer} paid ${c.priceUsdc} test USDC for ${c.service}  ${c.mock ? "(MOCK)" : c.explorer}`);
   }
-  console.log(`    x402 pay-per-call: ${a.paidCalls.length} calls, ${a.spentUsdc} test USDC on Base Sepolia (agent wallet -> 3 quote providers + screening service)`);
+  console.log(`    x402 pay-per-call: ${a.paidCalls.length} calls, ${a.spentUsdc} test USDC on Base Sepolia (agent wallet -> stablecoin-rail and bank quote providers + screening service)`);
 }

@@ -18,7 +18,8 @@
     "company": "tsx src/company/cli.ts",
     "import": "tsx src/connectors/cli.ts",
     "ask": "tsx src/assistant/cli.ts",
-    "demo:reset": "tsx src/demoReset.ts"
+    "demo:reset": "tsx src/demoReset.ts",
+    "econ:test": "tsx src/econ.selftest.ts"
   },
   "dependencies": {
     "dotenv": "16.4.5",

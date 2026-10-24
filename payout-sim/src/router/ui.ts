@@ -1,0 +1,392 @@
+// Browser API for the demo frontend (served at /app). Mounted BEFORE the router's token check and accepted only from
+// this machine (loopback), so the page needs no secret. It reuses the router's own endpoints and the agents' concierge.
+import express from "express";
+import path from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { loadLinked, saveLinked } from "../assistant/linked.js";
+import { importFromNessie, seedDemo, writeBack } from "../connectors/nessieImport.js";
+import { loadMeta } from "../connectors/nessie.js";
+import { importCsv } from "../connectors/csv.js";
+import { runPaymentRun } from "../company/paymentRun.js";
+import { validate } from "../company/validate.js";
+import { loadPayees } from "../company/payees.js";
+import * as C from "../company/controls.js";
+import { DEMO_COMPANY } from "../company/profile.js";
+import { marketSummary } from "./market.js";
+import { SOURCES } from "./registry.js";
+import { load } from "./store.js";
+import { deliveryCondition, enforcementOn } from "../company/conditions.js";
+import { pain001, readiness } from "../company/iso20022.js";
+import { RAILS, TOKENIZED_NETWORKS, tokenizedQuote } from "./rails.js";
+import { usdcPeg, usdcInFlight, usdcRouteAllowed } from "./depeg.js";
+import { allInCost, fxRisk, sendBy, transitDays } from "../company/economics.js";
+import { midInfo, rateHistory } from "./market.js";
+
+const NOW = () => process.env.DEMO_NOW_UTC ?? "2026-10-26T14:00:00Z";
+const PAID = "data/executed.json";
+const loadPaid = (): Record<string, any> => (existsSync(PAID) ? JSON.parse(readFileSync(PAID, "utf8")) : {});
+const savePaid = (m: Record<string, any>) => { mkdirSync("data", { recursive: true }); writeFileSync(PAID, JSON.stringify(m, null, 2)); };
+
+const mask = (b: any) => { const a = String(b.iban ?? b.accountNumber ?? b.usdcWallet ?? "").replace(/\s+/g, ""); return a ? `${a.slice(0, 2)}•• •••• ${a.slice(-4)}` : "no account on file"; };
+
+export function mountUi(app: express.Express, port: number) {
+  const self = async (method: string, p: string, body?: any, extra: Record<string, string> = {}) => {
+    const r = await fetch(`http://127.0.0.1:${port}${p}`, { method, body: body ? JSON.stringify(body) : undefined,
+      headers: { "content-type": "application/json", authorization: `Bearer ${process.env.ROUTER_TOKEN ?? "dev-token"}`, ...extra } });
+    return r.json();
+  };
+  // Release-on-delivery escrow service (x402-spike: npm run escrow), internal token like the agent wallet
+  const esc = async (method: string, p: string, body?: any) => {
+    const r = await fetch(`${process.env.ESCROW_URL ?? "http://127.0.0.1:8416"}${p}`, { method, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(180_000),
+      headers: { "content-type": "application/json", authorization: `Bearer ${process.env.X402_INTERNAL_TOKEN ?? ""}` } });
+    const j: any = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error ?? `escrow HTTP ${r.status}`); return j;
+  };
+  const local = (req: express.Request, res: express.Response, next: express.NextFunction) =>
+    ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "") ? next() : res.status(403).json({ error: "local only" });
+
+  app.use("/app", local, express.static(path.resolve("public")));
+  app.get("/", local, (_req, res) => res.redirect("/app/"));
+  const ui = express.Router();
+  ui.use(local);
+
+  // Everything the dashboard shows: connection, bills, checks, market data, sources, recent transfers
+  ui.get("/state", async (_req, res) => {
+    const l = loadLinked(), paid = loadPaid(), db = load(), pol = C.loadPolicy();
+    const run = runPaymentRun(l.input);
+    // FX risk on what is still to be bought in foreign currency (after paying from existing balances)
+    const H = l.input.company.homeCcy;
+    const exposures = run.lines.filter((x: any) => x.ccy && x.ccy !== H && Number(x.convertedAmount) > 0 && !paid[`${l.input.company.companyId}:${x.payable}`])
+      .map((x: any) => ({ ccy: x.ccy, amountUsd: Number(x.convertedAmount) / Number(midInfo(x.ccy).rate), dueUtc: x.deadlineUtc }));
+    const [peg, escrow] = await Promise.all([usdcPeg(pol), esc("GET", "/escrow/status").catch((e) => ({ ready: false, note: `escrow service not reachable (${e.cause?.code ?? e.message})` }))]);
+    const bills = l.input.payables.map((p) => {
+      const v = validate(p.beneficiary), line = run.lines.find((x: any) => x.payable === p.id);
+      return { id: p.id, supplier: p.beneficiary.name, country: p.beneficiary.country, ccy: p.ccy, amount: p.amount, dueUtc: p.dueUtc,
+        acceptsUsdc: !!p.beneficiary.usdcWallet, ready: readiness(p.beneficiary), check: v.status, issues: [...v.errors, ...v.warnings], detailsChanged: (v as any).detailsChanged,
+        plan: line?.status ? "blocked" : line?.route ?? null, fromWallet: line?.fromWallet, paid: paid[`${l.input.company.companyId}:${p.id}`] ?? null };
+    });
+    res.json({ connected: !l.source.startsWith("demo company"), source: l.source, linkedAt: l.linkedAt, usdAvailable: l.usdAvailable,
+      company: l.input.company.name, bills, receivables: l.input.receivables, run, market: marketSummary(), sources: SOURCES,
+      payeesOnFile: Object.keys(loadPayees()).length, rails: RAILS, tokenizedNetworks: TOKENIZED_NETWORKS, policy: pol,
+      fxRisk: fxRisk(exposures, rateHistory(), Date.now(), pol.fxRiskLimitUsd), costOfCashPct: l.input.company.costOfCashPct,
+      usdc: { peg, inFlightUsd: usdcInFlight(), capUsd: pol.issuerCapUsd }, escrow,
+      transfers: Object.values(db.transfers).slice(-20).reverse().map((t: any) => ({ transferId: t.transferId, status: t.status,
+        reference: t.terms.intent.reference, supplier: t.terms.intent.beneficiary?.name, debit: t.terms.totals.sourceDebit, credit: t.terms.totals.recipientNet })) });
+  });
+
+  // "Connect your bank": Capital One (Nessie sandbox) live, or an accounting export (CSV)
+  ui.post("/connect", async (req, res) => {
+    try {
+      const { provider, customerId, csv } = req.body ?? {};
+      if (provider === "nessie") {
+        let id = customerId || Object.keys(loadMeta()).find((k) => k.startsWith("customer:"))?.split(":")[1];
+        if (!id) id = (await seedDemo(false)).customerId;
+        const imp = await importFromNessie(id, DEMO_COMPANY, NOW());
+        saveLinked({ source: `Nessie customer ${id}`, linkedAt: new Date().toISOString(), usdAvailable: imp.usdAvailable, input: imp.input });
+        return res.json({ ok: true, source: `Capital One (Nessie) customer ${id}`, imported: imp.imported, usdAvailable: imp.usdAvailable });
+      }
+      if (provider === "csv" && typeof csv === "string") {
+        const imp = importCsv(csv, DEMO_COMPANY, NOW());
+        saveLinked({ source: "CSV upload", linkedAt: new Date().toISOString(), input: imp.input });
+        return res.json({ ok: true, source: "CSV upload", imported: imp.imported, problems: imp.problems });
+      }
+      res.status(400).json({ ok: false, error: "provider must be nessie or csv" });
+    } catch (e: any) { res.status(502).json({ ok: false, error: String(e.message ?? e).slice(0, 300) }); }
+  });
+
+  // Prompt -> the Fetch.ai concierge (agents buy quotes + screens with x402, then approve/hold)
+  ui.post("/ask", async (req, res) => {
+    try {
+      const r = await fetch(`${process.env.AGENT_GATEWAY_URL ?? "http://127.0.0.1:8100"}/ask`, { method: "POST", signal: AbortSignal.timeout(280_000),
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: String(req.body?.text ?? "").slice(0, 500), policy: req.body?.policy || undefined, tenantId: process.env.AGENT_TENANT ?? "demo-tenant",
+          correlationId: `ui-${Date.now().toString(36)}`, serviceToken: process.env.AGENT_SERVICE_TOKEN ?? process.env.ROUTER_TOKEN ?? "dev-token" }) });
+      res.json(await r.json());
+    } catch (e: any) { res.status(502).json({ status: "error", error: `agents not reachable (${e.cause?.code ?? e.message}): start workers.py and gateway.py` }); }
+  });
+
+  // ---------------------------------------------------------------- sign-in (demo users + one-time code)
+  const me = (req: express.Request) => C.sessionUser(req.headers.cookie);
+  const publicUser = (u?: C.User) => u && { id: u.id, name: u.name, title: u.title, roles: u.roles, approvalLimitUsd: u.approvalLimitUsd };
+  ui.get("/me", (req, res) => res.json({ user: publicUser(me(req)) ?? null, users: C.USERS.map(publicUser), policy: C.loadPolicy() }));
+  ui.post("/login/code", (req, res) => {
+    const u = C.user(req.body?.userId); if (!u) return res.status(400).json({ error: "unknown user" });
+    res.json({ sentTo: `${u.name}'s device`, demoCode: C.issueCode(u.id) });   // demo only: the code is shown on screen
+  });
+  ui.post("/login", (req, res) => {
+    const token = C.signIn(String(req.body?.userId), String(req.body?.code ?? ""));
+    if (!token) return res.status(401).json({ error: "code incorrect or expired" });
+    C.audit(req.body.userId, "sign_in", "-", "second factor verified");
+    res.setHeader("set-cookie", `r402=${token}; HttpOnly; SameSite=Strict; Path=/`); res.json({ user: publicUser(C.user(req.body.userId)) });
+  });
+  ui.post("/logout", (req, res) => { C.signOut(req.headers.cookie); res.setHeader("set-cookie", "r402=; Max-Age=0; Path=/"); res.json({ ok: true }); });
+  const need = (req: express.Request, res: express.Response) => { const u = me(req); if (!u) res.status(401).json({ error: "sign in first" }); return u; };
+
+  ui.post("/policy", (req, res) => {
+    const u = need(req, res); if (!u) return;
+    if (!C.can(u, "admin")) return res.status(403).json({ error: "admin only" });
+    const p = { ...C.loadPolicy(), ...req.body }, before = C.loadPolicy();
+    p.dualApprovalOverUsd = Math.max(0, Number(p.dualApprovalOverUsd)); p.requoteTolerancePct = Math.max(0, Number(p.requoteTolerancePct));
+    p.requireCallbackOnDetailsChange = !!p.requireCallbackOnDetailsChange; p.quoteValidMinutes = Math.min(14, Math.max(0, Number(p.quoteValidMinutes)));
+    p.depegBandPct = Math.min(5, Math.max(0.01, Number(p.depegBandPct))); p.depegFailClosed = p.depegFailClosed !== false;
+    p.issuerCapUsd = Math.max(0, Number(p.issuerCapUsd)); p.escrowDeadlineDays = Math.min(180, Math.max(0.0001, Number(p.escrowDeadlineDays)));
+    p.fxRiskLimitUsd = Math.max(0, Number(p.fxRiskLimitUsd)); C.savePolicy(p);
+    C.audit(u.id, "policy_changed", "policy", `${JSON.stringify(before)} -> ${JSON.stringify(p)}`); res.json(p);
+  });
+
+  // ---------------------------------------------------------------- payment requests: prepare -> verify -> approve -> release
+  const view = (r: C.PaymentRequest, u?: C.User) => { const p = C.loadPolicy(), n = C.nextActions(r, u, p);
+    return { ...r, status: n.status, approvalsRequired: C.approvalsRequired(r, p), actions: n.actions }; };
+  ui.get("/requests", (req, res) => { const u = me(req); res.json(Object.values(C.loadRequests()).reverse().map((r) => view(r, u))); });
+
+  // The preparer turns the agent's paid plan into payment requests. Nothing moves until the company's controls are met.
+  ui.post("/requests", async (req, res) => {
+    const u = need(req, res); if (!u) return;
+    if (!C.can(u, "preparer")) return res.status(403).json({ error: "your role cannot prepare payments" });
+    if (!req.body?.confirmed) return res.status(400).json({ error: "confirm that you checked the supplier, invoice, fees and delivery estimate" });
+    const l = loadLinked(), co = l.input.company, paid = loadPaid(), reqs = C.loadRequests(), out: any[] = [];
+    const onDelivery = new Set<string>(req.body?.releaseOnDelivery ?? []);
+    for (const d of (req.body?.decisions ?? []) as any[]) {
+      if (!["approve", "review"].includes(d.decision) || !d.intentId) { out.push({ payable: d.payable, skipped: "held by the routing agent" }); continue; }
+      const prev = paid[`${co.companyId}:${d.payable}`];
+      if (prev && ["COMPLETED", "EXECUTING"].includes(prev.status)) { out.push({ payable: d.payable, skipped: `already ${prev.status.toLowerCase()}` }); continue; }
+      if (Object.values(reqs).some((r) => r.payable === d.payable && !["REJECTED", "FAILED"].includes(r.status))) { out.push({ payable: d.payable, skipped: "already has an open payment request" }); continue; }
+      const it = await self("GET", `/v1/intents/${d.intentId}`);
+      if (!it?.intentId) { out.push({ payable: d.payable, skipped: "quote not found on this router: ask again" }); continue; }
+      const bill = l.input.payables.find((p) => p.id === d.payable), v: any = bill ? validate(bill.beneficiary) : { warnings: [] };
+      const r: C.PaymentRequest = { id: C.newRequestId(), payable: d.payable, supplier: it.intent.beneficiary?.name ?? bill?.beneficiary.name ?? d.payable,
+        country: bill?.beneficiary.country ?? "-", ccy: it.intent.destCcy, amount: it.intent.amount, reference: it.intent.reference ?? d.payable,
+        intentId: d.intentId, provider: d.chosen, route: (d.routeIds ?? []).join("+"), debitUsd: Number(String(it.decision.totals.sourceDebit).split(" ")[0]),
+        recipientGets: it.decision.totals.recipientNet, arrivalUtc: it.decision.totals.arrivalUtc, agentReasons: (d.reasons ?? []).filter((x: string) => !x.startsWith("compared:")).slice(0, 4),
+        preparedBy: u.id, preparedAt: new Date().toISOString(), detailsChanged: !!v.detailsChanged || d.decision === "review",
+        detailsNote: v.warnings?.find((w: string) => w.includes("changed")), approvals: [], releaseOnDelivery: onDelivery.has(d.payable), status: "AWAITING_APPROVAL",
+        condition: onDelivery.has(d.payable) ? deliveryCondition(u.id, u.roles[0]) : undefined, msgId: `R402-${Date.now().toString(36).toUpperCase()}-${d.payable}`.slice(0, 35),
+        purpose: String(req.body?.purpose ?? "").slice(0, 120) || "Invoice payment", mode: req.body?.mode === "budget" ? "budget" : "invoice",
+        checkedBy: req.body?.confirmed ? { userId: u.id, at: new Date().toISOString() } : undefined };
+      r.status = C.computeStatus(r, C.loadPolicy()); reqs[r.id] = r;
+      C.audit(u.id, "prepared", r.id, `${r.payable} ${r.amount} ${r.ccy} to ${r.supplier} via ${r.provider} (${it.decision.totals.sourceDebit}); agent plan ${r.intentId}${r.releaseOnDelivery ? "; release on delivery" : ""}`);
+      out.push({ payable: d.payable, requestId: r.id, status: r.status });
+    }
+    C.saveRequests(reqs); res.json({ requests: out });
+  });
+
+  const act = (fn: (r: C.PaymentRequest, u: C.User, body: any) => string | null) => async (req: express.Request, res: express.Response) => {
+    const u = need(req, res); if (!u) return;
+    const reqs = C.loadRequests(), r = reqs[String(req.params.id)]; if (!r) return res.status(404).json({ error: "no such request" });
+    const err = fn(r, u, req.body ?? {}); if (err) return res.status(403).json({ error: err });
+    r.status = C.computeStatus(r, C.loadPolicy()); reqs[r.id] = r; C.saveRequests(reqs);
+    if (r.status === "READY") release(r.id);
+    if (r.status === "AWAITING_DELIVERY" && !r.escrow && needsEscrow(r)) lockEscrow(r.id);
+    res.json(view(r, u));
+  };
+  const allowed = (r: C.PaymentRequest, u: C.User, a: string) => (C.nextActions(r, u, C.loadPolicy()).actions as any)[a];
+
+  // Call-back verification: someone other than the preparer phones the supplier on a number ALREADY on file
+  ui.post("/requests/:id/callback", act((r, u, b) => {
+    const a = allowed(r, u, "callback"); if (!a.allowed) return a.why;
+    if (!b.phoneOnFile || !b.contact) return "record the number you dialled (from the vendor master) and who confirmed";
+    r.callback = { by: u.id, at: new Date().toISOString(), phoneOnFile: String(b.phoneOnFile).slice(0, 40), contact: String(b.contact).slice(0, 80), outcome: "confirmed" };
+    C.audit(u.id, "callback_verified", r.id, `${r.supplier}: new bank details confirmed by ${r.callback.contact} on ${r.callback.phoneOnFile}`); return null;
+  }));
+  ui.post("/requests/:id/approve", act((r, u) => {
+    const a = allowed(r, u, "approve"); if (!a.allowed) return a.why;
+    r.approvals.push({ by: u.id, at: new Date().toISOString() });
+    C.audit(u.id, "approved", r.id, `approval ${r.approvals.length} of ${C.approvalsRequired(r, C.loadPolicy())} for ${r.debitUsd.toLocaleString()} USD`); return null;
+  }));
+  ui.post("/requests/:id/reject", act((r, u, b) => {
+    const a = allowed(r, u, "reject"); if (!a.allowed) return a.why;
+    r.rejected = { by: u.id, at: new Date().toISOString(), why: String(b.why ?? "").slice(0, 200) }; r.status = "REJECTED";
+    C.audit(u.id, "rejected", r.id, r.rejected.why); return null;
+  }));
+  // Release on delivery: funds are approved but held until receiving confirms the goods (bill of lading / goods receipt)
+  ui.post("/requests/:id/delivery", act((r, u, b) => {
+    const a = allowed(r, u, "confirmDelivery"); if (!a.allowed) return a.why;
+    if (!b.documentRef) return "enter the bill of lading or goods-receipt number";
+    r.delivery = { by: u.id, at: new Date().toISOString(), documentRef: String(b.documentRef).slice(0, 60) };
+    if (r.condition) r.condition.met = { ...r.delivery };
+    C.audit(u.id, "delivery_confirmed", r.id, `${r.delivery.documentRef}: release condition met`); return null;
+  }));
+
+  // A paused payment (stablecoin breaker, issuer cap, escrow not ready) can be re-checked by an approver
+  ui.post("/requests/:id/recheck", act((r, u) => {
+    const a = allowed(r, u, "recheck"); if (!a.allowed) return a.why;
+    r.status = "READY"; r.note = undefined; C.audit(u.id, "rechecked", r.id); return null;
+  }));
+  // Refund an unreleased escrow after its deadline (the contract refuses earlier)
+  ui.post("/requests/:id/refund", async (req, res) => {
+    const u = need(req, res); if (!u) return;
+    const r = C.loadRequests()[String(req.params.id)]; if (!r) return res.status(404).json({ error: "no such request" });
+    const a = allowed(r, u, "refund"); if (!a.allowed) return res.status(403).json({ error: a.why });
+    try {
+      const out = await esc("POST", "/escrow/refund", { requestId: r.id });
+      const all = C.loadRequests(), rr = all[r.id]; rr.escrow = { ...rr.escrow!, state: "REFUNDED", refundTx: out.refundTx, explorer: out.explorer ?? rr.escrow!.explorer };
+      rr.status = "REFUNDED"; rr.note = "delivery was not confirmed before the escrow deadline: the locked USDC went back to the company"; all[r.id] = rr; C.saveRequests(all);
+      C.audit(u.id, "escrow_refunded", r.id, `${out.refundTx}`); res.json(view(rr, u));
+    } catch (e: any) { res.status(502).json({ error: e.message }); }
+  });
+
+  // Escrow: only for release-on-delivery payments on the USDC rail to a supplier wallet
+  const walletOf = (r: C.PaymentRequest) => loadLinked().input.payables.find((p) => p.id === r.payable)?.beneficiary.usdcWallet;
+  const needsEscrow = (r: C.PaymentRequest) => r.releaseOnDelivery && r.provider === "stablecoin" && !!walletOf(r);
+  async function lockEscrow(id: string) {
+    const upd = (f: (x: C.PaymentRequest) => void) => { const all = C.loadRequests(); f(all[id]); C.saveRequests(all); return all[id]; };
+    const r = C.loadRequests()[id], pol = C.loadPolicy();
+    const g = await usdcRouteAllowed(r.debitUsd, id);
+    if (!g.ok) { upd((x) => { x.escrow = { chain: "-", contract: "-", lockId: "-", amountUsdc: 0, deadline: "-", state: "FAILED", error: g.reason };
+      x.note = `Escrow not locked: ${g.reason}. Release still waits for delivery under Route402's controls.`; }); C.audit("system", "escrow_blocked", id, g.reason!); return; }
+    const deadline = new Date(Date.now() + pol.escrowDeadlineDays * 86400e3).toISOString();
+    upd((x) => { x.escrow = { chain: "-", contract: "-", lockId: "-", amountUsdc: 0, deadline, state: "LOCKING" }; });
+    try {
+      const out = await esc("POST", "/escrow/lock", { requestId: id, payee: walletOf(r), deadlineUtc: deadline, condition: r.condition });
+      upd((x) => { x.escrow = { chain: out.chain, contract: out.contract, lockId: out.lockId, amountUsdc: out.amountUsdc, deadline, state: "LOCKED", lockTx: out.lockTx, explorer: out.explorer }; });
+      C.audit("system", "escrow_locked", id, `${out.amountUsdc} test USDC locked for the supplier until ${deadline.slice(0, 10)} on ${out.chain} (${out.lockTx}); condition hash ${out.onChain?.conditionHash?.slice(0, 18)}`);
+    } catch (e: any) {
+      upd((x) => { x.escrow = { ...x.escrow!, state: "FAILED", error: e.message }; x.note = `Escrow not locked (${e.message}). Release still waits for delivery under Route402's controls.`; });
+      C.audit("system", "escrow_failed", id, e.message);
+    }
+  }
+
+  // Release a fully approved request: on the agent's quoted plan if still valid; otherwise re-quote the SAME provider and,
+  // if the price moved more than the company's tolerance, send it back for approval instead of paying a different amount.
+  const releasing = new Set<string>();
+  async function release(id: string) {
+    if (releasing.has(id)) return; releasing.add(id);
+    try { await releaseOne(id); } finally { releasing.delete(id); }
+  }
+  async function releaseOne(id: string) {
+    const r = C.loadRequests()[id], pol = C.loadPolicy(); if (!r || r.status !== "READY") return;
+    // save only THIS request, re-reading the file first: other users may be acting on other requests meanwhile
+    const saveR = () => { const all = C.loadRequests(); all[id] = r; C.saveRequests(all); };
+    const l = loadLinked(), co = l.input.company, key = `${co.companyId}:${r.payable}`, paid = loadPaid();
+    if (paid[key] && ["COMPLETED", "EXECUTING"].includes(paid[key].status)) { r.status = "FAILED"; r.note = "already paid (double-payment protection)"; saveR(); return; }
+    const pause = (why: string) => { r.status = "PAUSED"; r.note = why; saveR(); C.audit("system", "paused", r.id, why); };
+    if (r.provider === "stablecoin") {
+      // depeg breaker always; issuer cap only if the money is not already sitting in escrow
+      const g = r.escrow?.state === "LOCKED" ? { ok: (await usdcPeg(pol)).status !== "paused", reason: (await usdcPeg(pol)).reason } : await usdcRouteAllowed(r.debitUsd, r.id);
+      if (!g.ok) return pause(`${g.reason ?? "USDC route paused"}. Nothing was sent; an approver can re-check when it clears.`);
+      if (r.escrow?.state === "LOCKING") return pause("The escrow lock is still confirming on-chain. Re-check in a moment.");
+      if (r.escrow?.state === "LOCKED") {
+        try {
+          const out = await esc("POST", "/escrow/release", { requestId: r.id, evidence: r.delivery?.documentRef ?? "" });
+          r.escrow = { ...r.escrow, state: "RELEASED", releaseTx: out.releaseTx, explorer: out.explorer ?? r.escrow.explorer }; saveR();
+          C.audit("system", "escrow_released", r.id, `released to the supplier on delivery ${r.delivery?.documentRef ?? ""} (${out.releaseTx})`);
+        } catch (e: any) { return pause(`Escrow release failed (${e.message}). Nothing else was sent.`); }
+      }
+    }
+    let intentId = r.intentId; const it = await self("GET", `/v1/intents/${intentId}`);
+    if (!it?.intentId || Date.now() - Date.parse(it.createdAt) > pol.quoteValidMinutes * 60e3) {
+      const { nowUtc, provider, ...body } = it?.intent ?? {};
+      const q = await self("POST", "/v1/provider-quote", { provider: provider ?? r.provider, ...body });
+      const newDebit = Number(String(q?.plan?.sourceDebit ?? "").split(" ")[0]);
+      if (!q?.intentId || !newDebit) { r.status = "AWAITING_APPROVAL"; r.approvals = []; r.note = "quote expired and could not be refreshed: approve again after a new quote"; saveR(); C.audit("system", "requote_failed", r.id); return; }
+      if (newDebit > r.debitUsd * (1 + pol.requoteTolerancePct / 100)) {
+        C.audit("system", "requote_outside_tolerance", r.id, `${r.debitUsd} -> ${newDebit} USD (tolerance ${pol.requoteTolerancePct}%): approvals reset`);
+        Object.assign(r, { intentId: q.intentId, debitUsd: newDebit, approvals: [], status: "AWAITING_APPROVAL", note: `price moved to ${newDebit.toLocaleString()} USD after the quote expired: approve again` });
+        saveR(); return;
+      }
+      C.audit("system", "requoted_within_tolerance", r.id, `${r.debitUsd} -> ${newDebit} USD`); intentId = q.intentId; r.intentId = intentId; r.debitUsd = newDebit;
+    }
+    const approvers = r.approvals.map((a) => C.user(a.by)?.name ?? a.by).join(" + "), approverIds = r.approvals.map((a) => a.by).join(":");
+    const t = await self("POST", "/v1/transfers", { intentId }, { "idempotency-key": `ui_${r.id}_${intentId}` });
+    await self("POST", `/v1/transfers/${t.transferId}/approvals`, { planVersion: t.planVersion, termsHash: t.termsHash, approver: approverIds });
+    await self("POST", `/v1/transfers/${t.transferId}/execute`, { planVersion: t.planVersion, termsHash: t.termsHash }, { "idempotency-key": `exec_${t.transferId}` });
+    paid[key] = { transferId: t.transferId, status: "EXECUTING", at: new Date().toISOString() }; savePaid(paid);
+    Object.assign(r, { status: "EXECUTING", transferId: t.transferId }); saveR();
+    C.audit("system", "sent", r.id, `${t.transferId}: terms ${t.termsHash?.slice(0, 16) ?? "-"} approved by ${approvers}`);
+    const meta = loadMeta(), cust = l.source.match(/Nessie customer (\S+)/)?.[1], opAcct = cust ? meta[`customer:${cust}`]?.operatingAccountId : undefined;
+    for (let i = 0; i < 150; i++) {
+      const st = await self("GET", `/v1/transfers/${t.transferId}`);
+      if (!["EXECUTING", "APPROVED"].includes(st.status)) {
+        const p2 = loadPaid(); p2[key] = { transferId: t.transferId, status: st.status, at: new Date().toISOString() }; savePaid(p2);
+        const all = C.loadRequests(), rr = all[id]; rr.status = st.status === "COMPLETED" ? "COMPLETED" : "FAILED";
+        rr.proof = Object.values<any>(st.steps ?? {}).find((x: any) => x.proofTx)?.explorer;
+        if (rr.status === "FAILED") { const bad = Object.entries<any>(st.steps ?? {}).find(([, v]) => v.status !== "CONFIRMED");
+          rr.note = `transfer ${st.status}${bad ? `: ${bad[0]} ${bad[1].status}${bad[1].detail ? ` (${String(bad[1].detail).split("\n")[0].slice(0, 140)})` : ""}` : ""}. Nothing was sent twice; resolve it, then re-run.`; }
+        all[id] = rr; C.saveRequests(all);
+        C.audit("system", st.status === "COMPLETED" ? "completed" : "needs_attention", id, `${t.transferId} ${st.status}${rr.proof ? ` proof ${rr.proof}` : ""}`);
+        if (st.status === "COMPLETED" && opAcct) await writeBack(opAcct, st.terms.totals.sourceDebit.split(" ")[0], t.transferId).catch(() => {});
+        return;
+      }
+      await new Promise((z) => setTimeout(z, 2000));
+    }
+  }
+
+  // ISO 20022 pain.001 for one payment request: the same instruction a wire or a tokenized-deposit network can take
+  ui.get("/requests/:id/iso20022", (req, res) => {
+    const r = C.loadRequests()[String(req.params.id)]; if (!r) return res.status(404).json({ error: "no such request" });
+    const l = loadLinked(), bill = l.input.payables.find((p) => p.id === r.payable);
+    if (!bill) return res.status(404).json({ error: "bill not found in the linked data" });
+    res.type("application/xml").setHeader("content-disposition", `attachment; filename="${r.msgId ?? r.id}.pain001.xml"`);
+    res.send(pain001({ msgId: r.msgId ?? r.id, createdAt: r.preparedAt, debtorName: l.input.company.name, debtorAccountRef: "OPERATING-ACCOUNT-ON-FILE",
+      executionDate: r.arrivalUtc, endToEndId: r.payable, amount: r.amount, ccy: r.ccy, beneficiary: bill.beneficiary, invoiceRef: r.payable,
+      condition: r.condition ? { kind: r.condition.kind, evidence: r.condition.proof.evidence } : null }));
+  });
+
+  // Rails and how a condition is enforced on each; tokenized networks with their sources
+  ui.get("/rails", (_req, res) => res.json({ rails: RAILS.map((x) => ({ ...x, condition: enforcementOn(x.id) })), networks: TOKENIZED_NETWORKS }));
+
+  // Route explorer for one bill: our rail and the company's bank, priced by the router (free, local), plus the tokenized
+  // rail's status. The agents' paid quotes (x402) replace these when an agent run has happened.
+  // Route comparison for one bill: our rail and the company's bank, priced by the router (free, local), the tokenized
+  // rail's status, and the economics per route. ?mode=budget&usd=10000 fixes what the company sends instead of the invoice.
+  ui.get("/routes/:payable", async (req, res) => {
+    const l = loadLinked(), bill = l.input.payables.find((p) => p.id === String(req.params.payable));
+    if (!bill) return res.status(404).json({ error: "no such bill" });
+    const co = l.input.company, bank = co.currentBank, budget = req.query.mode === "budget" && Number(req.query.usd) > 0;
+    const due = typeof req.query.due === "string" && !isNaN(Date.parse(req.query.due)) ? new Date(req.query.due).toISOString() : bill.dueUtc;
+    const body = { srcCcy: co.homeCcy, destCcy: bill.ccy, amountType: budget ? "SOURCE_FIXED" : "RECIPIENT_FIXED", amount: budget ? Number(req.query.usd).toFixed(2) : bill.amount,
+      objective: "cheapest", deadlineUtc: due, reference: bill.id, beneficiary: bill.beneficiary, beneficiaryAcceptsUsdc: !!bill.beneficiary.usdcWallet,
+      currentBank: { label: bank.label, fxMarkupBps: bank.fxMarkupBps, wireFeeUsd: bank.wireFeeUsd, businessDays: bank.businessDays, measured: bank.measured } };
+    const mid = Number(midInfo(bill.ccy).rate), now = Date.now();
+    const one = async (provider: string) => {
+      const q = await self("POST", "/v1/provider-quote", { provider, ...body });
+      if (q.status !== "OK") return { provider, status: "NO_QUOTE", reason: q.reason, peg: q.peg };
+      const it = await self("GET", `/v1/intents/${q.intentId}`), a = it.decision?.allocations?.[0]?.quote?.input ?? {};
+      const youPayUsd = Number(String(q.plan.sourceDebit).split(" ")[0]), getsDest = Number(String(q.plan.recipientNet).split(" ")[0]);
+      const transferUsd = Number(a.fundingFee ?? 0), payoutUsd = Number(a.payoutFee ?? 0) / (bill.ccy === "USD" ? 1 : mid);
+      const atMidUsd = getsDest / mid, days = transitDays(now, q.plan.arrivalUtc);
+      const econ = allInCost({ youPayUsd, atMidUsd, amountUsd: atMidUsd, costOfCashPct: co.costOfCashPct, days });
+      return { provider, status: "OK", intentId: q.intentId, youPay: q.plan.sourceDebit, supplierGets: q.plan.recipientNet, arrivalUtc: q.plan.arrivalUtc,
+        capturedAt: it.createdAt, expiresAt: new Date(Date.parse(it.createdAt) + C.loadPolicy().quoteValidMinutes * 60e3).toISOString(),
+        costVsMidBps: q.costVsMidBps?.plan, fxRate: a.fxRate, risk: q.risk, routeIds: q.plan.allocations.map((x: any) => x.routeId),
+        breakdown: { transferFeeUsd: transferUsd, payoutFeeUsd: payoutUsd, conversionCostUsd: Math.max(0, econ.pricedUsd - transferUsd - payoutUsd), convertedPrincipalUsd: youPayUsd - transferUsd },
+        economics: { ...econ, transitDays: days, sendBy: sendBy(due, days), meetsDeadline: Date.parse(q.plan.arrivalUtc) <= Date.parse(due), costOfCashPct: co.costOfCashPct } };
+    };
+    const [stablecoin, bankQ] = await Promise.all([one("stablecoin"), one("bank")]);
+    res.json({ bill: { id: bill.id, supplier: bill.beneficiary.name, country: bill.beneficiary.country, ccy: bill.ccy, amount: bill.amount, dueUtc: due,
+      maskedAccount: mask(bill.beneficiary), acceptsUsdc: !!bill.beneficiary.usdcWallet, mode: budget ? "budget" : "invoice", budgetUsd: budget ? Number(req.query.usd) : undefined },
+      routes: [stablecoin, bankQ, tokenizedQuote()], ready: readiness(bill.beneficiary), sourceAccount: l.source.startsWith("Nessie") ? "Operating account (Capital One)" : "USD operating account (demo)" });
+  });
+
+  // Agents for ONE payment (compare step): paid quotes from both providers + supplier screen, via the concierge's /review
+  ui.post("/review", async (req, res) => {
+    const l = loadLinked(), bill = l.input.payables.find((p) => p.id === String(req.body?.payable));
+    if (!bill) return res.status(404).json({ status: "error", error: "no such bill" });
+    const bank = l.input.company.currentBank, budget = req.body?.mode === "budget" && Number(req.body?.usd) > 0;
+    try {
+      const r = await fetch(`${process.env.AGENT_GATEWAY_URL ?? "http://127.0.0.1:8100"}/review`, { method: "POST", signal: AbortSignal.timeout(280_000),
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ tenantId: process.env.AGENT_TENANT ?? "demo-tenant", correlationId: `ui-${Date.now().toString(36)}`,
+          serviceToken: process.env.AGENT_SERVICE_TOKEN ?? process.env.ROUTER_TOKEN ?? "dev-token", homeCcy: l.input.company.homeCcy, policy: req.body?.policy || undefined,
+          currentBank: { label: bank.label, fxMarkupBps: bank.fxMarkupBps, wireFeeUsd: bank.wireFeeUsd, businessDays: bank.businessDays, measured: bank.measured },
+          payments: [{ payable: bill.id, destCcy: bill.ccy, amount: budget ? Number(req.body.usd).toFixed(2) : bill.amount, amountType: budget ? "SOURCE_FIXED" : "RECIPIENT_FIXED",
+            deadlineUtc: req.body?.due ?? bill.dueUtc, beneficiary: bill.beneficiary, reference: bill.id }] }) });
+      res.json(await r.json());
+    } catch (e: any) { res.status(502).json({ status: "error", error: `agents not reachable (${e.cause?.code ?? e.message}): start workers.py and gateway.py` }); }
+  });
+
+  ui.get("/audit", (_req, res) => res.json({ verify: C.verifyAudit(), entries: C.loadAudit().slice(-200).reverse() }));
+
+  ui.get("/transfers/:id", async (req, res) => {
+    const t = await self("GET", `/v1/transfers/${encodeURIComponent(String(req.params.id))}`);
+    if (t.status === "COMPLETED" || t.status === "NEEDS_RECONCILIATION") return res.json({ ...t, receipt: await self("GET", `/v1/transfers/${t.transferId}/receipt`) });
+    res.json(t);
+  });
+
+  ui.get("/calls", async (_req, res) => {
+    try {
+      const r = await fetch(`${process.env.AGENT_WALLET_URL ?? "http://localhost:8405"}/calls`, { headers: { authorization: `Bearer ${process.env.X402_INTERNAL_TOKEN ?? ""}` } });
+      res.json(await r.json());
+    } catch { res.json({ calls: [], note: "agent wallet not reachable" }); }
+  });
+  app.use("/ui", ui);
+}

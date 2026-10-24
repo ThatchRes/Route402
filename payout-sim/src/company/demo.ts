@@ -44,7 +44,10 @@ export const DEMO_RUN: PaymentRunInput = { company: DEMO_COMPANY, nowUtc: "2026-
     { id: "AP-MX-Proveedora", beneficiary: B("Proveedora SA", "MX", "MXN", { accountNumber: "012180012345678909" }), ccy: "MXN", amount: "3800000.00", dueUtc: "2026-11-04T20:00:00Z", discountPct: 1, discountByUtc: "2026-10-28T20:00:00Z" },
     { id: "AP-SG-Lion", beneficiary: B("Lion Components", "SG", "SGD", { accountNumber: "1234567890", swift: "DBSSSGSG" }), ccy: "SGD", amount: "120000.00", dueUtc: "2026-11-01T20:00:00Z" },
     { id: "AP-GB-Northwind", beneficiary: B("Northwind Ltd", "GB", "GBP", { iban: "GB82 WEST 1234 5698 7654 32" }), ccy: "GBP", amount: "85000.00", dueUtc: "2026-11-03T20:00:00Z" },
-    { id: "AP-US-contractor", beneficiary: B("A. Chen", "US", "USD", { routing: "011000016", accountNumber: "987654321" }), ccy: "USD", amount: "12000.00", dueUtc: "2026-10-31T20:00:00Z" }],
+    { id: "AP-US-contractor", beneficiary: B("A. Chen", "US", "USD", { routing: "011000016", accountNumber: "987654321" }), ccy: "USD", amount: "12000.00", dueUtc: "2026-10-31T20:00:00Z" },
+    // USD-invoiced suppliers abroad (common in Asian trade). One accepts USDC (wallet on file), one is bank-only.
+    { id: "AP-VN-Saigon", beneficiary: B("Saigon Textile Co", "VN", "USD", { accountNumber: "0071000123456", swift: "BFTVVNVX", usdcWallet: "0x8Ba1f109551bD432803012645Ac136ddd64DBA72" }), ccy: "USD", amount: "180000.00", dueUtc: "2026-10-29T20:00:00Z" },
+    { id: "AP-CN-Rongda", beneficiary: B("Shenzhen Rongda Electronics", "CN", "USD", { accountNumber: "4563518800123", swift: "BKCHCNBJ" }), ccy: "USD", amount: "95000.00", dueUtc: "2026-10-30T20:00:00Z" }],
   receivables: [
     { id: "AR-EU-1", ccy: "EUR", amount: "420000.00", dateUtc: "2026-10-27T10:00:00Z", status: "confirmed" },
     { id: "AR-EU-2", ccy: "EUR", amount: "310000.00", dateUtc: "2026-11-03T10:00:00Z", status: "confirmed" },

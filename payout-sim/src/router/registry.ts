@@ -1,4 +1,5 @@
-// SYNTHETIC routing catalog. Every number is a labeled demo assumption, not market data or a provider offer.
+// Routing catalog. Bank routes = the company's own bank only. Stablecoin rail = OUR rail, with sourced costs (SOURCES below).
+// MID_PER_USD is only the offline fallback table: live mid rates replace it at startup (market.ts).
 // Replace each entry with real provider quotes/capabilities when integrations exist (same shapes).
 
 /** Synthetic mid rates per 1 USD. Pairs not listed need explicit rates supplied with the intent. */
@@ -15,14 +16,12 @@ export interface BankProvider {
   id: string; label: string; fixedUsd: number; tiers: Tier[]; businessDays: number; sameDayBeforeUtcHour?: number;
   cutoffUtcHour: number; capacityUsd: number; dest: string[] | "*"; isBaseline?: boolean;
 }
+// Only the company's OWN bank. No third-party FX providers are routed to.
+// Fallback values when the company's bank terms are not set: wire fee = median outgoing international wire fee at US banks
+// ($45, NerdWallet survey of bank fee schedules); FX markup 120 bps = labeled assumption, replaced by measured data when live.
 export const BANKS: BankProvider[] = [
-  { id: "legacy_wire", label: "Correspondent wire (customer's current policy)", fixedUsd: 35, tiers: [{ upToUsd: Infinity, bps: 80 }],
+  { id: "legacy_wire", label: "Your bank (international wire)", fixedUsd: 45, tiers: [{ upToUsd: Infinity, bps: 120 }],
     businessDays: 2, cutoffUtcHour: 21, capacityUsd: Infinity, dest: "*", isBaseline: true },
-  { id: "negotiated_bank", label: "Negotiated bank FX", fixedUsd: 20,
-    tiers: [{ upToUsd: 100_000, bps: 45 }, { upToUsd: 1_000_000, bps: 30 }, { upToUsd: Infinity, bps: 20 }],
-    businessDays: 1, cutoffUtcHour: 20, capacityUsd: Infinity, dest: "*" },
-  { id: "local_rail_fx", label: "Local-rail FX partner", fixedUsd: 8, tiers: [{ upToUsd: Infinity, bps: 55 }],
-    businessDays: 1, sameDayBeforeUtcHour: 18, cutoffUtcHour: 18, capacityUsd: 250_000, dest: ["CAD", "EUR", "GBP", "MXN", "BRL", "INR", "PHP"] },
 ];
 
 // STABLECOIN CATALOG: fiat-reserved coins only (no algorithmic or synthetic-dollar designs). Issuer, peg,
@@ -59,84 +58,72 @@ export const TOKENS: Token[] = [
 /** Hard stability gate: a coin trading further than this from its peg is excluded entirely. */
 export const STABILITY = { maxPegDeviation: 0.001 };
 
-export interface Onramp { src: string; token: string; bps: number; fixedUsd: number; capacityUsd: number }
-// Fiat -> coin mints/purchases. Coins pegged to the source currency mint at par minus a small fee.
+// ---------------------------------------------------------------- OUR stablecoin rail (sourced; nothing invented)
+// Every number below has a source. Where a provider does not publish a price (USDC -> local-currency coin conversion),
+// the route is NOT priced: it needs a live venue quote (VENUE_QUOTES env, see venueQuote()) before it can be offered.
+export const SOURCES = {
+  circleMint: "Circle Mint: standard USDC redemption free up to $15M/day, 0.1% above (circle.com/blog/usdc-redemption-process-updated-to-expand-liquidity-worldwide)",
+  networkFees: "Spark, Stablecoin Transfer Cost Comparison by Chain (mid-2026): Base $0.005-0.01, Solana $0.001-0.005 normal congestion",
+  wireFee: "NerdWallet survey of US bank fee schedules: median outgoing international wire fee $45",
+  straitsx: "StraitsX business fee schedule: SGD FAST transfer out 1 XSGD; USDC/XSGD swap price not published",
+  juno: "Bitso/Juno docs: MXNB redemption to a bank account via SPEI, minimum 100 MXNB; fee not published",
+  circleFx: "Circle Mint cross-currency exchange USDC<->EURC: quotes valid 3 s; fee/spread not published",
+};
+
+export interface Onramp { src: string; token: string; bps: number; fixedUsd: number; capacityUsd: number; source: string }
+// USD -> USDC through Circle Mint: free up to $15M/day (redemption terms; minting has no published fee)
 export const ONRAMPS: Onramp[] = [
-  { src: "USD", token: "USDC", bps: 5, fixedUsd: 0, capacityUsd: 5_000_000 },
-  { src: "USD", token: "PYUSD", bps: 0, fixedUsd: 0, capacityUsd: 150_000 },
-  { src: "USD", token: "USDG", bps: 2, fixedUsd: 0, capacityUsd: 1_000_000 },
-  { src: "USD", token: "USDP", bps: 3, fixedUsd: 0, capacityUsd: 1_000_000 },
-  { src: "USD", token: "RLUSD", bps: 4, fixedUsd: 0, capacityUsd: 2_000_000 },
-  { src: "USD", token: "GUSD", bps: 5, fixedUsd: 0, capacityUsd: 500_000 },
-  { src: "EUR", token: "EURC", bps: 8, fixedUsd: 0, capacityUsd: 2_000_000 },
-  { src: "EUR", token: "EURCV", bps: 5, fixedUsd: 0, capacityUsd: 1_000_000 },
-  { src: "EUR", token: "EURE", bps: 0, fixedUsd: 0, capacityUsd: 500_000 },
-  { src: "EUR", token: "USDC", bps: 30, fixedUsd: 0, capacityUsd: 2_000_000 },
-  { src: "CAD", token: "QCAD", bps: 10, fixedUsd: 0, capacityUsd: 500_000 },
-  { src: "CAD", token: "USDC", bps: 25, fixedUsd: 0, capacityUsd: 1_000_000 },
-  { src: "GBP", token: "TGBP", bps: 10, fixedUsd: 0, capacityUsd: 500_000 },
-  { src: "GBP", token: "USDC", bps: 25, fixedUsd: 0, capacityUsd: 1_000_000 },
-  { src: "SGD", token: "XSGD", bps: 10, fixedUsd: 0, capacityUsd: 1_000_000 },
-  { src: "AUD", token: "AUDD", bps: 10, fixedUsd: 0, capacityUsd: 500_000 },
+  { src: "USD", token: "USDC", bps: 0, fixedUsd: 0, capacityUsd: 15_000_000, source: SOURCES.circleMint },
 ];
 
-/** Gas and finality per network (USD-equivalent, synthetic). */
+/** Network fee per transfer (upper end of "normal congestion", Spark mid-2026) and time to finality (minutes, labeled assumption). */
 export const NETWORK_COST: Record<string, { gasUsd: number; finalityMin: number }> = {
-  base: { gasUsd: 0.01, finalityMin: 2 }, solana: { gasUsd: 0.002, finalityMin: 1 }, ethereum: { gasUsd: 2.5, finalityMin: 6 },
-  polygon: { gasUsd: 0.02, finalityMin: 3 }, arbitrum: { gasUsd: 0.03, finalityMin: 2 }, stellar: { gasUsd: 0.001, finalityMin: 1 },
-  xrpl: { gasUsd: 0.001, finalityMin: 1 }, gnosis: { gasUsd: 0.01, finalityMin: 2 }, avalanche: { gasUsd: 0.05, finalityMin: 1 },
-  ronin: { gasUsd: 0.01, finalityMin: 1 },
+  base: { gasUsd: 0.01, finalityMin: 1 }, solana: { gasUsd: 0.005, finalityMin: 1 }, ethereum: { gasUsd: 5, finalityMin: 6 },
+  polygon: { gasUsd: 0.005, finalityMin: 2 }, arbitrum: { gasUsd: 0.05, finalityMin: 1 },
 };
 export interface Network { token: string; id: string; gasUsd: number; finalityMin: number; x402Executable?: boolean }
-export const NETWORKS: Network[] = TOKENS.flatMap((t) => t.networks.map((n) => ({ token: t.id, id: n, ...NETWORK_COST[n],
+export const NETWORKS: Network[] = TOKENS.flatMap((t) => t.networks.filter((n) => NETWORK_COST[n]).map((n) => ({ token: t.id, id: n, ...NETWORK_COST[n],
   x402Executable: t.id === "USDC" && n === "base" })));
 
-/** On-chain FX between stablecoins (pool/RFQ venues), same network. Opens USDC -> local-coin corridors. */
-export interface Swap { from: string; to: string; networks: string[]; bps: number; capacityUsd: number; minutes: number }
+/** USDC -> local-currency coin. Conversion price is not published by any of these venues: priced only with a venue quote. */
+export interface Swap { from: string; to: string; networks: string[]; capacityUsd: number; minutes: number; source: string }
 export const SWAPS: Swap[] = [
-  { from: "USDC", to: "EURC", networks: ["base", "ethereum", "solana"], bps: 8, capacityUsd: 2_000_000, minutes: 1 },
-  { from: "USDC", to: "XSGD", networks: ["ethereum", "polygon", "base"], bps: 12, capacityUsd: 500_000, minutes: 1 },
-  { from: "USDC", to: "QCAD", networks: ["ethereum", "solana"], bps: 15, capacityUsd: 300_000, minutes: 1 },
-  { from: "USDC", to: "AUDD", networks: ["ethereum", "solana"], bps: 15, capacityUsd: 300_000, minutes: 1 },
-  { from: "USDC", to: "MXNB", networks: ["arbitrum"], bps: 15, capacityUsd: 300_000, minutes: 1 },
-  { from: "USDC", to: "BRZ", networks: ["solana", "polygon"], bps: 18, capacityUsd: 300_000, minutes: 1 },
-  { from: "USDC", to: "TRYB", networks: ["solana", "avalanche"], bps: 25, capacityUsd: 150_000, minutes: 1 },
-  { from: "USDC", to: "JPYC", networks: ["polygon"], bps: 20, capacityUsd: 200_000, minutes: 1 },
-  { from: "USDC", to: "GYEN", networks: ["ethereum"], bps: 20, capacityUsd: 200_000, minutes: 1 },
-  { from: "USDC", to: "ZARP", networks: ["base", "polygon"], bps: 25, capacityUsd: 100_000, minutes: 1 },
-  { from: "USDC", to: "XIDR", networks: ["polygon"], bps: 25, capacityUsd: 150_000, minutes: 1 },
-  { from: "USDC", to: "PHPC", networks: ["polygon"], bps: 25, capacityUsd: 100_000, minutes: 1 },
-  { from: "USDC", to: "CNGN", networks: ["base"], bps: 30, capacityUsd: 100_000, minutes: 1 },
-  { from: "USDC", to: "TGBP", networks: ["ethereum"], bps: 15, capacityUsd: 300_000, minutes: 1 },
-  { from: "USDG", to: "XSGD", networks: ["ethereum"], bps: 10, capacityUsd: 300_000, minutes: 1 },
-  { from: "EURC", to: "USDC", networks: ["base", "ethereum", "solana"], bps: 8, capacityUsd: 2_000_000, minutes: 1 },
+  { from: "USDC", to: "EURC", networks: ["base", "ethereum", "solana"], capacityUsd: 15_000_000, minutes: 1, source: SOURCES.circleFx },
+  { from: "USDC", to: "XSGD", networks: ["polygon", "base", "ethereum"], capacityUsd: 1_000_000, minutes: 1, source: SOURCES.straitsx },
+  { from: "USDC", to: "MXNB", networks: ["arbitrum"], capacityUsd: 1_000_000, minutes: 1, source: SOURCES.juno },
 ];
 
 export interface Offramp {
   id: string; label: string; tokens: string[]; networks: string[]; dest: string[] | "*"; tiers: Tier[];
   fixedUsd: number; capacityUsd: number; payoutMin: number; cutoffUtcHour: number;
+  fixedDest?: number;            // fee in the destination currency (e.g. 1 XSGD for a FAST payout)
+  always?: boolean;              // 24/7: no bank cut-off or business days on this leg
+  requiresUsdcWallet?: boolean;  // the supplier must accept USDC (wallet on file)
+  source: string;
 }
 export const OFFRAMPS: Offramp[] = [
-  { id: "payout_partner_ca", label: "Canadian payout partner", tokens: ["USDC", "PYUSD"], networks: ["base", "solana", "ethereum"],
-    dest: ["CAD"], tiers: [{ upToUsd: 50_000, bps: 35 }, { upToUsd: 150_000, bps: 25 }, { upToUsd: Infinity, bps: 20 }],
-    fixedUsd: 4, capacityUsd: 200_000, payoutMin: 30, cutoffUtcHour: 20 },
-  { id: "payout_partner_global", label: "Global payout network", tokens: ["USDC"], networks: ["base", "solana", "polygon", "ethereum"],
-    dest: "*", tiers: [{ upToUsd: 100_000, bps: 60 }, { upToUsd: Infinity, bps: 45 }], fixedUsd: 3, capacityUsd: 500_000, payoutMin: 120, cutoffUtcHour: 19 },
-  { id: "eurc_desk", label: "EUR coin redemption (SEPA Instant)", tokens: ["EURC", "EURCV", "EURE"], networks: ["base", "ethereum", "solana", "polygon", "gnosis"],
-    dest: ["EUR"], tiers: [{ upToUsd: Infinity, bps: 5 }], fixedUsd: 1, capacityUsd: 1_000_000, payoutMin: 20, cutoffUtcHour: 17 },
-  { id: "usd_redemption", label: "USD coin redemption (domestic wire/RTP)", tokens: ["USDC", "PYUSD", "USDG", "USDP", "RLUSD", "GUSD"],
-    networks: ["base", "solana", "ethereum", "polygon", "arbitrum", "stellar", "xrpl"], dest: ["USD"], tiers: [{ upToUsd: Infinity, bps: 3 }],
-    fixedUsd: 2, capacityUsd: 5_000_000, payoutMin: 30, cutoffUtcHour: 21 },
-  // local-coin redemption at par into local rails: the cheap last mile for many corridors
-  ...([["QCAD", "CAD", ["ethereum", "solana", "stellar"], 30, 20], ["TGBP", "GBP", ["ethereum"], 20, 16], ["XSGD", "SGD", ["ethereum", "polygon", "base"], 15, 10],
-       ["AUDD", "AUD", ["ethereum", "solana", "stellar"], 30, 7], ["JPYC", "JPY", ["ethereum", "polygon"], 60, 6], ["GYEN", "JPY", ["ethereum", "solana"], 60, 6],
-       ["MXNB", "MXN", ["arbitrum", "ethereum"], 20, 22], ["BRZ", "BRL", ["ethereum", "solana", "polygon"], 20, 21], ["TRYB", "TRY", ["ethereum", "solana", "avalanche"], 30, 14],
-       ["ZARP", "ZAR", ["ethereum", "polygon", "base"], 30, 15], ["XIDR", "IDR", ["ethereum", "polygon"], 30, 9], ["PHPC", "PHP", ["ronin", "polygon"], 20, 9],
-       ["CNGN", "NGN", ["base", "ethereum"], 30, 15]] as [string, string, string[], number, number][])
-    .map(([tok, ccy, nets, mins, cutoff]) => ({ id: `${tok.toLowerCase()}_redeem`, label: `${tok} redemption to local ${ccy} rail`, tokens: [tok], networks: nets,
-      dest: [ccy], tiers: [{ upToUsd: Infinity, bps: 10 }], fixedUsd: 1, capacityUsd: 400_000, payoutMin: mins, cutoffUtcHour: cutoff })),
+  // USD-invoiced supplier that accepts USDC: delivered to its wallet, exact amount, 24/7; cost = network fee only
+  { id: "supplier_usdc_wallet", label: "Supplier's USDC wallet (exact amount, 24/7)", tokens: ["USDC"], networks: ["base", "solana"], dest: ["USD"],
+    tiers: [{ upToUsd: Infinity, bps: 0 }], fixedUsd: 0, capacityUsd: 15_000_000, payoutMin: 0, cutoffUtcHour: 24, always: true, requiresUsdcWallet: true,
+    source: SOURCES.networkFees },
+  { id: "eurc_redeem", label: "EURC redemption to EUR (Circle Mint)", tokens: ["EURC"], networks: ["base", "ethereum", "solana"], dest: ["EUR"],
+    tiers: [{ upToUsd: Infinity, bps: 0 }], fixedUsd: 0, capacityUsd: 15_000_000, payoutMin: 30, cutoffUtcHour: 17, source: SOURCES.circleFx },
+  { id: "xsgd_redeem", label: "XSGD redemption to SGD via FAST (StraitsX)", tokens: ["XSGD"], networks: ["polygon", "base", "ethereum"], dest: ["SGD"],
+    tiers: [{ upToUsd: Infinity, bps: 0 }], fixedUsd: 0, fixedDest: 1, capacityUsd: 1_000_000, payoutMin: 10, cutoffUtcHour: 24, always: true, source: SOURCES.straitsx },
+  { id: "mxnb_redeem", label: "MXNB redemption to MXN via SPEI (Juno)", tokens: ["MXNB"], networks: ["arbitrum"], dest: ["MXN"],
+    tiers: [{ upToUsd: Infinity, bps: 0 }], fixedUsd: 0, capacityUsd: 1_000_000, payoutMin: 10, cutoffUtcHour: 24, always: true, source: SOURCES.juno },
 ];
 
-export const PLATFORM = { flatFeeBps: 15, timeValueBpsPerDay: 1.5 };   // fee = 0.15% of converted volume (at mid); time value for cost+speed ranking
-/** Partner rail: priced from measured partner pricing (market.ts). Arrival and capacity are labeled assumptions. */
-export const PARTNER = { businessDays: 1, cutoffUtcHour: 20, capacityUsd: 1_000_000 };
+/** A live conversion quote for USDC -> local coin + redemption, entered from the venue (never a default).
+ *  VENUE_QUOTES='{"EUR":{"bps":12,"source":"Circle Mint quote 2026-10-24 14:05"}}' */
+export function venueQuote(destCcy: string): { bps: number; source: string } | null {
+  try {
+    const q = JSON.parse(process.env.VENUE_QUOTES ?? "{}")[destCcy];
+    return q && Number.isFinite(Number(q.bps)) && q.source ? { bps: Number(q.bps), source: String(q.source) } : null;
+  } catch { return null; }
+}
+
+// Our price (a pricing choice, not market data): a flat fee per payment sent on OUR stablecoin rail, set below the $45 median
+// international wire fee it replaces. Payments through the company's own bank and all treasury suggestions are free.
+export const PLATFORM = { feeBpsOfRailVolume: 15, timeValueBpsPerDay: 1.5 };   // 0.15% of rail volume, capped at the payment's saving
+

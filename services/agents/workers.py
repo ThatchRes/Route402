@@ -222,13 +222,14 @@ async def on_screen(ctx: Context, sender: str, msg: ScreenRequest):
     await ctx.send(sender, ScreenResult(correlationId=msg.correlationId, results=list(results)))
 
 
-PROVIDER_IDS = ("stablecoin", "partner", "bank")
+PROVIDER_IDS = ("stablecoin", "bank")      # OUR stablecoin rail, or the company's OWN bank
 
 
 @routing.on_message(model=ProcureRequest, replies=ProcureResult)
 @guarded
 async def on_procure(ctx: Context, sender: str, msg: ProcureRequest):
-    """RoutingAgent: for every payment, buys a quote from EACH provider (three separate x402 sellers, separate payees),
+    """RoutingAgent: for every payment, buys a quote from EACH provider (our stablecoin rail and the company's own bank;
+    separate x402 sellers, separate payees),
     asks ComplianceAgent for a paid supplier screen (agent-to-agent), then chooses one provider under the company's
     policy (cheapest | fastest | lowest_risk) or holds the payment."""
     corr, pays, policy = msg.correlationId, msg.payments, msg.policy
@@ -238,8 +239,12 @@ async def on_procure(ctx: Context, sender: str, msg: ProcureRequest):
     hops = [{"from": "concierge", "to": "routing", "message": f"ProcureRequest ({len(pays)} payments, policy {policy})"}]
 
     def body(p):
-        return {"srcCcy": msg.srcCcy, "destCcy": p["destCcy"], "amountType": "RECIPIENT_FIXED", "amount": p["amount"],
-                "deadlineUtc": p.get("deadlineUtc"), "objective": "cheapest", "currentBank": msg.currentBank}
+        ben = p.get("beneficiary") or {}
+        # invoice payments fix what the supplier receives; a budget payment (amountType SOURCE_FIXED) fixes what the company sends
+        amount_type = p.get("amountType") if p.get("amountType") in ("RECIPIENT_FIXED", "SOURCE_FIXED") else "RECIPIENT_FIXED"
+        return {"srcCcy": msg.srcCcy, "destCcy": p["destCcy"], "amountType": amount_type, "amount": p["amount"],
+                "deadlineUtc": p.get("deadlineUtc"), "objective": "cheapest", "currentBank": msg.currentBank,
+                "beneficiary": ben, "beneficiaryAcceptsUsdc": bool(ben.get("usdcWallet")), "reference": p.get("reference") or p["payable"]}
     jobs = [(i, pid) for i in range(len(pays)) for pid in PROVIDER_IDS]
     quotes_task = asyncio.ensure_future(asyncio.gather(*(backend.paid_call(f"quote:{pid}", body(pays[i]), corr, "routing-agent") for i, pid in jobs)))
     screen, status = await ctx.send_and_receive(

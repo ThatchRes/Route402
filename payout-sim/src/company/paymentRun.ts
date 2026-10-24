@@ -6,6 +6,7 @@
 // Every saving is measured against the company's CURRENT bank, pricing each conversion with the same exact math.
 import { optimize, mid } from "../router/optimizer.js";
 import { bankMarkup, MARKET, midInfo } from "../router/market.js";
+import { venueQuote } from "../router/registry.js";
 import { convert, fmt, toMinor } from "../money.js";
 import { validate, type Beneficiary } from "./validate.js";
 import type { CompanyProfile } from "./profile.js";
@@ -23,16 +24,27 @@ export function runPaymentRun(r: PaymentRunInput) {
   const midHome = (m: bigint, c: string) => convert(m, c, H, mid(c, H)).minor;
 
   // cost (vs mid) of buying `amount` of ccy from home currency: via the company's bank, or via our best route
-  const buy = (ccy: string, amountMinor: bigint, deadline: string | undefined, viaBank: boolean): Conv => {
+  const HOME_COUNTRY = "US";
+  const buy = (ccy: string, amountMinor: bigint, deadline: string | undefined, viaBank: boolean, ben?: Beneficiary): Conv => {
     if (amountMinor === 0n) return { costHome: 0n, debitHome: 0n, route: "-" };
     const amt = fmt(amountMinor, ccy).split(" ")[0];
-    if (ccy === H) return viaBank ? { costHome: toMinor(co.currentBank.wireFeeUsd.toFixed(2), H), debitHome: amountMinor, route: "bank:current_bank (domestic)" }
-                                  : { costHome: 0n, debitHome: amountMinor, route: "domestic (no FX)" };
+    // Domestic home-currency payment: the company's bank either way (no saving claimed)
+    if (ccy === H && (!ben || ben.country === HOME_COUNTRY)) {
+      const fee = toMinor(co.currentBank.wireFeeUsd.toFixed(2), H);
+      return { costHome: fee, debitHome: amountMinor + fee, route: "bank:current_bank (domestic)" };
+    }
+    // Cross-border (incl. USD-invoiced suppliers abroad): our rail vs the company's bank
     const o: any = optimize({ srcCcy: H, destCcy: ccy, amountType: "RECIPIENT_FIXED", amount: amt, deadlineUtc: viaBank ? undefined : deadline,
-      objective: "balanced", nowUtc: now, currentBank: bank });
+      objective: "balanced", nowUtc: now, currentBank: bank, beneficiaryAcceptsUsdc: !!ben?.usdcWallet });
     const atMid = midHome(amountMinor, ccy);
     if (viaBank) { const d = BigInt(o.baseline.sourceDebitMinor); return { costHome: d - atMid, debitHome: d, route: o.baseline.routeId }; }
-    if (o.status !== "OK") return { costHome: 0n, debitHome: 0n, route: `HOLD: ${o.reason ?? o.missing}` };
+    if (o.status !== "OK") {
+      // nothing meets the due date: it still has to be paid, through the company's bank (late). No saving is claimed.
+      const bm = o.baseline?.sourceDebitMinor ?? o.baseline?.quote?.sourceDebit?.minor;   // HOLD returns the raw priced baseline
+      if (bm) { const d = BigInt(bm);
+        return { costHome: d - atMid, debitHome: d, route: `${o.baseline.routeId} (arrives ${String(o.baseline.arrivalUtc).slice(0, 10)}, after the due date)` }; }
+      return { costHome: 0n, debitHome: 0n, route: `HOLD: ${o.reason ?? o.missing}` };
+    }
     const d = toMinor(o.totals.sourceDebit.split(" ")[0], H);
     return { costHome: d - atMid, debitHome: d, route: o.allocations.map((a: any) => a.routeId).join("+"), arrivalUtc: o.totals.arrivalUtc,
              input: o.allocations.map((a: any) => a.quote.input) };
@@ -41,7 +53,8 @@ export function runPaymentRun(r: PaymentRunInput) {
   const sell = (ccy: string, amountMinor: bigint, viaBank: boolean): bigint => {
     if (amountMinor === 0n || ccy === H) return 0n;
     const o: any = optimize({ srcCcy: ccy, destCcy: H, amountType: "SOURCE_FIXED", amount: fmt(amountMinor, ccy).split(" ")[0], objective: "cheapest", nowUtc: now, currentBank: bank });
-    const net = viaBank ? toMinor(o.baseline.recipientNet.split(" ")[0], H) : o.status === "OK" ? toMinor(o.totals.recipientNet.split(" ")[0], H) : 0n;
+    // our rail only buys from USD; selling foreign receipts goes through the company's bank either way
+    const net = viaBank || o.status !== "OK" ? toMinor(o.baseline.recipientNet.split(" ")[0], H) : toMinor(o.totals.recipientNet.split(" ")[0], H);
     return midHome(amountMinor, ccy) - net;
   };
 
@@ -53,7 +66,7 @@ export function runPaymentRun(r: PaymentRunInput) {
     const v = validate(p.beneficiary);
     if (v.status === "BLOCK") {
       // a bounced payment costs the return fee plus converting twice at the bank's markup
-      const c = buy(p.ccy, toMinor(p.amount, p.ccy), undefined, true);
+      const c = buy(p.ccy, toMinor(p.amount, p.ccy), undefined, true, p.beneficiary);
       validationAvoided += toMinor(co.currentBank.returnFeeUsd.toFixed(2), H) + (p.ccy === H ? 0n : c.costHome);
       lines.push({ payable: p.id, status: "BLOCKED before sending", why: v.errors.join("; ") }); continue;
     }
@@ -72,7 +85,8 @@ export function runPaymentRun(r: PaymentRunInput) {
   }
 
   // ---------- 3 + 4: scenarios A (bank, no wallet), B (our routes, no wallet), C (our routes + natural hedge)
-  let A = 0n, B = 0n, C = 0n, volA = 0n, volC = 0n;
+  const feeBps = co.pricing.feeBpsOfRailVolume ?? 15;
+  let A = 0n, B = 0n, C = 0n, volA = 0n, volC = 0n, railVol = 0n, railPayments = 0, xbUsd = 0n, fee = 0n, feeCapped = 0;   // railVol: volume on OUR rail; xbUsd: USD paid to suppliers abroad
   const ccys = [...new Set([...sendable.map((p) => p.ccy), ...r.receivables.map((x) => x.ccy)])];
   for (const ccy of ccys) {
     const pays = sendable.filter((p) => p.ccy === ccy).sort((a, b) => a.payOnUtc.localeCompare(b.payOnUtc));
@@ -84,8 +98,16 @@ export function runPaymentRun(r: PaymentRunInput) {
     for (const p of pays) {
       while (ri < recs.length && recs[ri].dateUtc <= p.payOnUtc) { if (recs[ri].status === "confirmed") wallet += toMinor(recs[ri].amount, ccy); ri++; }
       const need = toMinor(p.amount, ccy), use = ccy === H ? 0n : (wallet >= need ? need : wallet); wallet -= use; matchedRec += use;
-      const c = buy(ccy, need - use, p.payOnUtc, false); C += c.costHome; if (ccy !== H) volC += midHome(need - use, ccy);
-      lines.push({ payable: p.id, ccy, beneficiary: p.beneficiary, convertedAmount: fmt(need - use, ccy).split(" ")[0], deadlineUtc: p.payOnUtc,
+      const c = buy(ccy, need - use, p.payOnUtc, false, p.beneficiary); C += c.costHome; if (ccy !== H) volC += midHome(need - use, ccy);
+      if (c.route.startsWith("coin:")) {
+        // our fee: 0.15% of the amount sent on our rail, but never more than half of what this payment saves vs the company's bank
+        const v = midHome(need - use, ccy), bankCost = buy(ccy, need - use, p.payOnUtc, true, p.beneficiary).costHome;
+        const pctFee = (v * BigInt(feeBps)) / 10000n, saved = bankCost - c.costHome > 0n ? (bankCost - c.costHome) / 2n : 0n;   // cap: half the saving, so the company always keeps at least half
+        fee += pctFee < saved ? pctFee : saved; if (pctFee > saved) feeCapped++;
+        railVol += v; railPayments++;
+      }
+      const crossBorder = ccy !== H || p.beneficiary.country !== HOME_COUNTRY;
+      lines.push({ payable: p.id, ccy, crossBorder, reference: p.id, beneficiary: p.beneficiary, convertedAmount: fmt(need - use, ccy).split(" ")[0], deadlineUtc: p.payOnUtc,
                    payOnUtc: p.payOnUtc.slice(0, 10), amount: `${p.amount} ${ccy}`, fromWallet: fmt(use, ccy), converted: fmt(need - use, ccy),
                    route: need - use > 0n ? c.route : "wallet only", arrivesUtc: c.arrivalUtc, note: (p as any)._note || undefined, plan: c.input });
     }
@@ -94,13 +116,12 @@ export function runPaymentRun(r: PaymentRunInput) {
     const recCounted = scopeAll ? totalRec : matchedRec;            // receipts that are part of this request
     if (scopeAll) { C += sell(ccy, wallet, false); if (ccy !== H) volC += midHome(wallet, ccy); }
     // A (your bank) and B (our routes, no wallets): every payable bought separately, counted receipts sold on arrival
-    for (const p of pays) { const a = buy(ccy, toMinor(p.amount, ccy), p.payOnUtc, true), b = buy(ccy, toMinor(p.amount, ccy), p.payOnUtc, false); A += a.costHome; B += b.costHome; if (ccy !== H) volA += midHome(toMinor(p.amount, ccy), ccy); }
+    for (const p of pays) { const a = buy(ccy, toMinor(p.amount, ccy), p.payOnUtc, true, p.beneficiary), b = buy(ccy, toMinor(p.amount, ccy), p.payOnUtc, false, p.beneficiary); A += a.costHome; B += b.costHome; if (ccy !== H) volA += midHome(toMinor(p.amount, ccy), ccy);
+      else if (p.beneficiary.country !== HOME_COUNTRY) xbUsd += toMinor(p.amount, ccy); }
     A += sell(ccy, recCounted, true); B += sell(ccy, recCounted, false); if (ccy !== H) volA += midHome(recCounted, ccy);
   }
   const routing = A - B, hedge = B - C, total = routing + hedge + discountGain + validationAvoided;
-  // Our fee: flat bps of the volume we actually convert (volC, at mid). Existing balances, discounts and checks are free.
-  const feeBps = co.pricing.flatFeeBps ?? 15;
-  const fee = (volC * BigInt(Math.round(feeBps * 100))) / 1_000_000n;
+  // Our fee (computed per rail payment above): 0.15% of rail volume, capped at that payment's saving. Balances, discounts and checks are free.
   const pctOf = (x: bigint, base: bigint) => base > 0n ? `${(Number((x * 1_000_000n) / base) / 10000).toFixed(2)}%` : "0.00%";
   const f = (x: bigint) => fmt(x, H);
   return {
@@ -112,24 +133,26 @@ export function runPaymentRun(r: PaymentRunInput) {
       mode: MARKET.mode, loadedAt: MARKET.loadedAt, sources: MARKET.sources, notes: MARKET.notes,
       corridors: ccys.filter((c) => c !== H).map((c) => {
         const b = co.currentBank.measured ? bankMarkup(H, c, co.currentBank.fxMarkupBps) : { bps: co.currentBank.fxMarkupBps, basis: "company-entered rate" };
-        const pr = MARKET.partners[`${H}/${c}`], m = midInfo(c);
+        const m = midInfo(c), vq = venueQuote(c);
         return { pair: `${H}/${c}`, mid: m.rate, midSource: `${m.source}${m.date !== "-" ? ` ${m.date}` : ""}`, bankMarkupBps: b.bps, bankBasis: b.basis,
-                 partnerRail: pr ? `+${(pr.totalCostBps / 100).toFixed(2)}% all-in (measured)` : "not measured" };
+                 stablecoin: c === H ? "USDC to supplier wallet: network fee only" : vq ? `venue quote ${(vq.bps / 100).toFixed(2)}% (${vq.source})` : "needs a live venue quote (not published)" };
       }),
     },
-    provenance: `mid rates: ${MARKET.mode}; bank baseline: ${co.currentBank.measured ? "measured (Wise comparison data)" : "company-entered"}; partner rail: measured partner price; stablecoin rails: synthetic catalog`, lines,
+    provenance: `mid rates: ${MARKET.mode}; bank baseline: ${co.currentBank.measured ? "measured (Wise comparison data)" : "company-entered"}; stablecoin rail: sourced fees; local-coin conversion only at an entered venue quote`, lines,
     expectedOnly: r.receivables.filter((x) => x.status === "expected").map((x) => `${x.id} ${x.amount} ${x.ccy} (expected, not relied on)`),
     fxVolume: { withYourBank: f(volA), withUs: f(volC) },
     costVsMid: { withYourBank: f(A), routingOnly: f(B), routingPlusWallets: f(C) },
     savings: { routing: f(routing), naturalHedge: f(hedge), earlyPayDiscounts: f(discountGain), failedPaymentsAvoided: f(validationAvoided), total: f(total) },
     savingsGroups: {
-      routing: { label: "routing savings (cheaper conversion; our fee applies to this volume)", total: f(routing) },
+      routing: { label: "routing savings (our stablecoin rail vs your bank: FX markup + wire fees)", total: f(routing) },
       treasury: { label: "treasury suggestions (free)", items: { "pay from existing balances": f(hedge), "early-pay discounts": f(discountGain) }, total: f(hedge + discountGain) },
       checks: { label: "pre-send checks (free)", items: { "failed payments avoided": f(validationAvoided) }, total: f(validationAvoided) },
     },
-    ourFee: f(fee), feeRule: `${feeBps / 100}% of converted volume (${f(volC)})`, companyKeeps: f(total - fee),
-    percent: { savedOfFxVolume: pctOf(total, volA), keptOfFxVolume: pctOf(total - fee, volA), routingOfFxVolume: pctOf(routing, volA),
-               bankCostOfFxVolume: pctOf(A, volA), ourCostOfFxVolume: pctOf(C, volA), feeOfFxVolume: pctOf(fee, volA) },
+    ourFee: f(fee), feeRule: `${(feeBps / 100).toFixed(2)}% of ${f(railVol)} sent on our stablecoin rail (${railPayments} payment(s)), capped at half of each payment's measured saving${feeCapped ? ` (cap applied to ${feeCapped})` : ""}; payments through your bank and treasury suggestions are free`, companyKeeps: f(total - fee),
+    // percentages are of cross-border volume: foreign-currency payments + USD paid to suppliers abroad
+    percent: { savedOfFxVolume: pctOf(total, volA + xbUsd), keptOfFxVolume: pctOf(total - fee, volA + xbUsd), routingOfFxVolume: pctOf(routing, volA + xbUsd),
+               bankCostOfFxVolume: pctOf(A, volA + xbUsd), ourCostOfFxVolume: pctOf(C, volA + xbUsd), feeOfFxVolume: pctOf(fee, volA + xbUsd) },
+    crossBorderVolume: f(volA + xbUsd),
     multiEntity: (co.entities?.length ?? 0) > 1 ? "netting and cash pooling available: npm run treasury" : "single entity: netting/pooling not applicable",
   };
 }

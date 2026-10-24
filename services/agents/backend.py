@@ -219,7 +219,7 @@ async def paid_call(service: str, body: dict, corr: str, caller: str) -> dict:
     """Ask the agent wallet to buy ONE call to an allow-listed service with x402.
     Returns {ok, data, payment:{transaction, explorer, priceUsdc, ...}, budget} or {ok: False, error}.
     The wallet checks the seller's terms, the per-call price and the budget; the agent never holds keys."""
-    if service not in ("quote", "compliance", "quote:stablecoin", "quote:partner", "quote:bank"):
+    if service not in ("quote", "compliance", "quote:stablecoin", "quote:bank"):
         raise ValueError("unknown paid service")
     safe_id(corr, "correlationId")
     t0 = time.time()
@@ -242,9 +242,8 @@ async def paid_call(service: str, body: dict, corr: str, caller: str) -> dict:
         USAGE.tool(f"paid_{service}", (time.time() - t0) * 1000)
 
 
-_MOCK_PROVIDERS = {"stablecoin": (25.0, "2026-10-26T14:30:00Z", 2, "USDC on Base with on-chain settlement proof", True),
-                   "partner": (5.0, "2026-10-27T17:00:00Z", 2, "licensed payment partner", False),
-                   "bank": (40.0, "2026-10-27T17:00:00Z", 1, "regulated bank rail", False)}
+_MOCK_PROVIDERS = {"stablecoin": (0.0, "2026-10-26T14:01:00Z", 2, "USDC to supplier wallet, 24/7", True),
+                   "bank": (2.5, "2026-10-28T17:00:00Z", 1, "your own bank's wire", False)}
 
 
 def _mock_paid(service, body):

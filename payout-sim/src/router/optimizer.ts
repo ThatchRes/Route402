@@ -2,7 +2,7 @@
 // Every candidate is priced through the SAME quoteFor() the payout service executes, so numbers match exactly.
 import { quoteFor, type QuoteInput } from "../scenarios.js";
 import { convert, decimals, fmt, toMinor } from "../money.js";
-import { BANKS, NETWORKS, OFFRAMPS, ONRAMPS, PARTNER, PLATFORM, STABILITY, SWAPS, TOKENS, MID_PER_USD, type Tier } from "./registry.js";
+import { BANKS, NETWORKS, OFFRAMPS, ONRAMPS, PLATFORM, STABILITY, SWAPS, TOKENS, MID_PER_USD, venueQuote, type Tier } from "./registry.js";
 import { div, lessBps, mul } from "./rates.js";
 import { bankMarkup, MARKET, midInfo } from "./market.js";   // live mids overwrite the demo table before any price is computed
 
@@ -11,7 +11,10 @@ export interface Intent {
   deadlineUtc?: string; objective?: "balanced" | "cheapest" | "fastest";   // default balanced = cost + speed
   allowSplit?: boolean; nowUtc?: string; midOverrides?: Record<string, string>;     // e.g. {"USD/XOF": "605.2"}
   liveOnly?: boolean;   // only routes whose funding can really execute today (x402 USDC on Base) or bank routes
-  provider?: "stablecoin" | "partner" | "bank";   // one provider's routes only (each provider quotes separately)
+  provider?: "stablecoin" | "bank";   // one provider's routes only (each provider quotes separately)
+  beneficiaryAcceptsUsdc?: boolean;   // supplier has a USDC wallet on file (USD-invoiced suppliers)
+  reference?: string;                 // invoice reference carried with the payment (kept on the receipt)
+  beneficiary?: any;                  // supplier details (payee history is updated when the payment completes)
   currentBank?: { label: string; fxMarkupBps: number; wireFeeUsd: number; businessDays: number; measured?: boolean };   // the company's own bank = baseline
   // measured: true -> the FX markup comes from measured bank pricing for this corridor (market.ts); fxMarkupBps is only the fallback
 }
@@ -42,10 +45,11 @@ interface Route {
   arrival: (now: Date) => Date; pegDeviation: number; coins: string[];
 }
 
-export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[] } {
-  const o = it.midOverrides ?? {}, routes: Route[] = [], missing: string[] = [];
-  try { mid(it.srcCcy, it.destCcy, o); } catch (e: any) { missing.push(e.message); return { routes, missing }; }
-  const cbBps = it.currentBank ? (it.currentBank.measured ? bankMarkup(it.srcCcy, it.destCcy, it.currentBank.fxMarkupBps).bps : it.currentBank.fxMarkupBps) : 0;
+export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[]; unpriced: string[] } {
+  const o = it.midOverrides ?? {}, routes: Route[] = [], missing: string[] = [], unpriced: string[] = [];
+  try { mid(it.srcCcy, it.destCcy, o); } catch (e: any) { missing.push(e.message); return { routes, missing, unpriced }; }
+  const sameCcy = it.srcCcy === it.destCcy;   // no FX: the bank charges its wire fee only
+  const cbBps = !it.currentBank || sameCcy ? 0 : it.currentBank.measured ? bankMarkup(it.srcCcy, it.destCcy, it.currentBank.fxMarkupBps).bps : it.currentBank.fxMarkupBps;
   const banks = it.currentBank
     ? [{ id: "current_bank", label: `${it.currentBank.label} (your current bank)`, fixedUsd: it.currentBank.wireFeeUsd, tiers: [{ upToUsd: Infinity, bps: cbBps }],
          businessDays: it.currentBank.businessDays, cutoffUtcHour: 21, capacityUsd: Infinity, dest: "*" as const, isBaseline: true },
@@ -56,26 +60,18 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
     routes.push({ routeId: `bank:${b.id}`, kind: "bank", label: b.label, x402Executable: false, capacityUsd: b.capacityUsd,
       steps: [`${it.srcCcy} debit`, `${b.label} FX ${it.srcCcy}->${it.destCcy}`, `${it.destCcy} credit`], pegDeviation: 0, coins: [],
       build: (amountType, amount, usd) => ({ route: "bank", srcCcy: it.srcCcy, destCcy: it.destCcy, amountType, amount,
-        fxRate: lessBps(mid(it.srcCcy, it.destCcy, o), tierBps(b.tiers, usd)), fundingFee: usdToCcy(b.fixedUsd, it.srcCcy, o), payoutFee: "0" }),
+        fxRate: lessBps(mid(it.srcCcy, it.destCcy, o), sameCcy ? 0 : tierBps(b.tiers, usd)), fundingFee: usdToCcy(b.fixedUsd, it.srcCcy, o), payoutFee: "0" }),
       arrival: (now) => {
         if (b.sameDayBeforeUtcHour !== undefined && isBiz(now) && now.getUTCHours() < b.sameDayBeforeUtcHour) return new Date(now.getTime() + 4 * 3600e3);
         const start = isBiz(now) && now.getUTCHours() < b.cutoffUtcHour ? now : nextBiz(now, 9);
         return addBizDays(start, b.businessDays);
       } });
   }
-  // Partner rail: a licensed payment partner, priced from measured partner pricing for this corridor (when measured)
-  const partner = MARKET.partners[`${it.srcCcy}/${it.destCcy}`];
-  if (partner) {
-    routes.push({ routeId: "partner:measured", kind: "bank", label: "Payment partner rail (measured partner price)", x402Executable: false,
-      capacityUsd: PARTNER.capacityUsd, steps: [`${it.srcCcy} debit`, `partner FX ${it.srcCcy}->${it.destCcy}`, `${it.destCcy} local payout`], pegDeviation: 0, coins: [],
-      build: (amountType, amount) => ({ route: "bank", srcCcy: it.srcCcy, destCcy: it.destCcy, amountType, amount,
-        fxRate: lessBps(mid(it.srcCcy, it.destCcy, o), partner.totalCostBps), fundingFee: "0", payoutFee: "0" }),
-      arrival: (now) => addBizDays(isBiz(now) && now.getUTCHours() < PARTNER.cutoffUtcHour ? now : nextBiz(now, 9), PARTNER.businessDays) });
-  }
   for (const on of ONRAMPS.filter((x) => x.src === it.srcCcy)) {
     const tok = TOKENS.find((t) => t.id === on.token)!;
     for (const net of NETWORKS.filter((n) => n.token === tok.id)) {
       for (const off of OFFRAMPS.filter((f) => f.tokens.includes(tok.id) && f.networks.includes(net.id) && (f.dest === "*" || f.dest.includes(it.destCcy)))) {
+        if (off.requiresUsdcWallet && !it.beneficiaryAcceptsUsdc) { unpriced.push(`stablecoin: supplier has no USDC wallet on file`); continue; }
         let pegToDest: string; try { pegToDest = mid(tok.peg, it.destCcy, o); } catch { continue; }
         routes.push({ routeId: `coin:${tok.id}:${net.id}:${off.id}`, kind: "stablecoin", label: `${tok.id} on ${net.id} via ${off.label}`,
           token: tok.id, network: net.id, x402Executable: !!net.x402Executable && tok.id === "USDC",
@@ -85,9 +81,10 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
           build: (amountType, amount, usd) => ({ route: "stablecoin", srcCcy: it.srcCcy, destCcy: it.destCcy, amountType, amount,
             fundingAsset: tok.id, network: net.id, onrampRate: lessBps(mid(it.srcCcy, tok.peg, o), on.bps),
             fxRate: lessBps(pegToDest, tierBps(off.tiers, usd)),
-            fundingFee: usdToCcy(on.fixedUsd + net.gasUsd, it.srcCcy, o), payoutFee: usdToCcy(off.fixedUsd, it.destCcy, o) }),
+            fundingFee: usdToCcy(on.fixedUsd + net.gasUsd, it.srcCcy, o), payoutFee: off.fixedDest !== undefined ? off.fixedDest.toFixed(decimals(it.destCcy)) : usdToCcy(off.fixedUsd, it.destCcy, o) }),
           arrival: (now) => {
             const t = new Date(now.getTime() + (net.finalityMin + off.payoutMin) * 60e3);
+            if (off.always) return t;                                        // 24/7 leg: no cut-off, no business days
             return isBiz(t) && t.getUTCHours() < off.cutoffUtcHour ? t : new Date(nextBiz(t).getTime() + off.payoutMin * 60e3);
           } });
       }
@@ -101,27 +98,31 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
       for (const netId of sw.networks.filter((n) => t1.networks.includes(n) && t2.networks.includes(n))) {
         const net = NETWORKS.find((n) => n.token === t1.id && n.id === netId)!;
         for (const off of OFFRAMPS.filter((f) => f.tokens.includes(t2.id) && f.networks.includes(netId) && (f.dest === "*" || f.dest.includes(it.destCcy)))) {
+          const vq = venueQuote(it.destCcy);
+          if (!vq) { unpriced.push(`stablecoin to ${it.destCcy}: ${t1.id}->${t2.id} conversion price is not published; enter a live venue quote (VENUE_QUOTES)`); continue; }
           let swapRate: string, pegToDest: string;
-          try { swapRate = lessBps(mid(t1.peg, t2.peg, o), sw.bps); pegToDest = mid(t2.peg, it.destCcy, o); } catch { continue; }
+          try { swapRate = lessBps(mid(t1.peg, t2.peg, o), vq.bps); pegToDest = mid(t2.peg, it.destCcy, o); } catch { continue; }
           const live = t1.id === "USDC" && netId === "base";
           routes.push({ routeId: `coin:${t1.id}>${t2.id}:${netId}:${off.id}`, kind: "stablecoin", label: `${t1.id}->${t2.id} swap on ${netId}, ${off.label}`,
             token: t1.id, network: netId, x402Executable: live, capacityUsd: Math.min(on.capacityUsd, sw.capacityUsd, off.capacityUsd),
             pegDeviation: Math.max(t1.pegDeviation, t2.pegDeviation), coins: [t1.id, t2.id],
             steps: [`${it.srcCcy} debit`, `onramp ${it.srcCcy}->${t1.id}`, `${t1.id} on ${netId}${live ? " (x402 funding)" : ""}`,
-                    `on-chain swap ${t1.id}->${t2.id} (${sw.bps} bps)`, `${off.label} ${t2.id}->${it.destCcy}`, `${it.destCcy} credit`],
+                    `${t1.id}->${t2.id} at venue quote ${vq.bps} bps (${vq.source})`, `${off.label} ${t2.id}->${it.destCcy}`, `${it.destCcy} credit`],
             build: (amountType, amount, usd) => ({ route: "stablecoin", srcCcy: it.srcCcy, destCcy: it.destCcy, amountType, amount,
               fundingAsset: t1.id, network: netId, onrampRate: lessBps(mid(it.srcCcy, t1.peg, o), on.bps),
               fxRate: mul(swapRate, lessBps(pegToDest, tierBps(off.tiers, usd))),     // swap + redemption, exact composite rate
-              fundingFee: usdToCcy(on.fixedUsd + net.gasUsd, it.srcCcy, o), payoutFee: usdToCcy(off.fixedUsd + net.gasUsd, it.destCcy, o) }),
+              fundingFee: usdToCcy(on.fixedUsd + net.gasUsd, it.srcCcy, o),
+              payoutFee: off.fixedDest !== undefined ? off.fixedDest.toFixed(decimals(it.destCcy)) : usdToCcy(off.fixedUsd + net.gasUsd, it.destCcy, o) }),
             arrival: (now) => {
               const t = new Date(now.getTime() + (net.finalityMin + sw.minutes + off.payoutMin) * 60e3);
+              if (off.always) return t;
               return isBiz(t) && t.getUTCHours() < off.cutoffUtcHour ? t : new Date(nextBiz(t).getTime() + off.payoutMin * 60e3);
             } });
         }
       }
     }
   }
-  return { routes, missing };
+  return { routes, missing, unpriced: [...new Set(unpriced)] };
 }
 
 export interface Priced {
@@ -161,9 +162,9 @@ const pick = (xs: Priced[], cmp: (a: Priced, b: Priced) => number) => {
 export function optimize(it: Intent) {
   const now = it.nowUtc ? new Date(it.nowUtc) : new Date();
   const deadline = it.deadlineUtc ? new Date(it.deadlineUtc) : undefined;
-  const { routes, missing } = enumerateRoutes(it);
+  const { routes, missing, unpriced } = enumerateRoutes(it);
   if (missing.length) return { status: "MISSING_INPUT", missing };
-  const ofProvider = (id: string) => id.startsWith("coin:") ? "stablecoin" : id.startsWith("partner:") ? "partner" : id === "bank:current_bank" ? "baseline" : "bank";
+  const ofProvider = (id: string) => id.startsWith("coin:") ? "stablecoin" : "bank";
   const usable = routes.filter((r) => (!it.liveOnly || r.kind === "bank" || r.x402Executable) && (!it.provider || ofProvider(r.routeId) === it.provider));
   const priced = usable.map((r) => price(r, it, it.amount, now, deadline));
   const eligible = priced.filter((p) => p.eligible).sort((a, b) => (it.objective === "fastest"
@@ -200,7 +201,7 @@ export function optimize(it: Intent) {
   const baselineId = it.currentBank ? "bank:current_bank" : "bank:legacy_wire";
   const baseline = priced.find((p) => p.routeId === baselineId)
     ?? routes.filter((r) => r.routeId === baselineId).map((r) => price(r, it, it.amount, now, undefined))[0];   // baseline even if filtered by liveOnly
-  if (!chosen) return { status: "HOLD", reason: "no eligible route or allocation", candidates: priced, baseline };
+  if (!chosen) return { status: "HOLD", reason: it.provider === "stablecoin" ? (unpriced.length ? unpriced.join("; ") : `our stablecoin rail has no published-price route to ${it.destCcy} yet`) : "no eligible route or allocation", unpriced, candidates: priced, baseline };
 
   const sum = (k: "sourceDebit" | "recipientNet") => chosen.reduce((s, c) => s + BigInt(c.quote[k].minor), 0n);
   const debit = sum("sourceDebit"), net = sum("recipientNet");
@@ -210,9 +211,10 @@ export function optimize(it: Intent) {
     savingsMinor = it.amountType === "RECIPIENT_FIXED" ? BigInt(baseline.quote.sourceDebit.minor) - debit
       : convert(net - BigInt(baseline.quote.recipientNet.minor), it.destCcy, it.srcCcy, mid(it.destCcy, it.srcCcy, it.midOverrides ?? {})).minor;
   }
-  // flat fee on converted volume, valued at mid in the source currency (never negative)
-  const volSrc = it.amountType === "RECIPIENT_FIXED" ? convert(net, it.destCcy, it.srcCcy, mid(it.destCcy, it.srcCcy, it.midOverrides ?? {})).minor : debit;
-  const feeMinor = (volSrc * BigInt(PLATFORM.flatFeeBps)) / 10000n;
+  // our fee: 0.15% of the source debit sent on our stablecoin rail, never more than half the measured saving; bank routes are free
+  const railDebit = chosen.filter((c) => c.kind === "stablecoin").reduce((s, c) => s + BigInt(c.quote.sourceDebit.minor), 0n);
+  const pctFee = (railDebit * BigInt(PLATFORM.feeBpsOfRailVolume)) / 10000n;
+  const cap = savingsMinor > 0n ? savingsMinor / 2n : 0n, feeMinor = pctFee < cap ? pctFee : cap;   // the customer keeps at least half
   const latest = chosen.map((c) => c.arrivalUtc).sort().at(-1)!;
   // cost above mid in bps (what the payer gives up vs the mid-market rate), for the plan and the bank baseline
   const atMidSrc = it.amountType === "RECIPIENT_FIXED" ? convert(net, it.destCcy, it.srcCcy, mid(it.destCcy, it.srcCcy, it.midOverrides ?? {})).minor : debit;
@@ -221,11 +223,11 @@ export function optimize(it: Intent) {
     const fair = convert(d, it.srcCcy, it.destCcy, mid(it.srcCcy, it.destCcy, it.midOverrides ?? {})).minor;
     return fair > 0n ? Number(((fair - n) * 1000000n) / fair) / 100 : 0;
   };
-  const bankBasis = it.currentBank?.measured ? bankMarkup(it.srcCcy, it.destCcy, it.currentBank.fxMarkupBps) : it.currentBank ? { bps: it.currentBank.fxMarkupBps, basis: "company-entered rate" } : null;
+  const bankBasis = it.srcCcy === it.destCcy ? { bps: 0, basis: "no FX (same currency): wire fee only" } : it.currentBank?.measured ? bankMarkup(it.srcCcy, it.destCcy, it.currentBank.fxMarkupBps) : it.currentBank ? { bps: it.currentBank.fxMarkupBps, basis: "company-entered rate" } : null;
   return {
-    status: "OK", decisionRecordId: `dr_${Date.now().toString(36)}`, intent: it,
+    status: "OK", decisionRecordId: `dr_${Date.now().toString(36)}`, intent: it, unpriced,
     provenance: { midRates: `${MARKET.mode}: ${it.srcCcy} ${midInfo(it.srcCcy).source}, ${it.destCcy} ${midInfo(it.destCcy).source}`,
-                  bankBaseline: bankBasis ? `${bankBasis.bps} bps: ${bankBasis.basis}` : "none", ourRouteCosts: "partner rail: measured partner price (Wise comparison data); stablecoin and bank-partner rails: synthetic catalog (registry.ts)" },
+                  bankBaseline: bankBasis ? `${bankBasis.bps} bps: ${bankBasis.basis}` : "none", ourRouteCosts: "stablecoin rail: sourced fees (Circle Mint redemption terms, network fees); local-coin conversion only at an entered venue quote" },
     costVsMidBps: { plan: bps(debit, net), bank: baseline?.quote ? bps(BigInt(baseline.quote.sourceDebit.minor), BigInt(baseline.quote.recipientNet.minor)) : null },
     objective: it.objective ?? "balanced", plan: useSplit ? "split" : "single",
     allocations: chosen.map((c) => ({ routeId: c.routeId, label: c.label, token: c.token, network: c.network,
@@ -241,7 +243,7 @@ export function optimize(it: Intent) {
     baseline: baseline?.quote ? { routeId: baseline.routeId, label: baseline.label, sourceDebit: baseline.quote.sourceDebit.display, sourceDebitMinor: baseline.quote.sourceDebit.minor,
       recipientNet: baseline.quote.recipientNet.display, arrivalUtc: baseline.arrivalUtc, meetsDeadline: baseline.eligible } : null,
     value: { customerSavings: fmt(savingsMinor, it.srcCcy), platformFee: fmt(feeMinor, it.srcCcy),
-             customerNetSaving: fmt(savingsMinor - feeMinor, it.srcCcy), feeRule: `${PLATFORM.flatFeeBps / 100}% of converted volume` },
+             customerNetSaving: fmt(savingsMinor - feeMinor, it.srcCcy), feeRule: `${(PLATFORM.feeBpsOfRailVolume / 100).toFixed(2)}% of the amount on our stablecoin rail, capped at half the measured saving; bank routes free` },
     candidates: priced.map((p) => ({ routeId: p.routeId, label: p.label, eligible: p.eligible, reason: p.reason, x402Executable: p.x402Executable,
       sourceDebit: p.quote?.sourceDebit.display, recipientNet: p.quote?.recipientNet.display, arrivalUtc: p.arrivalUtc })),
   };

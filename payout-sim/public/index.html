@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Route402</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="logo">
+      <!-- Route402 highway shield (redrawn from the Figma logo) -->
+      <svg viewBox="0 0 64 70" aria-hidden="true">
+        <path d="M32 3c8 4 18 4 28 1 2 13 1.5 24-2 34C53 53 43 61 32 67 21 61 11 53 6 38 2.5 28 2 17 4 4c10 3 20 3 28-1z" fill="#f1fbf5" stroke="#acc8c7" stroke-width="1.5"/>
+        <text x="32" y="20" text-anchor="middle" font-family="Manrope, sans-serif" font-weight="800" font-size="8.5" fill="#193b42">ROUTE</text>
+        <text x="32" y="47" text-anchor="middle" font-family="Manrope, sans-serif" font-weight="800" font-size="25" fill="#193b42">402</text>
+      </svg>
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#/overview" data-nav="overview">Overview</a>
+      <a href="#/payments" data-nav="payments">Payments</a>
+      <a href="#/suppliers" data-nav="suppliers">Suppliers</a>
+      <a href="#/activity" data-nav="activity">Activity</a>
+    </nav>
+    <div class="company"><b id="co-name">Your company</b><span id="co-sub">Importer</span></div>
+    <div class="side-foot">
+      <div>Demo workspace</div>
+      <div id="who" class="who"></div>
+      <button class="link" id="open-policy">Policy &amp; people</button>
+      <button class="link" id="open-connect">Connect bank</button>
+    </div>
+  </aside>
+  <main class="main" id="page" aria-live="polite"></main>
+</div>
+<div class="modal hidden" id="modal" role="dialog" aria-modal="true"><div class="modal-box" id="modal-box"></div></div>
+<script src="app.js"></script>
+</body>
+</html>

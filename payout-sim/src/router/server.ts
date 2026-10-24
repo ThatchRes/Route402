@@ -16,6 +16,7 @@ import { DEMO_NETTING, DEMO_RULES, DEMO_STATE, DEMO_SWEEPS } from "../treasury/d
 import { runHedge } from "../company/hedge.js";
 import { runDiscounts } from "../company/discounts.js";
 import { validate as validateBeneficiary } from "../company/validate.js";
+import { recordPayment } from "../company/payees.js";
 import { DEMO_BENEFICIARIES, DEMO_DISCOUNTS, DEMO_HEDGE, DEMO_RUN } from "../company/demo.js";
 import { runPaymentRun } from "../company/paymentRun.js";
 import { importCsv } from "../connectors/csv.js";
@@ -25,7 +26,9 @@ import { ask } from "../assistant/prompts.js";
 import { loadLinked } from "../assistant/linked.js";
 import { fmt, toMinor } from "../money.js";
 import { MARKET, marketSummary } from "./market.js";
+import { mountUi } from "./ui.js";
 import { TOKENS } from "./registry.js";
+import { usdcRouteAllowed } from "./depeg.js";
 
 const app = express();
 app.use(express.json());
@@ -38,6 +41,7 @@ const TREASURY_USD = toMinor(process.env.TREASURY_USD ?? "2000000.00", "USD");  
 const ID = /^[A-Za-z0-9_\-:.]{1,80}$/;
 const now = () => new Date().toISOString();
 
+mountUi(app, Number(process.env.ROUTER_PORT ?? 8404));   // browser demo (/app, /ui/*): local-only, mounted before the token check
 app.use((req, res, next) => (req.header("authorization") === `Bearer ${TOKEN()}` ? next() : res.status(401).json({ code: "UNAUTHORIZED" })));
 const err = (res: express.Response, status: number, code: string, message: string, details?: any) =>
   res.status(status).json({ code, message, details, retryable: false, correlationId: res.req.header("x-correlation-id") });
@@ -57,21 +61,25 @@ app.post("/v1/intents", (req, res) => {
   try { res.status(201).json(createIntent(it)); } catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
 });
 
-// One provider's quote (stablecoin rail | partner rail | bank partner). Each provider service calls this for its own routes only.
+// One provider's quote: OUR stablecoin rail, or the company's OWN bank. Each provider service calls this for its own routes only.
 // The returned intentId is bound to that provider's plan, so executing it sends exactly what that provider quoted.
 const RISK: Record<string, { score: number; why: string }> = {
-  bank: { score: 1, why: "regulated bank rail" },
-  partner: { score: 2, why: "licensed payment partner" },
+  bank: { score: 1, why: "your own bank's wire (business days and cut-offs apply)" },
   stablecoin_live: { score: 2, why: "USD stablecoins; USDC-on-Base legs carry an on-chain settlement proof" },
   stablecoin: { score: 3, why: "local stablecoin rail: thinner liquidity, simulated off-ramp" },
 };
-app.post("/v1/provider-quote", (req, res) => {
+app.post("/v1/provider-quote", async (req, res) => {
   const { provider, ...it } = req.body ?? {};
-  if (!["stablecoin", "partner", "bank"].includes(provider) || !validIntent(it)) return err(res, 400, "INVALID_INTENT", "provider + intent required");
+  if (!["stablecoin", "bank"].includes(provider) || !validIntent(it)) return err(res, 400, "INVALID_INTENT", "provider + intent required");
   let r: any;
   try { r = createIntent({ ...it, provider, objective: it.objective ?? "cheapest" }); } catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
   const d = r.decision;
   if (d.status !== "OK") return res.json({ provider, status: "NO_QUOTE", reason: d.reason || (d.missing ?? []).join("; ") || "no route from this provider" });
+  // Stablecoin safety: depeg circuit breaker + issuer cap. A paused rail returns no quote, so no agent can pick it.
+  if (provider === "stablecoin") {
+    const g = await usdcRouteAllowed(Number(String(d.totals.sourceDebit).split(" ")[0]));
+    if (!g.ok) return res.json({ provider, status: "NO_QUOTE", reason: g.reason, peg: g.peg });
+  }
   // stablecoin risk: USD coins only (USDC/USDG/PYUSD...) = 2; any local-currency coin (thinner liquidity) = 3
   const usdOnly = d.allocations.every((a: any) => !String(a.routeId).includes(">")          // a swap into a local coin
     && (!a.token || TOKENS.find((t) => t.id === a.token)?.peg === "USD"));
@@ -163,7 +171,7 @@ async function execute(transferId: string) {
       setStep(transferId, fundStep, "REQUESTED", { rail });
       try { const { orderId, tx } = await runX402Fund(childId); funding = { mode: "x402_testnet", orderId };
         setStep(transferId, fundStep, "CONFIRMED", { rail, orderId, proofTx: tx, explorer: tx ? `https://sepolia.basescan.org/tx/${tx}` : undefined,
-          transferAmountRail: `${input.route === "stablecoin" ? "stablecoin" : "bank"} payout of the full amount: simulated payout partner` }); }
+          transferAmountRail: `${input.route === "stablecoin" ? "stablecoin" : "bank"} payout of the full amount: simulated` }); }
       catch (e: any) { setStep(transferId, fundStep, "UNKNOWN", { detail: e.message }); throw e; }   // never re-funds blindly
     } else {
       funding = { mode: input.route === "stablecoin" ? "simulated_token" : "simulated_bank" };
@@ -186,6 +194,8 @@ async function execute(transferId: string) {
       const all = recs.every((r: any) => r.status === "DELIVERED" && !r.outstanding.fundedButUnpaid);
       update((db) => { const x = db.transfers[transferId]; db.reservedUsdMinor = (BigInt(db.reservedUsdMinor) - BigInt(x.reservedUsdMinor ?? "0")).toString();
         x.reservedUsdMinor = "0"; x.status = all ? "COMPLETED" : "NEEDS_RECONCILIATION"; x.history.push({ at: now(), status: x.status }); });
+      const ben = load().transfers[transferId].terms.intent.beneficiary;
+      if (all && ben?.name) recordPayment(ben, transferId);     // payee history: later bank-detail changes are held for a call-back
       return;
     }
     await new Promise((r) => setTimeout(r, 1500));
@@ -233,9 +243,10 @@ app.get("/v1/transfers/:id/receipt", async (req, res) => {
   const id = String(req.params.id), t = load().transfers[id];
   if (!t) return err(res, 404, "NOT_FOUND", "transfer");
   const kids = await Promise.all(t.children.map((c: string) => fetch(`${PAYOUT}/v1/transfers/${c}/receipt`, { headers: PAYOUT_H() }).then((r) => r.json())));
-  res.json({ transferId: id, status: t.status, plan: t.terms, termsHash: t.termsHash, approval: t.approval, value: t.value, children: kids,
+  res.json({ transferId: id, status: t.status, reference: t.terms.intent.reference ?? null, supplier: t.terms.intent.beneficiary?.name ?? null,
+    plan: t.terms, termsHash: t.termsHash, approval: t.approval, value: t.value, children: kids,
     disclosure: `Mid rates: ${MARKET.mode} (ECB reference rates via Frankfurter when live). Bank baseline: measured bank pricing (Wise comparison data) when live. `
-      + "Our route costs: synthetic catalog. Bank and non-USDC coin rails: simulated. Each USDC-on-Base leg carries an x402 settlement proof: "
+      + "Stablecoin rail: sourced fees (Circle Mint redemption terms, network fees); local-coin conversion only at an entered venue quote. Payouts: simulated. Each USDC-on-Base leg carries an x402 settlement proof: "
       + "a real 0.01 test USDC payment on Base Sepolia tied to this transfer's order and reconciled on chain. It proves the settlement path; it is not the transfer amount." });
 });
 

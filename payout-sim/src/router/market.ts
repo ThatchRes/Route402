@@ -3,8 +3,6 @@
 //                    open.er-api.com for currencies the ECB does not publish. Each rate keeps its source and date.
 //   bank baseline  : what banks actually charge, measured by Wise's public comparison data
 //                    (api.wise.com/v3/comparisons): FX markup over mid for a 100,000 USD send, per corridor.
-//   partner rail   : the best all-in price a licensed payment partner quotes in the same data (provider names are not kept).
-//                    It prices our "partner" rail: what a partner integration would cost us per corridor.
 // If the network is down: last cached data (labeled stale), else the built-in demo table (labeled synthetic).
 // LIVE_MARKET=0 forces the built-in demo table (for offline demos and tests).
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -17,11 +15,11 @@ const SEND_USD = 100_000;
 
 export interface MidInfo { rate: string; source: string; date: string }
 export interface BankInfo { bps: number; provider: string; collectedAt: string; basis: string }
-export interface PartnerInfo { totalCostBps: number; collectedAt: string; basis: string }
 export interface Market {
   mode: "live" | "cached" | "stale-cache" | "synthetic";
-  loadedAt: string; mids: Record<string, MidInfo>; banks: Record<string, BankInfo>; partners: Record<string, PartnerInfo>;
+  loadedAt: string; mids: Record<string, MidInfo>; banks: Record<string, BankInfo>; 
   sources: string[]; notes: string[];
+  history?: Record<string, [string, number][]>;   // ECB daily reference rates per currency (units per USD), ~120 days
 }
 
 const BUILTIN_MIDS = { ...MID_PER_USD };
@@ -44,14 +42,11 @@ async function fetchLive(): Promise<Market> {
   } catch (e: any) { notes.push(`secondary rate source unavailable (${e.message}); currencies the ECB does not publish use the built-in demo table`); }
 
   // Measured bank pricing, one corridor at a time (public endpoint, no key)
-  const banks: Record<string, BankInfo> = {}, partners: Record<string, PartnerInfo> = {};
+  const banks: Record<string, BankInfo> = {};
   await Promise.all(CORRIDORS.map(async (dest) => {
     try {
       const w: any = await getJson(`https://api.wise.com/v3/comparisons/?sourceCurrency=USD&targetCurrency=${dest}&sendAmount=${SEND_USD}`, 6000);
       const quotes = (w.providers ?? []).flatMap((p: any) => (p.quotes ?? []).map((q: any) => ({ name: p.name, type: p.type, ...q })));
-      // Wise's own quote has markup 0, so its rate is the comparison's mid; total cost = everything below mid incl. fees
-      const wise = quotes.find((q: any) => q.name === "Wise");
-      const refMid = wise ? Number(wise.rate) : undefined;
       const bankQuotes = quotes.filter((q: any) => q.type === "bank" && Number.isFinite(Number(q.markup)));
       if (bankQuotes.length) {
         const sorted = bankQuotes.map((q: any) => Number(q.markup) * 100).sort((a: number, b: number) => a - b);
@@ -59,30 +54,33 @@ async function fetchLive(): Promise<Market> {
         banks[`USD/${dest}`] = { bps: Math.round(median), provider: bankQuotes.map((q: any) => q.name).join(", "),
           collectedAt: bankQuotes[0].dateCollected, basis: `median bank FX markup for a ${SEND_USD.toLocaleString()} USD send, measured by Wise comparison data` };
       }
-      if (refMid) {
-        const best = quotes.filter((q: any) => q.type !== "bank" && Number(q.receivedAmount) > 0)
-          .map((q: any) => ({ totalCostBps: Math.max(0, Math.round((1 - Number(q.receivedAmount) / (SEND_USD * refMid)) * 10000)), collectedAt: String(q.dateCollected ?? "") }))
-          .sort((a: any, b: any) => a.totalCostBps - b.totalCostBps)[0];
-        if (best) partners[`USD/${dest}`] = { ...best, basis: `best all-in partner price for a ${SEND_USD.toLocaleString()} USD send, measured by Wise comparison data` };
-      }
     } catch (e: any) { notes.push(`USD/${dest} bank comparison unavailable (${e.message})`); }
   }));
-  return { mode: "live", loadedAt: new Date().toISOString(), mids, banks, partners, notes,
+  // Daily ECB history for FX risk on open bills (non-fatal if unavailable)
+  const history: Record<string, [string, number][]> = {};
+  try {
+    const start = new Date(Date.now() - 120 * 86400e3).toISOString().slice(0, 10);
+    const ts: any = await getJson(`https://api.frankfurter.dev/v1/${start}..?from=USD&symbols=${CORRIDORS.join(",")}`, 8000);
+    for (const [date, rates] of Object.entries<Record<string, number>>(ts.rates ?? {}).sort(([a], [b]) => a.localeCompare(b)))
+      for (const [c, v] of Object.entries(rates)) (history[c] ??= []).push([date, v]);
+  } catch (e: any) { notes.push(`rate history unavailable (${e.message}); FX risk on open bills is not computed`); }
+  return { mode: "live", loadedAt: new Date().toISOString(), mids, banks, notes, history,
     sources: ["https://api.frankfurter.dev (European Central Bank reference rates)", "https://open.er-api.com (currencies the ECB does not publish)",
-              "https://api.wise.com/v3/comparisons (measured bank and provider pricing)"] };
+              "https://api.wise.com/v3/comparisons (measured bank pricing)"] };
 }
 
 function synthetic(note: string): Market {
   const mids: Record<string, MidInfo> = {};
   for (const [c, r] of Object.entries(BUILTIN_MIDS)) mids[c] = { rate: r, source: "built-in demo table (synthetic)", date: "-" };
-  return { mode: "synthetic", loadedAt: new Date().toISOString(), mids, banks: {}, partners: {}, sources: [], notes: [note] };
+  return { mode: "synthetic", loadedAt: new Date().toISOString(), mids, banks: {}, sources: [], notes: [note] };
 }
 
 async function loadMarket(): Promise<Market> {
   if (process.env.LIVE_MARKET === "0") return synthetic("LIVE_MARKET=0: using the built-in demo table");
   let cached: Market | undefined;
   try { if (existsSync(FILE)) cached = JSON.parse(readFileSync(FILE, "utf8")); } catch { /* ignore a corrupt cache */ }
-  if (cached && !cached.partners) cached = undefined;           // cache from an older version: refetch
+  if (cached && (cached as any).partners) cached = undefined;   // cache from an older version: refetch
+  if (cached && !cached.history) cached = { ...cached, loadedAt: "1970-01-01T00:00:00Z" };   // older cache without history: refetch
   if (cached && cached.mode === "live" && Date.now() - Date.parse(cached.loadedAt) < MAX_AGE_MS) return { ...cached, mode: "cached" };
   try {
     const m = await fetchLive();
@@ -110,12 +108,14 @@ export function bankMarkup(src: string, dest: string, fallbackBps: number): { bp
   return { bps: fallbackBps, basis: `assumption (${fallbackBps} bps): live bank data unavailable` };
 }
 
+export function rateHistory(): Record<string, [string, number][]> { return MARKET.history ?? {}; }
+
 export function midInfo(ccy: string): MidInfo {
   return MARKET.mids[ccy] ?? { rate: MID_PER_USD[ccy] ?? "?", source: "built-in demo table (synthetic)", date: "-" };
 }
 
 export function marketSummary() {
   return { mode: MARKET.mode, loadedAt: MARKET.loadedAt, sources: MARKET.sources, notes: MARKET.notes,
-    banks: MARKET.banks, partners: MARKET.partners,
+    banks: MARKET.banks,
     mids: Object.fromEntries(Object.entries(MARKET.mids).map(([c, m]) => [c, `${m.rate} (${m.source}${m.date !== "-" ? `, ${m.date}` : ""})`])) };
 }

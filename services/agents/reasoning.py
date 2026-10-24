@@ -293,8 +293,8 @@ def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = 
              "live": any(a.get("x402Executable") for a in q["plan"].get("allocations", [])), "eligible": True}
         if cost is None or cost > limits["maxCostBps"]:
             o.update(eligible=False, why=f"cost {_pct(cost or 0)} above policy limit {_pct(limits['maxCostBps'])}")
-        elif bank is not None and cost >= bank:
-            o.update(eligible=False, why="no saving vs your bank")
+        elif bank is not None and cost > bank:
+            o.update(eligible=False, why="costs more than your bank")
         options.append(o)
 
     ok = [o for o in options if o["eligible"]]
@@ -314,7 +314,12 @@ def choose_route(quotes: dict, screen: dict | None, policy: str, limits: dict = 
     reasons.append("compared: " + " | ".join(
         f"{o['label']} {_pct(o['costBps'])}, {o['arrivalUtc'][:10]}, risk {o['risk']}" if o.get("costBps") is not None else f"{o['label']}: {o.get('why')}"
         for o in options))
-    decision = "hold" if hold else "approve"
+    # A screen REVIEW (e.g. bank details changed since the last payment) with a valid route is not a dead end: it becomes
+    # "review", carrying the quoted plan, and the company's controls require a call-back verification before anyone can
+    # approve it. Only "approve" is ever sent automatically by the CLI; "review" never is.
+    review_only = chosen is not None and s == "REVIEW" and len(hold) == 1
+    decision = "review" if review_only else ("hold" if hold else "approve")
     return {"decision": decision, "policy": policy, "chosen": chosen["provider"] if chosen else None,
-            "intentId": chosen["intentId"] if (chosen and decision == "approve") else None,
+            "intentId": chosen["intentId"] if (chosen and decision in ("approve", "review")) else None,
+            "needs": ["call-back verification on a number already on file"] if review_only else [],
             "routeIds": chosen["routeIds"] if chosen else [], "reasons": hold + reasons, "options": options}
