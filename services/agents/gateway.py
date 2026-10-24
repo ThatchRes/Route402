@@ -94,8 +94,10 @@ def payments_from_preview(r: dict) -> list:
                 and l.get("crossBorder", l.get("ccy") != home)]
     if r.get("template") == "send_to" and r.get("intent") and r.get("beneficiary"):
         it = r["intent"]
+        # "transfer 50000" with no currency fixes the home-currency debit (SOURCE_FIXED); a named supplier currency fixes what they receive
         return [{"payable": r.get("paymentRef") or f"send:{r['beneficiary'].get('name', 'beneficiary')}", "destCcy": it["destCcy"], "amount": it["amount"],
-                 "deadlineUtc": it.get("deadlineUtc"), "beneficiary": r["beneficiary"], "reference": r.get("paymentRef")}]
+                 "amountType": it.get("amountType", "RECIPIENT_FIXED"), "deadlineUtc": it.get("deadlineUtc"), "beneficiary": r["beneficiary"],
+                 "reference": r.get("paymentRef")}]
     return []
 
 

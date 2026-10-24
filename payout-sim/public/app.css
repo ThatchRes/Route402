@@ -22,22 +22,23 @@ a { color: var(--accent); } .mono { font-family: ui-monospace, SFMono-Regular, M
 .shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
 .shell > * { min-width: 0; }
 body.side-hidden .shell { grid-template-columns: minmax(0, 1fr); } body.side-hidden .side { display: none; }
-.side { background: var(--side); color: #fff; display: flex; flex-direction: column; gap: 24px; padding: 22px 16px 26px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
-.logo { position: relative; width: 64px; height: 70px; flex: none; align-self: center; display: block; text-decoration: none; }
-.logo img { position: absolute; display: block; max-width: none; }
-.logo-shield { left: 2px; top: 2px; } .logo-inset { left: 9px; top: 8px; } .logo-divider { left: 10px; top: 23.5px; }
-.logo-route, .logo-402 { position: absolute; font: 800 8.5px/normal var(--sans); color: var(--side); white-space: nowrap; }
-.logo-route { left: 17.5px; top: 9px; } .logo-402 { left: 8px; top: 26px; font-size: 25px; }
-.company { padding: 0 10px; display: grid; gap: 2px; line-height: 1.5; } .company b { color: #fff; font-size: 13px; font-weight: 600; } .company span { color: var(--side-sub); font-size: 11px; }
-.nav { display: grid; gap: 4px; }
-.nav a { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 6px; font-size: 13px; line-height: 1.5; color: var(--side-sub); text-decoration: none; }
+.side { background: var(--side); color: #fff; display: flex; flex-direction: column; gap: 14px; padding: 16px 12px 16px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+.logo { display: flex; align-items: center; gap: 10px; padding: 2px 8px; flex: none; text-decoration: none; color: #fff; }
+.logo-mark { flex: none; display: block; border-radius: 10px; box-shadow: 0 4px 14px rgba(0,0,0,.18); }
+.logo-word { display: grid; gap: 1px; line-height: 1.1; }
+.logo-word b { font: 700 17px/1.1 "Inter", var(--sans); letter-spacing: -.02em; color: #fff; }
+.logo-word i { font-style: normal; color: #8fd8cf; }
+.logo-word small { font: 500 10.5px/1.2 "Inter", var(--sans); color: var(--side-sub); letter-spacing: .01em; }
+.company { padding: 8px 10px; display: grid; gap: 0; line-height: 1.4; border-radius: 8px; background: rgba(255,255,255,.04); } .company b { color: #fff; font-size: 12.5px; font-weight: 600; } .company span { color: var(--side-sub); font-size: 10.5px; }
+.nav { display: grid; gap: 2px; }
+.nav a { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 6px; font-size: 13px; line-height: 1.4; color: var(--side-sub); text-decoration: none; }
 .nav a .ico { flex: none; width: 17px; height: 17px; }
 /* Icons are the Figma assets; the design shows only "Agent" active, so other states adjust the same asset's tone */
 .nav a:not(.active) .ico.on { opacity: .72; } .nav a.active .ico:not(.on) { filter: brightness(0) invert(1); }
 .nav a:hover { color: #fff; background: rgba(255,255,255,.05); }
 .nav a.active { background: var(--side-active); color: #fff; font-weight: 600; }
-.side-foot { margin-top: auto; padding: 0 10px; display: grid; gap: 16px; }
-.side-more { display: flex; flex-wrap: wrap; gap: 6px 14px; padding-bottom: 14px; border-bottom: 1px solid var(--side-active); }
+.side-foot { margin-top: auto; padding: 0 10px; display: grid; gap: 10px; }
+.side-more { display: flex; flex-wrap: wrap; gap: 4px 12px; padding-bottom: 10px; border-bottom: 1px solid var(--side-active); }
 .side-more a, .side-more .link { color: var(--side-sub); font-size: 11px; text-decoration: none; }
 .side-more a:hover, .side-more .link:hover, .side-more a.active { color: #fff; }
 .side-note { color: var(--side-sub); font-size: 10px; line-height: 1.5; }

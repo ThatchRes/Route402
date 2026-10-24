@@ -122,13 +122,17 @@ export const OFFRAMPS: Offramp[] = [
     tiers: [{ upToUsd: Infinity, bps: 0 }], fixedUsd: 0, capacityUsd: 1_000_000, payoutMin: 10, cutoffUtcHour: 24, always: true, source: SOURCES.juno },
 ];
 
-/** A live conversion quote for USDC -> local coin + redemption, entered from the venue (never a default).
- *  VENUE_QUOTES='{"EUR":{"bps":12,"source":"Circle Mint quote 2026-10-24 14:05"}}' */
-export function venueQuote(destCcy: string): { bps: number; source: string } | null {
+/** Venue quotes measured from public order books at market load (market.ts fills this, like MID_PER_USD). */
+export const LIVE_VENUES: Record<string, { bps: number; source: string; capacityUsd: number }> = {};
+
+/** A conversion quote for USDC -> local coin + redemption: a quote entered from the venue wins, else the live order-book
+ *  measurement, else none (never a default). VENUE_QUOTES='{"EUR":{"bps":12,"source":"Circle Mint quote 2026-10-24 14:05"}}' */
+export function venueQuote(destCcy: string): { bps: number; source: string; capacityUsd?: number } | null {
   try {
     const q = JSON.parse(process.env.VENUE_QUOTES ?? "{}")[destCcy];
-    return q && Number.isFinite(Number(q.bps)) && q.source ? { bps: Number(q.bps), source: String(q.source) } : null;
-  } catch { return null; }
+    if (q && Number.isFinite(Number(q.bps)) && q.source) return { bps: Number(q.bps), source: String(q.source) };
+  } catch { /* a malformed override falls through to the live quote */ }
+  return LIVE_VENUES[destCcy] ?? null;
 }
 
 // Our price (a pricing choice, not market data): a flat fee per payment sent on OUR stablecoin rail, set below the $45 median

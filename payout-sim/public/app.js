@@ -22,7 +22,7 @@ async function api(path, body) {
   if (!r.ok && !j.status && !j.requests) throw new Error(j.error || `HTTP ${r.status}`);
   return j;
 }
-let STATE = null, ME = null, USERS = [], POLICY = null, REQS = [];
+let STATE = null, ME = null, USERS = [], POLICY = null, REQS = [], GROWTH = null;
 const nameOf = (id) => (id === "system" ? "Route402" : USERS.find((u) => u.id === id)?.name ?? id);
 const billOf = (id) => STATE?.bills.find((b) => b.id === id);
 const reqFor = (billId) => REQS.find((r) => r.payable === billId && !["REJECTED", "REFUNDED"].includes(r.status));
@@ -35,7 +35,7 @@ const saveDraft = () => { try { sessionStorage.setItem("r402-draft", JSON.string
 // ------------------------------------------------------------------ shell
 const head = (title, sub, extra = "") => `<div class="page-head"><div><h1>${esc(title)}</h1><p>${esc(sub)}</p></div>
   ${extra ? `<div class="snap">${extra}</div>` : ""}</div>
-  <div class="notice wide">${STATE?.connected ? `Connected: ${esc(STATE.source.replace("Nessie customer", "Capital One ·"))} · ` : "Demo company data · "}Testnet money only · Supplier payouts simulated · x402 and escrow transactions are real testnet or local-chain transactions</div>`;
+  <div class="notice wide">${STATE?.connected ? "Connected to Capital One. " : "Demo company data. "}No real money moves: supplier payouts are simulated, and the agents pay for quotes with test tokens.</div>`;
 const steps = (n) => `<div class="steps3">${["Payment details", "Compare routes", "Review & approve"].map((t, i) =>
   `<div class="${i + 1 === n ? "on" : ""}"><b>${i + 1 < n ? "✓" : `0${i + 1}`}</b>${esc(t)}</div>`).join("")}</div>`;
 const foot = () => `<div class="foot2"><span>Route 402 · ${esc(STATE?.company ?? "")}</span><span>All timestamps UTC · Testnet only · <a href="#" data-sources>sources</a></span></div>`;
@@ -73,8 +73,9 @@ $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") clos
 async function loadAll() {
   const [s, m, r] = await Promise.all([api("/state"), api("/me"), api("/requests").catch(() => [])]);
   STATE = s; ME = m.user; USERS = m.users; POLICY = m.policy; REQS = r;
-  $("#co-name").textContent = s.company.replace(/ Inc\.?$/, "");
-  $("#co-sub").textContent = s.connected ? "Importer · bank connected" : "Importer · demo data";
+  api("/growth").then((g) => { GROWTH = g; if (typeof renderPastPayments === "function") renderPastPayments(); }).catch(() => {});
+  $("#co-name").textContent = s.company;
+  $("#co-sub").textContent = s.connected ? "Manufacturer · bank connected" : "Manufacturer · demo data";
   $("#who").innerHTML = ME ? `<span class="avatar" aria-hidden="true">${esc(initials(ME.name))}</span><span class="id"><b>${esc(ME.name)}</b><span>${esc(ME.title)} · <button class="link" id="signout">Sign out</button></span></span>`
     : `<span class="avatar" aria-hidden="true">–</span><span class="id"><b>Not signed in</b><button class="link strong" id="signin">Sign in →</button></span>`;
   shellStatus();
@@ -97,8 +98,22 @@ async function route() {
     loadAll().then(updateChatContext).catch(() => updateChatContext(false));
     return;
   }
-  try { await loadAll(); } catch (e) { $("#page").innerHTML = `<div class="alert bad">Router not reachable: ${esc(e.message)}</div>`; return; }
-  const P = $("#page");
+  // Switching pages is instant once data has loaded: render from what is already here, then refresh in the background and
+  // re-render only if something changed (and not while the person is typing in a field on this page).
+  const hash = location.hash, render = () => renderPage($("#page"), page, a, b, q);
+  if (!STATE) {
+    try { await loadAll(); } catch (e) { $("#page").innerHTML = `<div class="alert bad">Router not reachable: ${esc(e.message)}</div>`; return; }
+    return render();
+  }
+  const before = JSON.stringify([STATE, REQS, ME, POLICY]);
+  render();
+  loadAll().then(() => {
+    if (location.hash !== hash || JSON.stringify([STATE, REQS, ME, POLICY]) === before) return;
+    if ($("#page").contains(document.activeElement) && document.activeElement.matches("input, textarea, select")) return;
+    render();
+  }).catch(() => {});
+}
+function renderPage(P, page, a, b, q) {
   if (page === "payments" && a === "new") return pageCreate(P, q);
   if (page === "payments" && a === "compare") return pageCompare(P);
   if (page === "payments" && a === "review") return pageReview(P);
@@ -204,6 +219,7 @@ function pagePayments(P) {
   const started = new Set(REQS.filter((r) => !["REJECTED", "REFUNDED"].includes(r.status)).map((r) => r.payable));
   const open = STATE.bills.filter((b) => !started.has(b.id) && b.paid?.status !== "COMPLETED");
   P.innerHTML = `${head("Payments", "Every supplier payment, from draft to settlement.")}
+    <div id="portfolio"></div>
     <div class="actionbar"><div class="mid"><b>${REQS.length} payment request(s) · ${open.length} open bill(s) not started</b><span>Prepared by one person, approved by another. Nothing moves until your controls are met.</span></div><a class="btn primary" href="#/payments/new">New payment</a></div>
     <div class="panel2 scroll"><span class="label accent">Payment requests</span>${REQS.length ? `<table class="tbl" style="margin-top:8px"><thead><tr><th>Reference</th><th>Supplier</th><th>Debit</th><th>Route</th><th>Status</th><th>Next step</th></tr></thead><tbody>
       ${REQS.map((r) => `<tr class="click" data-go="#/payments/${r.id}"><td><b>${esc(r.payable)}</b><div class="note mono">${esc(r.id)}</div></td><td>${esc(r.supplier)}</td><td>${usd(r.debitUsd, 2)}</td>
@@ -213,6 +229,10 @@ function pagePayments(P) {
       ${open.map((b) => `<tr><td><b>${esc(b.id)}</b></td><td>${esc(b.supplier)}</td><td>${money(`${b.amount} ${b.ccy}`)}</td><td>${day(b.dueUtc)}</td><td>${checkPill(b)}</td>
         <td>${b.check === "BLOCK" ? `<a href="#/suppliers/${b.id}">Fix details</a>` : `<a class="btn sm" href="#/payments/new?bill=${b.id}">Start</a>`}</td></tr>`).join("") || `<tr><td colspan="6" class="muted">Every bill has a payment request.</td></tr>`}</tbody></table></div>${foot()}`;
   $$("[data-go]").forEach((tr) => tr.onclick = () => (location.hash = tr.dataset.go));
+  // savings across all payments: paid so far plus open bills projected (the payment pages show one payment each)
+  Promise.all([api("/growth").catch(() => null), api("/impact").catch(() => null)]).then(([g, imp]) => {
+    GROWTH = g ?? GROWTH; const el = $("#portfolio"); if (el && location.hash.startsWith("#/payments")) el.innerHTML = portfolioPanel(g, imp);
+  });
 }
 const checkPill = (b) => b.check === "BLOCK" ? pill("bad", "Blocked") : b.detailsChanged ? pill("warn", "Details changed") : b.check === "REVIEW" ? pill("warn", "Review") : pill("ok", "Verified");
 function nextStep(r) {
@@ -262,7 +282,7 @@ function renderCompare(P) {
   if (!d.selected && rec) d.selected = rec.provider;
   const sel = ok.find((r) => r.provider === d.selected), budget = d.mode === "budget";
   const card = (r) => {
-    if (r.provider === "tokenized_deposit") return `<div class="rcard off"><div class="lbl">NOT AVAILABLE YET</div><div class="nm">${RAIL.tokenized_deposit}</div><div class="st">${pill("draft", "Planned")}<span>no quote</span></div>
+    if (r.provider === "tokenized_deposit" && r.status !== "OK") return `<div class="rcard off"><div class="lbl">NOT SWITCHED ON</div><div class="nm">${RAIL.tokenized_deposit}</div><div class="st">${pill("draft", "Off")}<span>no quote</span></div>
       <div class="cmp">${esc(r.reason)}</div><hr/><div class="kv2"><div class="k">SETTLEMENT</div><div class="v">Designed for 24/7</div></div><div class="kv2"><div class="k">RELEASE CONDITION</div><div class="v">Locked and released on the ledger</div></div>
       <div class="rel">When your bank joins a network, this route turns on and your approvals, conditions and supplier records carry over.</div></div>`;
     if (r.status !== "OK") return `<div class="rcard off"><div class="lbl">${r.provider === "stablecoin" && /paused|cap/i.test(r.reason ?? "") ? "PAUSED BY YOUR SAFETY POLICY" : "NO QUOTE"}</div><div class="nm">${RAIL[r.provider]}</div>
@@ -270,7 +290,8 @@ function renderCompare(P) {
     const e = r.economics, x = r.breakdown, isSel = r.provider === d.selected, isRec = r === rec;
     const opt = d.agent?.decision?.options?.find((o) => o.provider === r.provider);
     const vsRec = rec && r !== rec ? (budget ? num(r.supplierGets) - num(rec.supplierGets) : e.allInUsd - rec.economics.allInUsd) : 0;
-    return `<div class="rcard ${isSel ? "sel" : ""}"><div class="lbl">${isRec ? "RECOMMENDED FOR THIS PAYMENT" : opt?.intentId ? "PAID QUOTE · X402" : "ROUTER QUOTE"}</div><div class="nm">${RAIL[r.provider]}</div>
+    const passed = (r.compliance ?? []).filter((c) => c.status === "pass").length;
+    return `<div class="rcard ${isSel ? "sel" : ""}"><div class="lbl">${isRec ? "RECOMMENDED FOR THIS PAYMENT" : opt?.intentId ? "PAID QUOTE · X402" : "ROUTER QUOTE"}</div><div class="nm">${r.provider === "tokenized_deposit" ? esc(r.routeLabel ?? RAIL.tokenized_deposit) : RAIL[r.provider]}</div>
       <div class="st">${isSel ? pill("ok", "✓ Selected") : pill("draft", "Available")}<span>Expires ${utc(r.expiresAt)} · <span data-exp="${esc(r.expiresAt)}"></span></span></div>
       <div class="fig"><div class="k">${budget ? "NET RECIPIENT AMOUNT" : "TOTAL SOURCE DEBIT · FEES INCLUDED"}</div><div class="v">${money(budget ? r.supplierGets : r.youPay)}</div></div>
       <div class="cmp ${isRec ? "good" : ""}">${isRec ? (SORT === "speed" ? "Fastest arrival among available routes." : "Lowest all-in cost within your requested delivery.") : budget ? `${fmt(Math.abs(vsRec))} ${esc(b.ccy)} ${vsRec < 0 ? "less" : "more"} for the supplier than the recommended route.` : `${usd(Math.abs(vsRec), 2)} ${vsRec > 0 ? "more" : "less"} all-in than the recommended route.`}</div><hr/>
@@ -282,7 +303,8 @@ function renderCompare(P) {
       <div class="cmp ${e.meetsDeadline ? "" : "warn"}">${e.meetsDeadline ? `Send by ${when(e.sendBy)} · meets requested delivery` : "May exceed the requested delivery date"}</div><hr/>
       <div class="row2"><span>Cost of sending early</span><b>${usd(e.sendingEarlyUsd, 2)}</b></div><div class="note">${e.transitDays.toFixed(1)} days in transit × your ${e.costOfCashPct}% cost of cash</div>
       <div class="row2 total"><span>All-in cost</span><b>${usd(e.allInUsd, 2)}</b></div><hr/>
-      <div class="elig">✓ Eligible · ${r.provider === "stablecoin" ? "supplier accepts USDC" : "saved receiving details"}${opt ? ` · agent risk ${opt.risk}/5` : ""}</div>
+      <div class="elig">✓ Eligible · ${r.provider === "stablecoin" ? "supplier accepts USDC" : r.provider === "tokenized_deposit" ? "bank deposit on your bank's ledger, 24/7" : "saved receiving details"}${opt ? ` · agent risk ${opt.risk}/5` : ""}</div>
+      ${passed ? `<div class="elig" title="${esc((r.compliance ?? []).map((c) => `${c.label}: ${c.detail}`).join(" · "))}">✓ Compliance: ${passed} check${passed === 1 ? "" : "s"} passed</div>` : ""}
       <div class="rel">Historical reliability: not available. No verified provider performance history.</div>
       ${isSel ? `<button class="btn primary select" disabled>✓ ${RAIL[r.provider]} selected</button>` : `<button class="btn select" data-pick="${r.provider}">Select route</button>`}</div>`;
   };
@@ -355,6 +377,15 @@ async function act(r, kind, P) {
   const form = (fields, label, p, map, cls = "primary") => { f.innerHTML = `<div class="inline-form">${fields.map(([k, ph]) => `<input id="f-${k}" placeholder="${esc(ph)}" />`).join("")}<button class="btn sm ${cls}" id="f-go">${label}</button></div>`; $("#f-go").onclick = () => send(p, map()); };
   if (kind === "callback") form([["phone", "Number dialled (from your vendor master)"], ["who", "Who confirmed the new details"]], "Details confirmed", "callback", () => ({ phoneOnFile: $("#f-phone").value, contact: $("#f-who").value }));
   if (kind === "confirmDelivery") form([["doc", "Bill of lading or goods-receipt number"]], r.escrow?.state === "LOCKED" ? "Goods received: release escrow" : "Goods received: release", "delivery", () => ({ documentRef: $("#f-doc").value }));
+  if (kind === "presentDocuments") {
+    const plats = STATE.documents?.platforms ?? [], insp = r.documentary?.terms?.documents?.includes("inspection_certificate");
+    f.innerHTML = `<div class="inline-form docs-form"><input id="f-ebl" placeholder="eBL number, e.g. EBL-1A2B3C4D" /><select id="f-plat">${plats.map((p) => `<option value="${p.id}">${esc(p.label)}</option>`).join("")}</select>
+      <input id="f-inv" placeholder="Commercial invoice number" value="${esc(r.reference)}" />${insp ? `<input id="f-insp" placeholder="Inspection certificate number" />` : ""}
+      <button class="btn sm primary" id="f-go">Check documents</button><button class="btn sm ghost" id="f-demo" title="Demo only: a simulated carrier issues the eBL and endorses title to you">Simulate carrier eBL</button></div>`;
+    $("#f-demo").onclick = async () => { try { const e = await api(`/requests/${r.id}/ebl-demo`, { platform: $("#f-plat").value }); $("#f-ebl").value = e.ref; if (e.inspectionRef && $("#f-insp")) $("#f-insp").value = e.inspectionRef; } catch (err) { f.insertAdjacentHTML("beforeend", `<div class="alert bad">${esc(err.message)}</div>`); } };
+    $("#f-go").onclick = () => send("documents", { eblRef: $("#f-ebl").value, platform: $("#f-plat").value, invoiceRef: $("#f-inv").value, inspectionRef: $("#f-insp")?.value });
+    return;
+  }
   if (kind === "reject") form([["why", "Reason"]], "Reject payment", "reject", () => ({ why: $("#f-why").value }), "danger");
 }
 
@@ -400,16 +431,22 @@ $("#open-policy").addEventListener("click", () => {
       <div class="field"><label><input type="checkbox" name="requireCallbackOnDetailsChange" ${p.requireCallbackOnDetailsChange ? "checked" : ""} ${dis} /> Require a call-back when a supplier's bank details change</label></div>
       ${nf("requoteTolerancePct", "Re-approve if an expired quote moves more than (%)", "0.1")}${nf("depegBandPct", "Pause the USDC route if its price is further than (%) from 1.00", "0.1")}
       <div class="field"><label><input type="checkbox" name="depegFailClosed" ${p.depegFailClosed ? "checked" : ""} ${dis} /> Also pause it when no live USDC price can be read</label></div>
-      ${nf("issuerCapUsd", "Most in flight or in escrow with one stablecoin issuer (USD)")}${nf("escrowDeadlineDays", "Escrow refundable after (days)")}${nf("fxRiskLimitUsd", "Flag a currency when its 95% FX move on open bills exceeds (USD)")}
+      ${nf("issuerCapUsd", "Most in flight or in escrow with any one stablecoin issuer, e.g. Circle or Ripple (USD); bigger payments split across issuers")}${nf("escrowDeadlineDays", "Escrow refundable after (days)")}${nf("fxRiskLimitUsd", "Flag a currency when its 95% FX move on open bills exceeds (USD)")}
+      ${nf("lcFeePct", "Your bank's letter-of-credit fee (%), to compare document-checked payments against", "0.05")}
+      ${policyTokenized(dis)}${policyCompliance(dis)}
       ${admin ? `<button class="btn primary sm">Save policy</button>` : `<p class="note">${ME ? "Only an admin can change the policy." : "Sign in as an admin to change it."}</p>`}<div id="pol-out"></div></form>
     <table class="tbl" style="margin-top:16px"><thead><tr><th>Person</th><th>Role</th><th>Limit</th></tr></thead><tbody>${USERS.map((u) => `<tr><td><b>${esc(u.name)}</b><div class="note">${esc(u.title)}</div></td><td>${esc(u.roles.join(", "))}</td>
       <td>${u.roles.includes("approver") ? (u.approvalLimitUsd ? usd(u.approvalLimitUsd) : "No limit") : "Cannot approve"}</td></tr>`).join("")}</tbody></table>
     <div style="text-align:right;margin-top:14px"><button class="btn ghost" id="m-x">Close</button></div>`);
   $("#m-x").onclick = closeModal;
   $("#pol").onsubmit = async (e) => { e.preventDefault(); const f = new FormData(e.target), body = {};
-    for (const k of ["dualApprovalOverUsd", "requoteTolerancePct", "depegBandPct", "issuerCapUsd", "escrowDeadlineDays", "fxRiskLimitUsd"]) body[k] = Number(f.get(k));
+    for (const k of ["dualApprovalOverUsd", "requoteTolerancePct", "depegBandPct", "issuerCapUsd", "escrowDeadlineDays", "fxRiskLimitUsd", "lcFeePct"]) body[k] = Number(f.get(k));
     body.requireCallbackOnDetailsChange = f.get("requireCallbackOnDetailsChange") === "on"; body.depegFailClosed = f.get("depegFailClosed") === "on";
-    try { POLICY = await api("/policy", body); $("#pol-out").innerHTML = `<div class="alert ok">Saved and logged.</div>`; } catch (err) { $("#pol-out").innerHTML = `<div class="alert bad">${esc(err.message)}</div>`; } };
+    body.tokenized = f.get("tk_network") ? { network: f.get("tk_network"), currencies: f.get("tk_currencies"), countries: f.get("tk_countries"), fxMarginBps: f.get("tk_fx"),
+      feeUsd: f.get("tk_fee"), settlementMinutes: f.get("tk_minutes"), tariffSource: f.get("tk_source") } : null;
+    body.compliance = { geniusEnforceFrom: f.get("c_from"), geniusPermittedTokens: f.get("c_tokens"), blockedCountries: f.get("c_blocked"),
+      travelRuleThresholdUsd: Number(f.get("c_travel")), micaForEea: f.get("c_mica") === "on", requireWalletScreening: f.get("c_screen") === "on" };
+    try { POLICY = await api("/policy", body); await loadAll(); $("#pol-out").innerHTML = `<div class="alert ok">Saved and logged.</div>`; } catch (err) { $("#pol-out").innerHTML = `<div class="alert bad">${esc(err.message)}</div>`; } };
 });
 $("#open-connect").addEventListener("click", () => {
   modal(`<h2>Connect your bank</h2><div class="dots"><span class="on"></span><span></span><span></span></div>
@@ -431,6 +468,30 @@ $("#open-connect").addEventListener("click", () => {
     } catch (err) { modal(`<h2>Could not connect</h2><div class="alert bad">${esc(err.message)}</div><div style="text-align:right;margin-top:12px"><button class="btn" id="m-x">Close</button></div>`); $("#m-x").onclick = closeModal; }
   };
 });
+// Policy sections: the bank's tokenized-deposit tariff, and the compliance rules the router enforces
+function policyTokenized(dis) {
+  const t = STATE?.tokenized ?? {}, c = t.config ?? {}, input = (n, v, ph, w = "") => `<input name="${n}" value="${esc(v ?? "")}" placeholder="${esc(ph)}" ${dis} style="${w}" />`;
+  return `<fieldset class="pol-sec"><legend>Tokenized deposits at your bank</legend>
+    <p class="note">A deposit token is an ordinary deposit at your bank that moves on its ledger 24/7. Turn it on with the tariff your bank gives you; Route402 never guesses a price.</p>
+    <div class="field"><label class="label">Network</label><select name="tk_network" ${dis}><option value="">Off</option>${(t.catalog ?? []).map((n) => `<option value="${n.id}" ${c.network === n.id ? "selected" : ""}>${esc(n.label)} · ${esc(n.operator)}</option>`).join("")}</select></div>
+    <div class="pol-grid">${[["tk_currencies", (c.currencies ?? []).join(", "), "Currencies, e.g. USD, EUR, GBP"], ["tk_countries", (c.countries ?? []).join(", "), "Supplier countries, e.g. DE, GB"],
+      ["tk_fx", c.fxMarginBps, "FX margin (bps)"], ["tk_fee", c.feeUsd, "Fee per payment (USD)"], ["tk_minutes", c.settlementMinutes, "Settlement (minutes)"]].map(([n, v, ph]) => `<div class="field"><label class="label">${esc(ph)}</label>${input(n, v, ph)}</div>`).join("")}</div>
+    <div class="field"><label class="label">Where the tariff comes from</label>${input("tk_source", c.tariffSource, "e.g. bank fee schedule, Oct 2026", "width:100%")}</div>
+    ${(t.catalog ?? []).map((n) => `<p class="note">• <a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.label)}</a>: ${esc(n.status)}</p>`).join("")}</fieldset>`;
+}
+function policyCompliance(dis) {
+  const p = STATE?.compliance?.policy ?? {}, input = (n, v, ph) => `<input name="${n}" value="${esc(v ?? "")}" placeholder="${esc(ph)}" ${dis} />`;
+  return `<fieldset class="pol-sec"><legend>Compliance rules</legend>
+    <p class="note">Checked before a route is quoted and again before money moves. These are company settings, not legal advice: have counsel confirm them.</p>
+    <div class="pol-grid">
+      <div class="field"><label class="label">GENIUS Act issuer rule applies from</label><input type="date" name="c_from" value="${esc(p.geniusEnforceFrom ?? "")}" ${dis} /></div>
+      <div class="field"><label class="label">Stablecoins confirmed from permitted issuers</label>${input("c_tokens", (p.geniusPermittedTokens ?? []).join(", "), "e.g. USDC, EURC (once approved)")}</div>
+      <div class="field"><label class="label">Sanctioned countries (no routes)</label>${input("c_blocked", (p.blockedCountries ?? []).join(", "), "CU, IR, KP")}</div>
+      <div class="field"><label class="label">Travel Rule threshold (USD)</label>${input("c_travel", p.travelRuleThresholdUsd, "3000")}</div></div>
+    <div class="field"><label><input type="checkbox" name="c_mica" ${p.micaForEea !== false ? "checked" : ""} ${dis} /> EU/EEA suppliers: only MiCA-authorized e-money tokens</label></div>
+    <div class="field"><label><input type="checkbox" name="c_screen" ${p.requireWalletScreening !== false ? "checked" : ""} ${dis} /> Never pay a supplier wallet that could not be sanctions-screened</label></div>
+    <p class="note"><a href="/ui/compliance/tax-report.csv" download>Download the digital-asset tax report (CSV) ↓</a> · fields for Form 1099-DA and CARF/DAC8 reporting</p></fieldset>`;
+}
 function showSources() {
   modal(`<h2>Sources and what is simulated</h2><ul class="perm small">${Object.values(STATE.sources).map((x) => `<li>${esc(x)}</li>`).join("")}${(STATE.market.sources ?? []).map((x) => `<li>${esc(x)}</li>`).join("")}
     <li>USDC price: Coinbase and Kraken public tickers (cautious reading of the two).</li><li>FX risk: European Central Bank reference rates via Frankfurter.</li>

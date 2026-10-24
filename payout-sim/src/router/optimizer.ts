@@ -5,18 +5,25 @@ import { convert, decimals, fmt, toMinor } from "../money.js";
 import { BANKS, NETWORKS, OFFRAMPS, ONRAMPS, PLATFORM, STABILITY, SWAPS, TOKENS, MID_PER_USD, venueQuote, localBankRoutes, type Tier } from "./registry.js";
 import { latestStart, planningNow } from "./timing.js";
 import { div, lessBps, mul } from "./rates.js";
-import { bankMarkup, MARKET, midInfo } from "./market.js";   // live mids overwrite the demo table before any price is computed
+import { bankMarkup, MARKET, midInfo } from "./market.js";
+import { networkLabel, tokenizedConfig, tokenizedUnavailable } from "./tokenized.js";
+import { STABLECOINS } from "./compliance.js";
+/** The stablecoin issuer a route holds money with while it is in flight (first coin of the route), or null for bank routes. */
+export const issuerOfCoins = (coins: string[]) => (coins.length ? STABLECOINS[coins[0]]?.issuer ?? coins[0] : null);   // live mids overwrite the demo table before any price is computed
 
 export interface Intent {
   srcCcy: string; destCcy: string; amountType: "SOURCE_FIXED" | "RECIPIENT_FIXED"; amount: string;
   deadlineUtc?: string; objective?: "balanced" | "cheapest" | "fastest";   // default balanced = cost + speed
   allowSplit?: boolean; nowUtc?: string; midOverrides?: Record<string, string>;     // e.g. {"USD/XOF": "605.2"}
   liveOnly?: boolean;   // only routes whose funding can really execute today (x402 USDC on Base) or bank routes
-  provider?: "stablecoin" | "bank";   // one provider's routes only (each provider quotes separately)
+  provider?: "stablecoin" | "bank" | "bank_wire" | "tokenized_deposit";   // one provider's routes only (each provider quotes separately)
   beneficiaryAcceptsUsdc?: boolean;   // supplier has a USDC wallet on file (USD-invoiced suppliers)
   reference?: string;                 // invoice reference carried with the payment (kept on the receipt)
   beneficiary?: any;                  // supplier details (payee history is updated when the payment completes)
   deadlineBufferMinutes?: number;
+  issuerHeadroomUsd?: Record<string, number>;   // how much more each stablecoin issuer may hold under the company's per-issuer cap
+  excludeCoins?: string[];      // coins the company's compliance rules forbid for this supplier (e.g. non-MiCA tokens to the EEA)
+  bankComplement?: boolean;     // the stablecoin plan may send the part above its issuers' caps through the company's bank wire
   allowedRouteIds?: string[];         // dispatcher restricts re-planning to the user's approved routes
   currentBank?: { label: string; fxMarkupBps: number; wireFeeUsd: number; businessDays: number; measured?: boolean };   // the company's own bank = baseline
   // measured: true -> the FX markup comes from measured bank pricing for this corridor (market.ts); fxMarkupBps is only the fallback
@@ -72,6 +79,18 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
         return addBizDays(start, b.businessDays);
       } });
   }
+  // Tokenized deposit at the company's own bank: the bank converts at the margin in its tariff, the ledger settles 24/7
+  // in the bank's stated time, and the supplier is credited in its local account. Offered only when an admin has entered
+  // that tariff and it covers this corridor and the supplier's country (tokenized.ts).
+  const tk = tokenizedConfig();
+  if (tk && !tokenizedUnavailable(it.srcCcy, it.destCcy, it.beneficiary?.country)) {
+    const label = `${networkLabel(tk.network)} (tokenized deposit at your bank)`;
+    routes.push({ routeId: `tokenized:${tk.network}`, kind: "bank", label, x402Executable: false, capacityUsd: Infinity, pegDeviation: 0, coins: [],
+      steps: [`${it.srcCcy} deposit token at your bank`, `${networkLabel(tk.network)} ${sameCcy ? "transfer" : `FX ${it.srcCcy}->${it.destCcy} at ${tk.fxMarginBps} bps`} (${tk.tariffSource})`, `${it.destCcy} credit to the supplier's account`],
+      build: (amountType, amount) => ({ route: "bank", srcCcy: it.srcCcy, destCcy: it.destCcy, amountType, amount,
+        fxRate: lessBps(mid(it.srcCcy, it.destCcy, o), sameCcy ? 0 : tk.fxMarginBps), fundingFee: usdToCcy(tk.feeUsd, it.srcCcy, o), payoutFee: "0" }),
+      arrival: (now) => new Date(now.getTime() + tk.settlementMinutes * 60e3) });   // 24/7: no cut-offs or business days
+  }
   for (const on of ONRAMPS.filter((x) => x.src === it.srcCcy)) {
     const tok = TOKENS.find((t) => t.id === on.token)!;
     for (const net of NETWORKS.filter((n) => n.token === tok.id)) {
@@ -109,7 +128,7 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
           try { swapRate = lessBps(mid(t1.peg, t2.peg, o), vq.bps); pegToDest = mid(t2.peg, it.destCcy, o); } catch { continue; }
           const live = t1.id === "USDC" && netId === "base";
           routes.push({ routeId: `coin:${t1.id}>${t2.id}:${netId}:${off.id}`, kind: "stablecoin", label: `${t1.id}->${t2.id} swap on ${netId}, ${off.label}`,
-            token: t1.id, network: netId, x402Executable: live, capacityUsd: Math.min(on.capacityUsd, sw.capacityUsd, off.capacityUsd),
+            token: t1.id, network: netId, x402Executable: live, capacityUsd: Math.min(on.capacityUsd, sw.capacityUsd, off.capacityUsd, vq.capacityUsd ?? Infinity),
             pegDeviation: Math.max(t1.pegDeviation, t2.pegDeviation), coins: [t1.id, t2.id],
             steps: [`${it.srcCcy} debit`, `onramp ${it.srcCcy}->${t1.id}`, `${t1.id} on ${netId}${live ? " (x402 funding)" : ""}`,
                     `${t1.id}->${t2.id} at venue quote ${vq.bps} bps (${vq.source})`, `${off.label} ${t2.id}->${it.destCcy}`, `${it.destCcy} credit`],
@@ -127,7 +146,9 @@ export function enumerateRoutes(it: Intent): { routes: Route[]; missing: string[
       }
     }
   }
-  return { routes, missing, unpriced: [...new Set(unpriced)] };
+  const banned = new Set(it.excludeCoins ?? []), allowed = routes.filter((r) => !r.coins.some((c) => banned.has(c)));
+  for (const c of new Set(routes.flatMap((r) => r.coins).filter((c) => banned.has(c)))) unpriced.push(`${c}: not allowed for this supplier under your compliance rules`);
+  return { routes: allowed, missing, unpriced: [...new Set(unpriced)] };
 }
 
 export interface Priced {
@@ -153,6 +174,8 @@ function price(r: Route, it: Intent, amount: string, now: Date, deadline?: Date)
   const out: Priced = { ...base, quote, arrivalUtc: arrival.toISOString(), costMinor: binding, timeCostMinor: time, scoreMinor: score, eligible: true };
   const fail = (reason: string) => ({ ...out, eligible: false, reason });
   if (sizeUsd > r.capacityUsd) return fail(`exceeds provider capacity (${r.capacityUsd.toLocaleString()} USD-eq); a split may help`);
+  const issuer = issuerOfCoins(r.coins), room = issuer ? it.issuerHeadroomUsd?.[issuer] : undefined;
+  if (room !== undefined && sizeUsd > room) return fail(`exceeds provider capacity (${issuer} issuer cap: ${Math.max(0, Math.round(room)).toLocaleString()} USD left); a split across issuers may help`);
   if (deadline && arrival.getTime() + (it.deadlineBufferMinutes ?? 0) * 60_000 > deadline.getTime()) return fail(`arrives ${arrival.toISOString()}, cannot meet recipient deadline ${deadline.toISOString()}${it.deadlineBufferMinutes ? ` with ${it.deadlineBufferMinutes} min buffer` : ""}`);
   if (r.pegDeviation > STABILITY.maxPegDeviation) return fail(`${r.coins.join("/")} is ${r.pegDeviation} off peg (limit ${STABILITY.maxPegDeviation}): not stable enough`);
   return out;
@@ -172,11 +195,16 @@ export function optimize(it: Intent) {
     return { status: "MISSING_INPUT", missing: ["valid planning time, recipient deadline and non-negative buffer are required"] };
   const { routes, missing, unpriced } = enumerateRoutes(it);
   if (missing.length) return { status: "MISSING_INPUT", missing };
-  const ofProvider = (id: string) => id.startsWith("coin:") ? "stablecoin" : "bank";
-  const usable = routes.filter((r) => (!it.liveOnly || r.kind === "bank" || r.x402Executable) && (!it.provider || ofProvider(r.routeId) === it.provider)
+  // Providers: our stablecoin rail; the company's bank, which offers its wire and, when switched on, its tokenized deposits.
+  // "bank" covers both (the agents' bank quote picks the better of the two); "bank_wire" and "tokenized_deposit" isolate one.
+  const ofProvider = (id: string) => (id.startsWith("coin:") ? "stablecoin" : id.startsWith("tokenized:") ? "tokenized_deposit" : "bank_wire");
+  // the bank wire as a complement: only inside a split with at least one stablecoin leg, never as the stablecoin plan on its own
+  const complement = (id: string) => it.provider === "stablecoin" && !!it.bankComplement && ofProvider(id) === "bank_wire";
+  const fromProvider = (id: string) => !it.provider || ofProvider(id) === it.provider || (it.provider === "bank" && ofProvider(id) !== "stablecoin") || complement(id);
+  const usable = routes.filter((r) => (!it.liveOnly || r.kind === "bank" || r.x402Executable) && fromProvider(r.routeId)
     && (!it.allowedRouteIds || it.allowedRouteIds.includes(r.routeId)) && (process.env.LOCAL_ROUTING !== "1" || r.kind === "bank"));
   const priced = usable.map((r) => price(r, it, it.amount, now, deadline));
-  const eligible = priced.filter((p) => p.eligible).sort((a, b) => (it.objective === "fastest"
+  const eligible = priced.filter((p) => p.eligible && !complement(p.routeId)).sort((a, b) => (it.objective === "fastest"
     ? a.arrivalUtc.localeCompare(b.arrivalUtc) || Number(a.scoreMinor - b.scoreMinor) : Number(a.scoreMinor - b.scoreMinor)));
   const bestUnsplit = eligible[0];
 
@@ -190,6 +218,7 @@ export function optimize(it: Intent) {
     const shares2 = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((x) => [x, 10 - x]);
     const shares3 = [[2, 2, 6], [2, 4, 4], [2, 6, 2], [4, 2, 4], [4, 4, 2], [6, 2, 2], [2, 3, 5], [3, 3, 4], [5, 3, 2], [4, 3, 3]];
     const tryCombo = (rs: Route[], shares: number[]) => {
+      if (rs.every((r) => complement(r.routeId))) return;   // a stablecoin plan needs at least one stablecoin leg
       const amts = shares.map((s) => (total * BigInt(s)) / 10n); amts[amts.length - 1] = total - amts.slice(0, -1).reduce((x, y) => x + y, 0n);
       const kids: Priced[] = [];
       for (let i = 0; i < rs.length; i++) {
@@ -197,6 +226,17 @@ export function optimize(it: Intent) {
         if (!p.eligible) return;
         kids.push(p);
       }
+      // legs with the same issuer share that issuer's headroom under the company's cap
+      if (it.issuerHeadroomUsd) {
+        const per: Record<string, number> = {};
+        rs.forEach((r, i) => { const iss = issuerOfCoins(r.coins); if (iss) per[iss] = (per[iss] ?? 0) + (it.amountType === "SOURCE_FIXED" ? usdOf(str(amts[i]), it.srcCcy, it.midOverrides ?? {}) : usdOf(str(amts[i]), it.destCcy, it.midOverrides ?? {})); });
+        if (Object.entries(per).some(([iss, v]) => it.issuerHeadroomUsd![iss] !== undefined && v > it.issuerHeadroomUsd![iss])) return;
+      }
+      // legs converting through the same venue (e.g. USDC>XSGD on two networks) draw on one order book: they share its depth
+      const venue: Record<string, { used: number; cap: number }> = {};
+      rs.forEach((r, i) => { if (r.coins.length < 2) return; const k = r.coins.join(">"), v = venue[k] ??= { used: 0, cap: r.capacityUsd };
+        v.used += it.amountType === "SOURCE_FIXED" ? usdOf(str(amts[i]), it.srcCcy, it.midOverrides ?? {}) : usdOf(str(amts[i]), it.destCcy, it.midOverrides ?? {}); v.cap = Math.min(v.cap, r.capacityUsd); });
+      if (Object.values(venue).some((v) => v.used > v.cap)) return;
       const score = kids.reduce((s, k) => s + k.scoreMinor, 0n);
       const arrivalUtc = kids.map((k) => k.arrivalUtc).sort().at(-1)!;
       if (!bestSplit || (it.objective === "fastest" ? arrivalUtc < bestSplit.arrivalUtc || (arrivalUtc === bestSplit.arrivalUtc && better(score, bestSplit.scoreMinor))
@@ -215,7 +255,7 @@ export function optimize(it: Intent) {
     ?? routes.filter((r) => r.routeId === baselineId).map((r) => price(r, it, it.amount, now, undefined))[0];   // baseline even if filtered by liveOnly
   if (!chosen) return { status: "HOLD", reason: process.env.LOCAL_ROUTING === "1" && it.provider === "stablecoin" ? "stablecoin settlement disabled in LOCAL_ROUTING; use simulated bank routes"
     : priced.length ? [...new Set(priced.map((p) => `${p.label}: ${p.reason}`))].join("; ")
-    : it.provider === "stablecoin" ? (unpriced.length ? unpriced.join("; ") : `our stablecoin rail has no published-price route to ${it.destCcy} yet`) : "no eligible route or allocation",
+    : it.provider === "tokenized_deposit" ? (tokenizedUnavailable(it.srcCcy, it.destCcy, it.beneficiary?.country) ?? "no tokenized route meets this payment's deadline") : it.provider === "stablecoin" ? (unpriced.length ? unpriced.join("; ") : `our stablecoin rail has no published-price route to ${it.destCcy} yet`) : "no eligible route or allocation",
     deadlineUtc: it.deadlineUtc, earliestArrivalUtc: priced.filter((p) => p.quote).map((p) => p.arrivalUtc).sort()[0] ?? null,
     unpriced, candidates: priced, baseline };
 

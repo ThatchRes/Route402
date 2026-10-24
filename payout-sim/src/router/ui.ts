@@ -14,12 +14,16 @@ import { loadPayees } from "../company/payees.js";
 import * as C from "../company/controls.js";
 import { DEMO_COMPANY } from "../company/profile.js";
 import { marketSummary } from "./market.js";
-import { SOURCES } from "./registry.js";
+import { PLATFORM, SOURCES } from "./registry.js";
+import { optimize } from "./optimizer.js";
 import { load } from "./store.js";
-import { deliveryCondition, enforcementOn } from "../company/conditions.js";
+import { deliveryCondition, documentsCondition, enforcementOn } from "../company/conditions.js";
+import { cleanTerms, DOC_LABEL, EBL_PLATFORMS, lcComparison, simulateCarrierIssue, verifyDocuments } from "../company/documents.js";
+import { cleanTokenizedConfig, setTokenizedConfig, TOKENIZED_CATALOG, tokenizedConfig, tokenizedUnavailable } from "./tokenized.js";
+import { cleanCompliance, coinsOf, complianceChecks, compliancePolicy, railOf, STABLECOINS, travelRuleRecord } from "./compliance.js";
 import { pain001, readiness } from "../company/iso20022.js";
 import { RAILS, TOKENIZED_NETWORKS, tokenizedQuote } from "./rails.js";
-import { usdcPeg, usdcInFlight, usdcRouteAllowed } from "./depeg.js";
+import { usdcPeg, usdcInFlight, usdcRouteAllowed, stablecoinPlanAllowed, issuerInFlight, issuerHeadroom } from "./depeg.js";
 import { allInCost, fxRisk, sendBy, transitDays } from "../company/economics.js";
 import { midInfo, rateHistory } from "./market.js";
 import { planningNow } from "./timing.js";
@@ -52,6 +56,27 @@ export function mountUi(app: express.Express, port: number) {
       headers: { "content-type": "application/json", authorization: `Bearer ${process.env.X402_INTERNAL_TOKEN ?? ""}` } });
     const j: any = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error ?? `escrow HTTP ${r.status}`); return j;
   };
+  // The payment-run plan for all open bills takes ~1.3 s to compute and only changes when the company's data does, so the
+  // dashboard reuses it for the same input (bills, balances, settings) for up to 2 minutes. The planning clock (nowUtc)
+  // is left out of the key: it changes on every call, and two minutes of drift does not change a plan's timing meaningfully.
+  let runCache: { key: string; at: number; run: any } | null = null;
+  const paymentRun = (input: any) => {
+    const key = JSON.stringify({ ...input, nowUtc: undefined });
+    if (runCache?.key === key && Date.now() - runCache.at < 120_000) return runCache.run;
+    const run = runPaymentRun(input); runCache = { key, at: Date.now(), run }; return run;
+  };
+  // Escrow status for the dashboard, cached: on Windows a refused localhost connection takes ~2 s to fail, and every page
+  // load used to wait for it when the escrow service is not running. After the first check, the last status is served at
+  // once and refreshed in the background (every 15 s when up, 30 s when down). Escrow actions themselves never use this.
+  let escrowCache: { at: number; ttl: number; value: any } | null = null, escrowRefresh: Promise<any> | null = null;
+  const escrowStatus = async () => {
+    const refresh = () => (escrowRefresh ??= esc("GET", "/escrow/status")
+      .catch((e) => ({ ready: false, note: `escrow service not reachable (${e.cause?.code ?? e.message})` }))
+      .then((value) => { escrowCache = { at: Date.now(), ttl: value.ready === false && value.note ? 30_000 : 15_000, value }; escrowRefresh = null; return value; }));
+    if (!escrowCache) return refresh();
+    if (Date.now() - escrowCache.at >= escrowCache.ttl) void refresh();
+    return escrowCache.value;
+  };
   app.use("/app", browserSecurity, express.static(fileURLToPath(new URL("../../public/", import.meta.url))));
   app.get("/", browserSecurity, (_req, res) => res.redirect("/app/"));
   const ui = express.Router();
@@ -63,12 +88,12 @@ export function mountUi(app: express.Express, port: number) {
   // Everything the dashboard shows: connection, bills, checks, market data, sources, recent transfers
   ui.get("/state", async (_req, res) => {
     const l = loadLinked(), paid = loadPaid(), db = load(), pol = C.loadPolicy();
-    const run = runPaymentRun(l.input);
+    const run = paymentRun(l.input);
     // FX risk on what is still to be bought in foreign currency (after paying from existing balances)
     const H = l.input.company.homeCcy;
     const exposures = run.lines.filter((x: any) => x.ccy && x.ccy !== H && Number(x.convertedAmount) > 0 && !paid[`${l.input.company.companyId}:${x.payable}`])
       .map((x: any) => ({ ccy: x.ccy, amountUsd: Number(x.convertedAmount) / Number(midInfo(x.ccy).rate), dueUtc: x.deadlineUtc }));
-    const [peg, escrow] = await Promise.all([usdcPeg(pol), esc("GET", "/escrow/status").catch((e) => ({ ready: false, note: `escrow service not reachable (${e.cause?.code ?? e.message})` }))]);
+    const [peg, escrow] = await Promise.all([usdcPeg(pol), escrowStatus()]);
     const bills = l.input.payables.map((p) => {
       const v = validate(p.beneficiary), line = run.lines.find((x: any) => x.payable === p.id);
       return { id: p.id, supplier: p.beneficiary.name, country: p.beneficiary.country, ccy: p.ccy, amount: p.amount, dueUtc: p.dueUtc,
@@ -79,8 +104,10 @@ export function mountUi(app: express.Express, port: number) {
       company: l.input.company.name, bills, receivables: l.input.receivables, run, market: marketSummary(), sources: SOURCES,
       suppliers: supplierDirectory(l),
       payeesOnFile: Object.keys(loadPayees()).length, rails: RAILS, tokenizedNetworks: TOKENIZED_NETWORKS, policy: pol,
+      tokenized: { catalog: TOKENIZED_CATALOG, config: tokenizedConfig() }, compliance: { policy: compliancePolicy(pol), stablecoins: STABLECOINS },
+      documents: { platforms: EBL_PLATFORMS, labels: DOC_LABEL },
       fxRisk: fxRisk(exposures, rateHistory(), Date.now(), pol.fxRiskLimitUsd), costOfCashPct: l.input.company.costOfCashPct,
-      usdc: { peg, inFlightUsd: usdcInFlight(), capUsd: pol.issuerCapUsd }, escrow,
+      usdc: { peg, inFlightUsd: usdcInFlight(), capUsd: pol.issuerCapUsd, byIssuer: issuerInFlight() }, escrow,
       transfers: Object.values(db.transfers).slice(-20).reverse().map((t: any) => ({ transferId: t.transferId, status: t.status,
         reference: t.terms.intent.reference, supplier: t.terms.intent.beneficiary?.name, debit: t.terms.totals.sourceDebit, credit: t.terms.totals.recipientNet })) });
   });
@@ -94,7 +121,7 @@ export function mountUi(app: express.Express, port: number) {
         if (!id) id = (await seedDemo(false)).customerId;
         const imp = await importFromNessie(id, DEMO_COMPANY, NOW());
         saveLinked({ source: `Nessie customer ${id}`, linkedAt: new Date().toISOString(), usdAvailable: imp.usdAvailable, input: imp.input });
-        return res.json({ ok: true, source: `Capital One (Nessie) customer ${id}`, imported: imp.imported, usdAvailable: imp.usdAvailable });
+        return res.json({ ok: true, source: "Capital One", imported: imp.imported, usdAvailable: imp.usdAvailable });
       }
       if (provider === "csv" && typeof csv === "string") {
         const imp = importCsv(csv, DEMO_COMPANY, NOW());
@@ -118,9 +145,22 @@ export function mountUi(app: express.Express, port: number) {
       const answer: any = await r.json();
       if (loadLinked().input.company.companyId !== companyId) return res.status(409).json({ status: "error", error: "The linked company changed during this request. Open a new chat." });
       if (r.ok) recordUiReview(process.env.AGENT_TENANT ?? "demo-tenant", answer);
+      if (r.ok && answer?.hops?.length) answer.agentStats = recordAgentStats(answer);
       res.status(r.ok ? 200 : 502).json(answer);
     } catch (e: any) { res.status(502).json({ status: "error", error: `agents not reachable (${e.cause?.code ?? e.message}): start workers.py and gateway.py` }); }
   });
+
+  // Each agent's working time on one request, and the running average across requests (data/agent-stats.json)
+  function recordAgentStats(a: any) {
+    const hops: any[] = a.hops ?? [], ms = (pred: (h: any) => boolean) => hops.find(pred)?.ms ?? null;
+    const run = { compliance: ms((h) => h.from === "compliance"), routing: ms((h) => h.to === "providers"), total: ms((h) => h.message === "ProcureResult"), paidCalls: (a.paidCalls ?? []).length };
+    if (run.total == null) return null;
+    const file = "data/agent-stats.json", st = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : { runs: 0, compliance: 0, routing: 0, total: 0, paidCalls: 0 };
+    const avg = (k: "compliance" | "routing" | "total" | "paidCalls") => run[k] == null ? st[k] : (st[k] * st.runs + run[k]!) / (st.runs + 1);
+    const next = { runs: st.runs + 1, compliance: avg("compliance"), routing: avg("routing"), total: avg("total"), paidCalls: avg("paidCalls") };
+    mkdirSync("data", { recursive: true }); writeFileSync(file, JSON.stringify(next, null, 2));
+    return { run, average: next };
+  }
 
   ui.get("/conversations/:id", (req, res) => {
     try { res.json(conversationView(process.env.AGENT_TENANT ?? "demo-tenant", String(req.params.id))); }
@@ -162,7 +202,13 @@ export function mountUi(app: express.Express, port: number) {
     p.requireCallbackOnDetailsChange = !!p.requireCallbackOnDetailsChange; p.quoteValidMinutes = Math.min(14, Math.max(0, Number(p.quoteValidMinutes)));
     p.depegBandPct = Math.min(5, Math.max(0.01, Number(p.depegBandPct))); p.depegFailClosed = p.depegFailClosed !== false;
     p.issuerCapUsd = Math.max(0, Number(p.issuerCapUsd)); p.escrowDeadlineDays = Math.min(180, Math.max(0.0001, Number(p.escrowDeadlineDays)));
-    p.fxRiskLimitUsd = Math.max(0, Number(p.fxRiskLimitUsd)); C.savePolicy(p);
+    p.fxRiskLimitUsd = Math.max(0, Number(p.fxRiskLimitUsd)); p.lcFeePct = Math.min(10, Math.max(0, Number(p.lcFeePct ?? 1)));
+    p.compliance = cleanCompliance(p.compliance);
+    if ("tokenized" in (req.body ?? {})) {
+      const t = cleanTokenizedConfig(req.body.tokenized); if (t.error) return res.status(400).json({ error: t.error });
+      p.tokenized = t.config ? { ...t.config, enabledBy: u.id, enabledAt: new Date().toISOString() } : null;
+    }
+    C.savePolicy(p); setTokenizedConfig(p.tokenized);
     C.audit(u.id, "policy_changed", "policy", `${JSON.stringify(before)} -> ${JSON.stringify(p)}`); res.json(p);
   });
 
@@ -191,7 +237,7 @@ export function mountUi(app: express.Express, port: number) {
         return res.status(409).json({ error: "This plan has changed. Ask for a fresh preview in this conversation before preparing it." });
     }
     const l = loadLinked(), co = l.input.company, paid = loadPaid(), reqs = C.loadRequests(), out: any[] = [];
-    const onDelivery = new Set<string>(req.body?.releaseOnDelivery ?? []);
+    const onDelivery = new Set<string>(req.body?.releaseOnDelivery ?? []), documentary = req.body?.documentary ?? {};
     for (const d of decisions) {
       if (!["approve", "review"].includes(d.decision) || !d.intentId) { out.push({ payable: d.payable, skipped: "held by the routing agent" }); continue; }
       const prev = paid[`${co.companyId}:${d.payable}`];
@@ -202,6 +248,16 @@ export function mountUi(app: express.Express, port: number) {
       if (!it?.intentId) { out.push({ payable: d.payable, skipped: "quote not found on this router: ask again" }); continue; }
       if (it.decision?.status !== "OK") { out.push({ payable: d.payable, skipped: "router has no eligible plan" }); continue; }
       const bill = l.input.payables.find((p) => p.id === d.payable), v: any = bill ? validate(bill.beneficiary) : { warnings: [] };
+      let terms: any = null;
+      if (documentary[d.payable]) { terms = cleanTerms(documentary[d.payable], it.decision.timing?.deadlineUtc ?? it.intent.deadlineUtc); if (terms.error) { out.push({ payable: d.payable, skipped: terms.error }); continue; } }
+      const routeIds = (it.decision.allocations ?? []).map((a: any) => String(a.routeId)).concat(it.decision.allocations ? [] : (d.routeIds ?? []).map(String));
+      const comp = await complianceChecks({ routeKind: railOf(routeIds), coins: coinsOf(routeIds), destCcy: it.intent.destCcy, country: it.intent.beneficiary?.country ?? bill?.beneficiary.country,
+        supplierWallet: routeIds.some((x: string) => x.includes("supplier_usdc_wallet")) ? (it.intent.beneficiary ?? bill?.beneficiary)?.usdcWallet : undefined,
+        amountUsd: Number(String(it.decision.totals.sourceDebit).split(" ")[0]) }, C.loadPolicy());
+      if (!comp.ok) { out.push({ payable: d.payable, skipped: comp.reason }); continue; }
+      const travel = comp.checks.find((c) => c.id === "travel_rule" && c.status === "pass")
+        ? travelRuleRecord({ name: co.name, country: "US" }, l.source.startsWith("Nessie") ? "Operating account" : "USD operating account", it.intent.beneficiary ?? bill?.beneficiary,
+            it.decision.totals.sourceDebit, coinsOf(routeIds).join(">") || "USDC") : undefined;
       const r: C.PaymentRequest = { id: C.newRequestId(), payable: d.payable, supplier: it.intent.beneficiary?.name ?? bill?.beneficiary.name ?? d.payable,
         country: bill?.beneficiary.country ?? "-", ccy: it.intent.destCcy, amount: it.intent.amount, reference: it.intent.reference ?? d.payable,
         intentId: d.intentId, provider: d.chosen, route: (d.routeIds ?? []).join("+"), debitUsd: Number(String(it.decision.totals.sourceDebit).split(" ")[0]),
@@ -209,12 +265,13 @@ export function mountUi(app: express.Express, port: number) {
         preparedBy: u.id, preparedAt: new Date().toISOString(), detailsChanged: !!v.detailsChanged || !!d.detailsChanged || (d.needs ?? []).some((n: string) => n.includes("call-back")),
         costReview: (d.needs ?? []).some((n: string) => n.includes("cost")), allowReroute: req.body?.allowReroute === true, timing: it.decision.timing,
         fallbackIntentIds: (d.options ?? []).filter((o: any) => o.eligible && o.intentId && o.intentId !== d.intentId).map((o: any) => o.intentId),
-        detailsNote: v.warnings?.find((w: string) => w.includes("changed")), approvals: [], releaseOnDelivery: onDelivery.has(d.payable), status: "AWAITING_APPROVAL",
-        condition: onDelivery.has(d.payable) ? deliveryCondition(u.id, u.roles[0]) : undefined, msgId: `R402-${Date.now().toString(36).toUpperCase()}-${d.payable}`.slice(0, 35),
+        detailsNote: v.warnings?.find((w: string) => w.includes("changed")), approvals: [], releaseOnDelivery: onDelivery.has(d.payable) || !!terms, status: "AWAITING_APPROVAL",
+        condition: terms ? documentsCondition(u.id, u.roles[0], terms.presentationDays) : onDelivery.has(d.payable) ? deliveryCondition(u.id, u.roles[0]) : undefined,
+        documentary: terms ? { terms, presentations: [] } : undefined, compliance: { checkedAt: new Date().toISOString(), checks: comp.checks, travelRule: travel }, msgId: `R402-${Date.now().toString(36).toUpperCase()}-${d.payable}`.slice(0, 35),
         purpose: String(req.body?.purpose ?? "").slice(0, 120) || "Invoice payment", mode: req.body?.mode === "budget" ? "budget" : "invoice",
         checkedBy: req.body?.confirmed ? { userId: u.id, at: new Date().toISOString() } : undefined };
       r.status = C.computeStatus(r, C.loadPolicy()); reqs[r.id] = r;
-      C.audit(u.id, "prepared", r.id, `${r.payable} ${r.amount} ${r.ccy} to ${r.supplier} via ${r.provider} (${it.decision.totals.sourceDebit}); agent plan ${r.intentId}${r.releaseOnDelivery ? "; release on delivery" : ""}`);
+      C.audit(u.id, "prepared", r.id, `${r.payable} ${r.amount} ${r.ccy} to ${r.supplier} via ${r.provider} (${it.decision.totals.sourceDebit}); agent plan ${r.intentId}${terms ? "; released when the shipping documents verify (instead of a letter of credit)" : r.releaseOnDelivery ? "; release on delivery" : ""}; compliance ${comp.checks.filter((c) => c.status === "pass").length} checks passed`);
       out.push({ payable: d.payable, requestId: r.id, status: r.status });
     }
     C.saveRequests(reqs); res.json({ requests: out });
@@ -241,6 +298,7 @@ export function mountUi(app: express.Express, port: number) {
   ui.post("/requests/:id/approve", act((r, u) => {
     const a = allowed(r, u, "approve"); if (!a.allowed) return a.why;
     r.approvals.push({ by: u.id, at: new Date().toISOString() });
+    if (u.owner && u.id === r.preparedBy) C.audit(u.id, "owner_override", r.id, "the owner approved a payment they prepared (segregation of duties skipped by owner authority)");
     C.audit(u.id, "approved", r.id, `approval ${r.approvals.length} of ${C.approvalsRequired(r, C.loadPolicy())} for ${r.debitUsd.toLocaleString()} USD`); return null;
   }));
   ui.post("/requests/:id/reject", act((r, u, b) => {
@@ -256,6 +314,44 @@ export function mountUi(app: express.Express, port: number) {
     if (r.condition) r.condition.met = { ...r.delivery };
     C.audit(u.id, "delivery_confirmed", r.id, `${r.delivery.documentRef}: release condition met`); return null;
   }));
+
+  // Documents presented for a document-checked payment (in place of a letter of credit). Each presentation is kept with its
+  // checks; the payment is released only when every check passes, the moment it does (no five-day bank examination).
+  ui.post("/requests/:id/documents", act((r, u, b) => {
+    const a = allowed(r, u, "presentDocuments"); if (!a.allowed) return a.why;
+    if (!r.documentary) return "this payment has no document check";
+    const res = verifyDocuments({ eblRef: String(b.eblRef ?? ""), platform: String(b.platform ?? ""), invoiceRef: String(b.invoiceRef ?? ""), inspectionRef: b.inspectionRef ? String(b.inspectionRef) : undefined },
+      { supplier: r.supplier, buyer: loadLinked().input.company.name, invoiceRef: r.reference, terms: r.documentary.terms });
+    r.documentary.presentations.push({ by: u.id, at: new Date().toISOString(), eblRef: String(b.eblRef ?? "").slice(0, 40), platform: String(b.platform ?? ""), ok: res.ok, checks: res.checks, simulated: res.simulated });
+    if (res.ok) {
+      r.delivery = { by: u.id, at: new Date().toISOString(), documentRef: String(b.eblRef).slice(0, 60) };
+      if (r.condition) r.condition.met = { ...r.delivery };
+      C.audit(u.id, "documents_verified", r.id, `eBL ${r.delivery.documentRef} and ${r.documentary.terms.documents.length - 1} other document(s) verified (simulated eBL platform); release condition met`);
+    } else C.audit(u.id, "documents_rejected", r.id, res.checks.filter((c) => !c.ok).map((c) => `${c.label}: ${c.detail}`).join("; ").slice(0, 380));
+    return null;
+  }));
+  // Demo only: the supplier's carrier issues the eBL and endorses title to the company, as a live eBL platform would report
+  ui.post("/requests/:id/ebl-demo", (req, res) => {
+    const u = need(req, res); if (!u) return;
+    const r = C.loadRequests()[String(req.params.id)]; if (!r?.documentary) return res.status(404).json({ error: "no document-checked payment" });
+    const rec = simulateCarrierIssue({ supplier: r.supplier, buyer: loadLinked().input.company.name, invoiceRef: r.reference, platform: req.body?.platform,
+      withInspection: r.documentary.terms.documents.includes("inspection_certificate") });
+    C.audit(u.id, "ebl_simulated", r.id, `${rec.ref} issued by a simulated carrier on ${rec.platform}`); res.json(rec);
+  });
+  // What the same payment would have cost as a letter of credit (company's own LC fee setting)
+  ui.get("/requests/:id/lc-comparison", (req, res) => {
+    const r = C.loadRequests()[String(req.params.id)]; if (!r) return res.status(404).json({ error: "no such request" });
+    res.json(lcComparison(r.debitUsd, C.loadPolicy().lcFeePct));
+  });
+  // Stablecoin transfers with the fields digital-asset tax reporting asks for (Form 1099-DA, CARF/DAC8), as CSV
+  ui.get("/compliance/tax-report.csv", (_req, res) => {
+    const rows = Object.values(C.loadRequests()).filter((r) => r.route?.includes("coin:") && ["COMPLETED", "EXECUTING"].includes(r.status) || (r.route?.includes("coin:") && r.transferId));
+    const q = (v: any) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const head = ["date_utc", "payment_request", "transfer", "asset", "amount_usd", "counterparty", "counterparty_country", "currency_delivered", "amount_delivered", "purpose", "settlement_proof"];
+    const body = rows.map((r) => [r.preparedAt, r.id, r.transferId, coinsOf(r.route.split("+")).join(">"), r.debitUsd.toFixed(2), r.supplier, r.country, r.ccy, r.recipientGets, r.purpose, r.proof].map(q).join(","));
+    res.setHeader("content-type", "text/csv"); res.setHeader("content-disposition", "attachment; filename=route402-digital-asset-tax-report.csv");
+    res.send([head.join(","), ...body].join("\n"));
+  });
 
   // A paused payment (stablecoin breaker, issuer cap, escrow not ready) can be re-checked by an approver
   ui.post("/requests/:id/recheck", act((r, u) => {
@@ -319,7 +415,7 @@ export function mountUi(app: express.Express, port: number) {
     const check = planForDispatch(originalTerms, NOW());
     if (!check.ok) return pause(`${check.reason}. Nothing new was sent; request a new plan or approval.`);
     // Refresh only within the routes and debit cap the company reviewed. No provider switch or higher debit is implicit.
-    const refreshed = await self("POST", "/v1/intents", { ...original.intent, provider: r.allowReroute ? undefined : original.intent.provider, allowedRouteIds: originalTerms.executionPolicy.allowedRouteIds });
+    const refreshed = await self("POST", "/v1/intents", { ...original.intent, issuerHeadroomUsd: issuerHeadroom(pol, r.id), provider: r.allowReroute ? undefined : original.intent.provider, allowedRouteIds: originalTerms.executionPolicy.allowedRouteIds });
     if (refreshed.decision?.status !== "OK") return pause(refreshed.decision?.reason ?? "No route can still meet the recipient deadline");
     const newDebit = Number(refreshed.decision.totals.sourceDebit.split(" ")[0]);
     if (newDebit > r.debitUsd) {
@@ -331,7 +427,7 @@ export function mountUi(app: express.Express, port: number) {
       arrivalUtc: refreshed.decision.totals.arrivalUtc, timing: refreshed.decision.timing }); saveR();
     if (r.provider === "stablecoin") {
       // depeg breaker always; issuer cap only if the money is not already sitting in escrow
-      const g = r.escrow?.state === "LOCKED" ? { ok: (await usdcPeg(pol)).status !== "paused", reason: (await usdcPeg(pol)).reason } : await usdcRouteAllowed(r.debitUsd, r.id);
+      const g = r.escrow?.state === "LOCKED" ? { ok: (await usdcPeg(pol)).status !== "paused", reason: (await usdcPeg(pol)).reason } : await stablecoinPlanAllowed(refreshed.decision.allocations, r.id);   // each issuer's legs against its own cap
       if (!g.ok) return pause(`${g.reason ?? "USDC route paused"}. Nothing was sent; an approver can re-check when it clears.`);
       if (r.escrow?.state === "LOCKING") return pause("The escrow lock is still confirming on-chain. Re-check in a moment.");
       if (r.escrow?.state === "LOCKED") {
@@ -396,7 +492,7 @@ export function mountUi(app: express.Express, port: number) {
     const mid = Number(midInfo(bill.ccy).rate), now = Date.now();
     const one = async (provider: string) => {
       const q = await self("POST", "/v1/provider-quote", { provider, ...body });
-      if (q.status !== "OK") return { provider, status: "NO_QUOTE", reason: q.reason, peg: q.peg };
+      if (q.status !== "OK") return { provider, status: "NO_QUOTE", reason: q.reason, peg: q.peg, compliance: q.compliance };
       const it = await self("GET", `/v1/intents/${q.intentId}`), a = it.decision?.allocations?.[0]?.quote?.input ?? {};
       const youPayUsd = Number(String(q.plan.sourceDebit).split(" ")[0]), getsDest = Number(String(q.plan.recipientNet).split(" ")[0]);
       const transferUsd = Number(a.fundingFee ?? 0), payoutUsd = Number(a.payoutFee ?? 0) / (bill.ccy === "USD" ? 1 : mid);
@@ -405,14 +501,75 @@ export function mountUi(app: express.Express, port: number) {
       return { provider, status: "OK", intentId: q.intentId, youPay: q.plan.sourceDebit, supplierGets: q.plan.recipientNet, arrivalUtc: q.plan.arrivalUtc,
         timing: q.timing, simulation: q.simulation,
         capturedAt: it.createdAt, expiresAt: new Date(Date.parse(it.createdAt) + C.loadPolicy().quoteValidMinutes * 60e3).toISOString(),
-        costVsMidBps: q.costVsMidBps?.plan, fxRate: a.fxRate, risk: q.risk, routeIds: q.plan.allocations.map((x: any) => x.routeId),
+        costVsMidBps: q.costVsMidBps?.plan, fxRate: a.fxRate, risk: q.risk, routeIds: q.plan.allocations.map((x: any) => x.routeId), compliance: q.compliance,
+        routeLabel: q.plan.allocations[0]?.label,
         breakdown: { transferFeeUsd: transferUsd, payoutFeeUsd: payoutUsd, conversionCostUsd: Math.max(0, econ.pricedUsd - transferUsd - payoutUsd), convertedPrincipalUsd: youPayUsd - transferUsd },
         economics: { ...econ, transitDays: days, sendBy: sendBy(due, days), meetsDeadline: Date.parse(q.plan.arrivalUtc) <= Date.parse(due), costOfCashPct: co.costOfCashPct } };
     };
-    const [stablecoin, bankQ] = await Promise.all([one("stablecoin"), one("bank")]);
+    const tkWhy = tokenizedUnavailable(co.homeCcy, bill.ccy, bill.beneficiary.country);
+    const [stablecoin, bankQ, tokenQ] = await Promise.all([one("stablecoin"), one("bank_wire"),
+      tkWhy ? Promise.resolve({ ...tokenizedQuote(), reason: tkWhy }) : one("tokenized_deposit")]);
     res.json({ bill: { id: bill.id, supplier: bill.beneficiary.name, country: bill.beneficiary.country, ccy: bill.ccy, amount: bill.amount, dueUtc: due,
       maskedAccount: mask(bill.beneficiary), acceptsUsdc: !!bill.beneficiary.usdcWallet, mode: budget ? "budget" : "invoice", budgetUsd: budget ? Number(req.query.usd) : undefined },
-      routes: [stablecoin, bankQ, tokenizedQuote()], ready: readiness(bill.beneficiary), sourceAccount: l.source.startsWith("Nessie") ? "Operating account (Capital One)" : "USD operating account (demo)" });
+      routes: [stablecoin, { ...bankQ, provider: "bank" }, tokenQ], ready: readiness(bill.beneficiary), sourceAccount: l.source.startsWith("Nessie") ? "Operating account (Capital One)" : "USD operating account (demo)" });
+  });
+
+  // How a decision was reached, in data the page can show: the bank baseline it beat, the savings and our fee, the cost
+  // against mid-market for both, what was searched and why routes were excluded, and the inputs to the cost model.
+  const excludedKind = (reason = "") => /deadline/i.test(reason) ? "would arrive after the deadline" : /capacity/i.test(reason) ? "more than the route can carry"
+    : /peg|stable/i.test(reason) ? "stablecoin too far from its peg" : "not available for this payment";
+  function analysisOf(it: any, costOfCashPct: number) {
+    const d = it.decision, cands: any[] = d.candidates ?? [], railOf2 = (id: string) => id.startsWith("coin:") ? "stablecoin" : id.startsWith("tokenized:") ? "tokenized deposit" : "bank wire";
+    const excluded: Record<string, number> = {};
+    for (const c of cands.filter((x) => !x.eligible)) excluded[excludedKind(c.reason)] = (excluded[excludedKind(c.reason)] ?? 0) + 1;
+    return { baseline: d.baseline ? { label: d.baseline.label, sourceDebit: d.baseline.sourceDebit, recipientNet: d.baseline.recipientNet, arrivalUtc: d.baseline.arrivalUtc } : null,
+      value: d.value ?? null, costVsMidBps: d.costVsMidBps ?? null, objective: d.objective, plannedAtUtc: d.timing?.plannedAtUtc, provenance: d.provenance,
+      searched: { routes: cands.length, eligible: cands.filter((x) => x.eligible).length, rails: [...new Set(cands.map((x) => railOf2(String(x.routeId))))],
+        networks: [...new Set(cands.map((x) => String(x.routeId)).filter((x) => x.startsWith("coin:")).map((x) => x.split(":")[2]))], excluded, unpriced: (d.unpriced ?? []).length },
+      model: { mid: midInfo(it.intent.destCcy).rate, midSource: midInfo(it.intent.destCcy).source, costOfCashPct, timeValueBpsPerDay: PLATFORM.timeValueBpsPerDay,
+        feeRule: d.value?.feeRule ?? null } };
+  }
+  // Savings growth: what each open bill is projected to save against the bank wire once paid on its best route (the router's
+  // own model, before the live safety gates), plus the realized savings of completed requests. Cached like the payment run.
+  let growthCache: { key: string; at: number; value: any } | null = null;
+  ui.get("/growth", (_req, res) => {
+    const l = loadLinked(), co = l.input.company, reqs = Object.values(C.loadRequests()), db = load();
+    const key = JSON.stringify({ ...l.input, nowUtc: undefined, reqs: reqs.map((r) => [r.id, r.status, r.transferId]) });
+    if (growthCache?.key === key && Date.now() - growthCache.at < 120_000) return res.json(growthCache.value);
+    const started = new Set(reqs.filter((r) => !["REJECTED", "REFUNDED"].includes(r.status)).map((r) => r.payable));
+    const open = l.input.payables.filter((b) => !started.has(b.id)), blocked = open.filter((b) => validate(b.beneficiary).status === "BLOCK").length;
+    const projected = open.filter((b) => validate(b.beneficiary).status !== "BLOCK").map((b) => {
+      try {
+        const d: any = optimize({ srcCcy: co.homeCcy, destCcy: b.ccy, amountType: "RECIPIENT_FIXED", amount: b.amount, objective: "cheapest", deadlineUtc: b.dueUtc,
+          beneficiary: b.beneficiary, beneficiaryAcceptsUsdc: !!b.beneficiary.usdcWallet, currentBank: { ...co.currentBank, measured: true } } as any);
+        if (d.status !== "OK") return null;
+        const saved = Number(String(d.value.customerNetSaving).split(" ")[0]), faster = d.baseline ? (Date.parse(d.baseline.arrivalUtc) - Date.parse(d.totals.arrivalUtc)) / 86400e3 : 0;
+        return { bill: b.id, supplier: b.beneficiary.name, payOnUtc: b.dueUtc, savedUsd: Math.max(0, saved), daysFaster: Math.max(0, faster), route: d.allocations[0]?.routeId };
+      } catch { return null; }
+    }).filter(Boolean).sort((a: any, b: any) => a.payOnUtc.localeCompare(b.payOnUtc));
+    const realized = reqs.filter((r) => r.transferId && db.transfers[r.transferId]?.status === "COMPLETED").map((r) => {
+      const d = db.intents[r.intentId]?.decision, t = db.transfers[r.transferId!];
+      return { id: r.id, supplier: r.supplier, at: t.history?.findLast?.((h: any) => h.status === "COMPLETED")?.at ?? r.preparedAt, savedUsd: Math.max(0, Number(String(d?.value?.customerNetSaving ?? "0").split(" ")[0])) };
+    }).sort((a, b) => a.at.localeCompare(b.at));
+    const value = { realized, projected, open: { bills: open.length, blocked, noRoute: open.length - blocked - projected.length }, totals: { realizedUsd: realized.reduce((s, x) => s + x.savedUsd, 0), projectedUsd: projected.reduce((s: number, x: any) => s + x.savedUsd, 0),
+      fasterBills: projected.filter((x: any) => x.daysFaster > 0.04).length, avgDaysFaster: (() => { const f = projected.filter((x: any) => x.daysFaster > 0.04); return f.length ? f.reduce((s: number, x: any) => s + x.daysFaster, 0) / f.length : 0; })() } };
+    growthCache = { key, at: Date.now(), value }; res.json(value);
+  });
+
+  // Every payment request with the savings and time its decision measured against the bank baseline (impact charts)
+  ui.get("/impact", (_req, res) => {
+    const db = load(), rows = Object.values(C.loadRequests()).filter((r) => !["REJECTED", "REFUNDED"].includes(r.status)).map((r) => {
+      const d = db.intents[r.intentId]?.decision, t = r.transferId ? db.transfers[r.transferId] : null, b = d?.baseline;
+      // like for like: the route's estimated arrival against the bank's estimated arrival (simulated payouts credit instantly)
+      const ours = d?.totals?.arrivalUtc ?? r.arrivalUtc, planned = d?.timing?.plannedAtUtc ?? r.preparedAt;
+      return { id: r.id, supplier: r.supplier, provider: r.provider, status: t?.status === "COMPLETED" ? "COMPLETED" : r.status, preparedAt: r.preparedAt,
+        completedAt: t?.status === "COMPLETED" ? (t.history?.findLast?.((h: any) => h.status === "COMPLETED")?.at ?? t.creditedAtUtc ?? null) : null,
+        debitUsd: r.debitUsd, savedUsd: d?.value ? Number(String(d.value.customerNetSaving).split(" ")[0]) : 0,
+        bankDebitUsd: b ? Number(String(b.sourceDebit).split(" ")[0]) : null, bankDays: b?.arrivalUtc ? (Date.parse(b.arrivalUtc) - Date.parse(planned)) / 86400e3 : null,
+        ourDays: ours ? Math.max(0, (Date.parse(ours) - Date.parse(planned)) / 86400e3) : null, routesCompared: (d?.candidates ?? []).length,
+        bpsOurs: d?.costVsMidBps?.plan ?? null, bpsBank: d?.costVsMidBps?.bank ?? null };
+    }).sort((a, b) => a.preparedAt.localeCompare(b.preparedAt));
+    res.json({ payments: rows });
   });
 
   // Read-only priced terms of a quote the agents returned to this workspace, or one a payment request is bound to
@@ -431,7 +588,8 @@ export function mountUi(app: express.Express, port: number) {
       sourceAccount: l.source.startsWith("Nessie") ? "Operating account (Capital One)" : `${l.input.company.homeCcy} operating account (demo)`,
       legs: d.allocations.map((a: any) => ({ label: a.label, routeId: a.routeId, arrivalUtc: a.arrivalUtc, sourceDebit: a.quote.sourceDebit.display,
         fundingFee: a.quote.fundingFee.display, payoutFee: a.quote.payoutFee.display, funded: a.quote.funding.display, onrampRate: a.quote.funding.rate,
-        fxRate: a.quote.converted.rate, converted: a.quote.converted.display, recipientNet: a.quote.recipientNet.display })) });
+        fxRate: a.quote.converted.rate, converted: a.quote.converted.display, recipientNet: a.quote.recipientNet.display })),
+      analysis: analysisOf(it, l.input.company.costOfCashPct) });
   });
 
   // Agents for ONE payment (compare step): paid quotes from both providers + supplier screen, via the concierge's /review

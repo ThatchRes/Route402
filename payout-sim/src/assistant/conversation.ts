@@ -2,19 +2,22 @@
 // client-supplied assistant messages never grant authority or become executable instructions.
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { ask, amountOf, currencyOf, place, planSend, window } from "./prompts.js";
+import { ask, amountOf, countryOf, currencyOf, place, planSend, usualCurrency, window } from "./prompts.js";
 import { loadLinked, type Linked } from "./linked.js";
 import { supplierDirectory, supplierRecords, addSupplier, type SupplierDraft } from "../company/suppliers.js";
+import { validate } from "../company/validate.js";
 import { runPaymentRun } from "../company/paymentRun.js";
 import { load as loadRouter } from "../router/store.js";
 import { unsafeInstruction, publicData } from "./safety.js";
 import { explanation } from "./explanations.js";
 
 type Task = { kind: "send" | "batch" | "convert"; supplierId?: string; amount?: number; currency?: string; sourceCurrency?: string;
-  deadlineUtc?: string; billIds?: string[]; policy?: string; reference: string; requestedSupplierName?: string };
+  deadlineUtc?: string; billIds?: string[]; policy?: string; reference: string; requestedSupplierName?: string; sourceFixed?: boolean;
+  goods?: { qty: number; item: string } };   // "30 VW Beetles": a quantity of goods, priced once the person gives a total or unit price
 interface Conversation {
   id: string; companyId: string; tenantId: string; revision: number; selected: string[]; topic?: string; task?: Task;
   supplierDraft?: SupplierDraft; explanationTopic?: string; intentIds: string[]; decisions: any[]; turns: { user: string; reply: any }[];
+  mentioned?: string[];   // suppliers named most recently in any turn ("the company I talked about before")
 }
 export class ConversationConflict extends Error {}
 const clean = (text: string) => text.trim().replace(/\b(companeis|companys|comapnies)\b/gi, "companies").replace(/\bsupliers?\b/gi, "suppliers");
@@ -44,6 +47,36 @@ function namedSuppliers(text: string, l: Linked) {
   const exact = records.filter((b) => t.includes(b.name.toLowerCase())); if (exact.length) return exact;
   return records.filter((b) => b.name.toLowerCase().split(/\s+/).some((word) => word.length >= 4 && new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(t)));
 }
+// Money vs quantities. "30 VW Beetles" is 30 of something, not 30 dollars; "$30", "30k", "30 EUR", "30,000" at the end or
+// before "to/for/by" are money. "30 cars at 12,000 each" is 360,000. Numbers inside references (INV-2024) or after a month
+// ("by Oct 30") are never money.
+const MONTH = /(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s*$/i;
+const MONEY_UNIT = /^\s*(?:[km]\b|[A-Z]{3}\b|dollars?\b|euros?\b|pesos?\b|pounds?\b|yen\b|rupees\b|reais\b)/i;
+const NOT_GOODS = /^(?:to|for|by|on|before|please|instead|now|today|tomorrow|this|next|and|with|from|in|total|each|apiece|per|at|of|the|a|an|so|via|asap|urgently)$/i;
+const scale = (n: string, k?: string) => Number(n.replace(/,/g, "")) * (k?.toLowerCase() === "k" ? 1e3 : k?.toLowerCase() === "m" ? 1e6 : 1);
+export function moneyIn(text: string): { amount: number | null; goods?: { qty: number; item: string } } {
+  const t = text.replace(/\b20\d\d-\d\d-\d\d\b/g, " ");
+  const unit = t.match(/(?<![\w-])(\d[\d,]*)\s+([a-z][a-z0-9 -]{0,40}?)\s+(?:at|@|for)\s+[$€£]?\s*(\d[\d,]*(?:\.\d+)?)\s*([km])?\b(?:\s*[A-Z]{3})?\s*(?:each|apiece|a piece|per\s+\w+|\/\s*\w+)/i);
+  if (unit) return { amount: Number(unit[1].replace(/,/g, "")) * scale(unit[3], unit[4]) };
+  let goods: { qty: number; item: string } | undefined;
+  for (const m of t.matchAll(/(?<![\w.-])([$€£])?\s*(\d[\d,]*(?:\.\d+)?)/g)) {
+    const before = t.slice(0, m.index), after = t.slice(m.index! + m[0].length);
+    if (MONTH.test(before)) continue;
+    const k = /^\s*([km])\b/i.exec(after)?.[1];
+    if (m[1] || /\b[A-Z]{3}\s*$/.test(before) || MONEY_UNIT.test(after) || /^\s*$/.test(after)) return { amount: scale(m[2], k) };
+    const next = /^\s+([A-Za-z][\w-]*)/.exec(after)?.[1];
+    if (!next || NOT_GOODS.test(next) || /^[,.;!?)]/.test(after)) return { amount: scale(m[2], k) };
+    if (!goods) goods = { qty: Number(m[2].replace(/,/g, "")), item: after.trim().split(/\s+(?:and|for|from|to|by|with|can|please|so)\b|[,.;!?]/i)[0].split(/\s+/).slice(0, 4).join(" ") };
+  }
+  return { amount: null, goods };
+}
+// A partial name answering "which supplier?": "North" -> Northwind Ltd and North Pack Co
+function suppliersStartingWith(fragment: string, l: Linked) {
+  const f = fragment.trim().toLowerCase().replace(/[^a-z0-9 ]/g, "");
+  if (f.length < 3 || f.split(" ").length > 3) return [];
+  return supplierRecords(l).filter((b) => b.name.toLowerCase().startsWith(f) || b.name.toLowerCase().split(/\s+/).some((w) => w.startsWith(f)));
+}
+const refersBack = (t: string) => /\b(?:the (?:company|supplier|vendor)|that (?:company|supplier|vendor|one)|same (?:company|supplier|vendor)|(?:i|we) (?:talked|spoke|asked|mentioned)|mentioned|before|previous(?:ly)?|earlier|them|him|her)\b/i.test(t);
 const unsupported = (t: string) => /\b(ignore (?:all|previous|your)|system prompt|poems?|jokes?|recipes?|homework|wallpaper|weather forecast|what(?:'s| is) the weather|sports scores|solve this equation|write (?:me )?(?:a |some )?(?:essay|code|story))\b/i.test(t);
 const help = "I can help with your company, suppliers, invoices, currencies, payment routes, savings and payment status. Try ‘list my suppliers using MXN’, ‘pay them’, or ‘add a supplier’.";
 const reference = () => `chat_${randomUUID()}`;
@@ -65,21 +98,37 @@ function statusReply(c: Conversation) {
     message: (lastPlan.blocked ?? [lastPlan.preview.reason]).join("; ") };
   return { template: "payment_status", title: "No submitted payment in this conversation", message: c.task ? "We have a draft or preview. A payment is sent only after the approval flow." : "Ask me to plan a payment first, or open a previous conversation." };
 }
+const ISO_CURRENCIES = new Set<string>((Intl as any).supportedValuesOf?.("currency") ?? []);
 function draftFromText(text: string, previous?: SupplierDraft): SupplierDraft {
   const draft = { ...previous }, p = place(text), ccy = currencyOf(text);
   const countryCode = text.match(/\bcountry\s*[:=]?\s*([A-Z]{2})\b/i)?.[1] ?? (/^[a-z]{2}$/i.test(text) ? text : undefined);
+  // While the draft is waiting for its country, a short answer is read loosely so small typos still match ("Switzerlan")
+  const answeringCountry = !!previous?.name && !previous.country;
+  const after = text.match(/\b(?:in|from|based in)\s+(.+?)(?=\s+(?:using|paid in|currency)\b|[,;]|$)/i)?.[1];   // "… in Switzerland"
+  const named = countryOf(after ?? (answeringCountry ? text : ""), !!after || answeringCountry);
   if (p && p.country !== "*") draft.country = p.country;
   else if (countryCode) draft.country = countryCode.toUpperCase();
+  else if (named) draft.country = named.code;
+  // While waiting for the currency, any real ISO 4217 code is accepted ("NOK"), not only the common ones currencyOf knows
+  const code = text.trim().toUpperCase().replace(/[.!]$/, "");
+  const anyIso = !!previous?.name && !!previous.country && !previous.currency && /^[A-Z]{3}$/.test(code) && ISO_CURRENCIES.has(code) ? code : undefined;
   if (ccy) draft.currency = ccy;
+  else if (anyIso) draft.currency = anyIso;
   const name = text.match(/\b(?:add|create|register)\s+(?:a\s+|new\s+)?(?:company\s+)?(?:supplier|vendor|company)\s+(?:called\s+|named\s+)?(.+?)(?=\s+(?:in|using|paid in|currency|country)\b|[,;]|$)/i)?.[1]
     ?? text.match(/\bname\s*[:=]\s*(.+?)(?=[,;]|$)/i)?.[1];
   if (name && !/^(?:please|company|supplier|vendor)$/i.test(name)) draft.name = name.replace(/^["']|["']$/g, "").trim();
   if (previous && !previous.name && !name && !p && !ccy && !countryCode && !/\b(add|create|register|supplier|vendor|company)\b/i.test(text)) draft.name = text;
   return draft;
 }
-function supplierDraftReply(c: Conversation) {
-  const d = c.supplierDraft!;
-  const missing = !d.name ? "What is the supplier company’s name?" : !d.country ? "Which country is the supplier in?" : !d.currency ? "Which currency should this supplier receive?" : null;
+function supplierDraftReply(c: Conversation, text = "", before?: SupplierDraft) {
+  const d = c.supplierDraft!, country = d.country ? new Intl.DisplayNames(["en"], { type: "region" }).of(d.country) : "", usual = d.country ? usualCurrency(d.country) : undefined;
+  // Never repeat a question word for word: say what was not understood and give an example that works
+  const notCountry = !!before?.name && !before.country && !d.country && !!text.trim();
+  const notCurrency = !!before?.country && !before.currency && !d.currency && !!text.trim();
+  const missing = !d.name ? "What is the supplier company’s name?"
+    : !d.country ? (notCountry ? `I couldn’t match “${text.trim()}” to a country. Type the country’s name, like Switzerland, or its two-letter code, like CH.` : `Which country is ${d.name} in?`)
+    : !d.currency ? (notCurrency ? `I couldn’t read “${text.trim()}” as a currency. Reply with its three-letter code${usual ? `, like ${usual}` : ", like EUR or USD"}.`
+      : `Got it: ${d.name} in ${country}. Which currency should they be paid in?${usual ? ` Suppliers in ${country} are usually paid in ${usual}; reply “${usual}” to use it.` : ""}`) : null;
   return missing ? { template: "add_supplier", clarification: missing, supplierDraft: d }
     : { template: "add_supplier", title: "Review the new supplier", message: "Confirm the supplier and enter their receiving details below. Nothing is saved until you confirm, and no invoice or payment will be created.",
       supplierDraft: d, action: { type: "add_supplier" } };
@@ -87,10 +136,15 @@ function supplierDraftReply(c: Conversation) {
 function planTask(c: Conversation, l: Linked): any {
   const task = c.task!;
   if (task.kind === "send") {
+    const choices = supplierDirectory(l).filter((s) => c.selected.includes(s.id)).map((s) => s.name);
     if (!task.supplierId) return { template: "send_to", clarification: task.requestedSupplierName ? `“${task.requestedSupplierName}” is not a saved supplier. Ask to add this supplier, or choose an existing supplier by name.`
-      : `Which supplier? ${supplierDirectory(l).filter((s) => c.selected.includes(s.id)).map((s) => s.name).join(", ") || "Say a saved supplier’s name."}` };
-    if (task.amount == null) return { template: "send_to", clarification: "How much should the supplier receive?" };
-    return { ...planSend(l, task.supplierId, task.amount, task.currency, task.deadlineUtc), paymentRef: task.reference, policy: task.policy };
+      : choices.length >= 2 && choices.length <= 3 ? `Did you mean ${choices.slice(0, -1).join(", ")} or ${choices.at(-1)}?`
+      : `Which supplier should receive it? Say its name${choices.length ? `, for example ${choices.slice(0, 3).join(", ")}` : ""}.` };
+    const name = supplierRecords(l).find((b) => b.id === task.supplierId)?.name ?? "the supplier", home = l.input.company.homeCcy;
+    if (task.amount == null) return { template: "send_to", clarification: task.goods
+      ? `I can plan the payment to ${name}, but I can’t price ${task.goods.qty} ${task.goods.item} myself. What is the order total, or the price per unit? For example “12,000 each” or “360,000”. Amounts without a currency are in ${home}.`
+      : `How much should ${name} receive? An amount without a currency is in ${home}, your home currency.` };
+    return { ...planSend(l, task.supplierId, task.amount, task.currency, task.deadlineUtc, task.sourceFixed), paymentRef: task.reference, policy: task.policy };
   }
   if (task.kind === "batch") {
     const bills = l.input.payables.filter((p) => task.billIds?.includes(p.id));
@@ -112,11 +166,16 @@ export function askConversation(tenant: string, raw: string, id: string = random
   let result: any;
   const info = explanation(text, c.explanationTopic ?? (c.topic === "payment" ? "status" : c.topic?.startsWith("supplier") ? "suppliers" : undefined));
   const names = namedSuppliers(text, l), directory = supplierDirectory(l), ccy = currencyOf(text), p = place(text);
-  const amountText = text.replace(/\b20\d\d-\d\d-\d\d\b/g, ""), parsedAmount = amountOf(amountText);
+  const amountText = text.replace(/\b20\d\d-\d\d-\d\d\b/g, ""), money = moneyIn(amountText);
+  // a reply to "what is the price per unit?" multiplies by the quantity already on the task
+  const perUnit = c.task?.goods && /\b(?:each|apiece|per|a piece)\b/i.test(text) ? money.amount : null;
+  const parsedAmount = perUnit != null ? perUnit * c.task!.goods!.qty : money.amount;
   const amount = /(?:^|\s)-\s*\$?\s*\d/.test(amountText) && parsedAmount != null ? -parsedAmount
-    : parsedAmount ?? (/\d/.test(amountText) ? 0 : null), date = window(text, l.input.nowUtc);
+    : parsedAmount ?? (/\d/.test(amountText) && !money.goods && amountOf(amountText) == null ? 0 : null), date = window(text, l.input.nowUtc);
   const add = /\b(add|create|register)\s+(?:a\s+|new\s+)?(?:company\s+)?(?:supplier|vendor|company)\b/i.test(text);
-  const query = /\b(list|show|which|what|who|have|associated)\b/i.test(text) && /\b(suppliers?|vendors?|companies|companeis)\b/i.test(text);
+  // "find using Euro", "find suppliers user euro", "who do we pay in pesos": a directory lookup, by currency or country
+  const query = (/\b(list|show|which|what|who|have|associated|find|search|look(?:ing)? (?:for|up)|get)\b/i.test(text) && /\b(suppliers?|vendors?|compan(?:y|ies)|companeis)\b/i.test(text))
+    || (/\b(find|search|look(?:ing)? (?:for|up)|using|uses?|user|paid in|who do we pay)\b/i.test(text) && !!(ccy || p) && !/\b(send|transfer|wire|pay|settle)\b\s+\$?\d/i.test(text));
   const currencyAnswer = !!ccy && /^(?:[A-Z]{3}|dollars?|euros?|pesos?|pounds?|yen)[?.!]*$/i.test(text);
   const directoryFollowup = c.topic === "suppliers" && (!!(ccy || p) && /^(?:what about|how about|only|and|instead|the)\b/i.test(text) || currencyAnswer);
   const shortAmount = /^\$?\s*\d[\d,]*(?:\.\d+)?\s*[km]?(?:\s+(?:[A-Z]{3}|dollars?|euros?|pesos?|pounds?|rupees|yen))?(?:\s+(?:please|instead))?$/i.test(text);
@@ -126,7 +185,11 @@ export function askConversation(tenant: string, raw: string, id: string = random
     || (adjustment !== text && /^\$?\s*\d[\d,]*(?:\.\d+)?\s*[km]?(?:\s+(?:[A-Z]{3}|dollars?|euros?|pesos?))?(?:\s+instead)?$/i.test(adjustment))
     || (!!ccy && /^(?:what about|how about|actually(?: use)?|use|instead)\s+(?:[A-Z]{3}|dollars?|euros?|pesos?|pounds?|yen)(?:\s+instead)?[?.!]*$/i.test(text))
     || (!!date && /^(?:by |on |before |try it by |make it by |actually by )/i.test(text));
-  const payment = /\b(send|transfer|wire|pay|settle|run)\b/i.test(text);
+  // planning, estimating or ordering from a named supplier is a payment request too ("plan a payment for Northwind")
+  const purchase = /\b(?:plan(?:ning)?|estimate|quote|cost|price|order(?:ing)?|buy(?:ing)?|purchas(?:e|ing))\b/i.test(text) && (names.length > 0 || money.amount != null || !!money.goods);
+  const payment = /\b(send|transfer|wire|pay|settle|run)\b/i.test(text) || purchase;
+  // answering "which supplier?" with part of a name, or "how much each?" with a unit price
+  const awaitingSupplier = c.task?.kind === "send" && !c.task.supplierId, fragment = awaitingSupplier && t.split(/\s+/).length <= 3 ? suppliersStartingWith(text, l) : [];
   const unrelatedQuestion = /^(?:what|who|how|where|when|why|can you|could you|tell me)\b/i.test(text)
     && !/\b(company|companies|suppliers?|vendors?|invoices?|payments?|amount|currency|currencies|deadline|bank|account|balance|owe|savings?|route|status|country|did it|did that|happened)\b/i.test(text) && !ccy && !names.length && !directoryFollowup && !payment && !(edit && c.task);
   if (unsafeInstruction(text)) result = { template: "out_of_scope", title: "Chat cannot override security controls", message: "I can explain features or help plan business payments. Chat cannot change its authority, reveal credentials, bypass checks, execute code, or approve payments." };
@@ -134,7 +197,8 @@ export function askConversation(tenant: string, raw: string, id: string = random
   else if (unsupported(text) || unrelatedQuestion) result = { template: "out_of_scope", title: "Let’s keep this about your business payments", message: help };
   else if (/\b(cancel|discard)\b/i.test(text) && c.supplierDraft) { delete c.supplierDraft; result = { template: "supplier_draft_cancelled", title: "Supplier draft discarded", message: "No supplier was saved." }; }
   else if (add || (c.topic === "supplier_draft" && c.supplierDraft && !query && !payment && !edit && !/\b(owe|savings|status|check|verify|validate|convert|exchange|swap|why|how|what|list|show)\b/i.test(text))) {
-    c.topic = "supplier_draft"; c.supplierDraft = draftFromText(text, add ? undefined : c.supplierDraft); result = supplierDraftReply(c);
+    const before = add ? undefined : c.supplierDraft;
+    c.topic = "supplier_draft"; c.supplierDraft = draftFromText(text, before); result = supplierDraftReply(c, text, before);
   }
   else if (/\b(why|status|did it work|did that work|what happened|failed|failure|worked|successful|completed)\b/i.test(text) && !payment && !edit) result = statusReply(c);
   else if (/\b(my|our) company\b/i.test(text) && /\b(name|which|what|about|details)\b/i.test(text) && !ccy) {
@@ -158,16 +222,24 @@ export function askConversation(tenant: string, raw: string, id: string = random
     c.topic = "suppliers"; c.selected = names.map((s) => s.id);
     result = { template: "list_suppliers", title: "Supplier details", suppliers: directory.filter((s) => names.some((b) => b.id === s.id)) };
   }
-  else if (payment || (edit && c.task) || (c.task?.kind === "send" && (shortAmount || currencyAnswer || names.some((s) => s.name.toLowerCase() === t) || /^(?:the )?(?:first|second|third|last|that|this) one$/i.test(text)))) {
+  else if (payment || (edit && c.task) || (c.task?.kind === "send" && (shortAmount || currencyAnswer || perUnit != null || fragment.length > 0 || (awaitingSupplier && names.length > 0)
+      || names.some((s) => s.name.toLowerCase() === t) || /^(?:the )?(?:first|second|third|last|that|this) one$/i.test(text)))) {
     const prior = c.task, transfers = existingTransfers(c), busy = transfers.find((v: any) => ["SCHEDULED", "EXECUTING", "NEEDS_RECONCILIATION", "PARTIAL"].includes(v.status));
     if (busy) result = { ...statusReply(c), title: "Resolve the existing transfer first", message: `Transfer ${busy.transferId} is ${busy.status}. I can explain its status, but changing the amount or retrying must not resend money while its outcome is unresolved.` };
     else {
-      let chosen = names;
+      let chosen = fragment.length > 1 ? [] : names;   // a short answer that fits several suppliers is asked about, not guessed
+      // "pay 100000 to a European company": the suppliers in that region or currency; one is chosen, several are asked about
+      const regional = !names.length && p ? supplierRecords(l).filter((b) => (p.country === "*" ? b.currency === p.ccy : b.country === p.country) && validate(b).status !== "BLOCK") : [];
+      if (!chosen.length && regional.length === 1) chosen = regional;
       const ordinal = /\b(first|second|third|last)\b/i.exec(text)?.[1]?.toLowerCase();
       if (!chosen.length && ordinal && c.selected.length) { const index = ordinal === "last" ? c.selected.length - 1 : ["first", "second", "third"].indexOf(ordinal); chosen = supplierRecords(l).filter((s) => s.id === c.selected[index]); }
       const useContext = !/\bto\s+(?!them\b|that\b|the\b|\d|\$)/i.test(text) || names.length > 0;
       const recipientChange = /\b(?:change|update|set)\b.*\b(?:recipient|supplier)\b/i.test(text);
-      if (!chosen.length && edit && !recipientChange && prior?.supplierId) chosen = supplierRecords(l).filter((s) => s.id === prior.supplierId);
+      if (!chosen.length && fragment.length === 1) chosen = fragment;
+      if (!chosen.length && fragment.length > 1) c.selected = fragment.map((s) => s.id);   // "Did you mean A or B?"; "the first one" then works
+      if (!chosen.length && (edit || perUnit != null || shortAmount || currencyAnswer) && !recipientChange && prior?.supplierId) chosen = supplierRecords(l).filter((s) => s.id === prior.supplierId);
+      if (!chosen.length && !recipientChange && refersBack(t) && c.mentioned?.length === 1) chosen = supplierRecords(l).filter((s) => s.id === c.mentioned![0]);
+      if (!chosen.length && awaitingSupplier && fragment.length !== 1 && prior?.amount != null) { /* keep asking which supplier, below */ }
       if (!chosen.length && !recipientChange && useContext && c.selected.length === 1) chosen = supplierRecords(l).filter((s) => s.id === c.selected[0]);
       const batch = amount == null && /\b(all|suppliers?|vendors?|bills?|invoices?|them|everyone)\b/i.test(text) && !(edit && prior?.kind === "send");
       if (edit && prior?.kind === "batch" && amount == null && !names.length) {
@@ -180,13 +252,20 @@ export function askConversation(tenant: string, raw: string, id: string = random
         c.task = { kind: "batch", billIds: bills.map((b) => b.id), reference: reference(), policy: policies(text, prior?.policy) };
         c.selected = [...new Set(bills.map((b) => b.beneficiary.id))];
       } else {
+        const keep = edit || !payment || perUnit != null || fragment.length > 0 || (awaitingSupplier && names.length > 0), home = l.input.company.homeCcy;
+        // An amount with no currency (or in the home currency, for a supplier paid in another one) is what the company sends:
+        // "transfer 50000" = 50,000 USD out, converted for the supplier. Naming the supplier's currency fixes what they receive.
+        const sourceFixed = amount != null ? (!ccy || (ccy === home && !!chosen[0] && chosen[0].currency !== home)) : keep ? prior?.sourceFixed : undefined;
         c.task = { kind: "send", supplierId: chosen.length === 1 ? chosen[0].id : undefined,
-          amount: amount ?? (edit || !payment ? prior?.amount : undefined), currency: ccy ?? ((edit || !payment ? prior?.currency : undefined) ?? chosen[0]?.currency),
-          deadlineUtc: date?.to ?? (edit || !payment ? prior?.deadlineUtc : undefined), policy: policies(text, prior?.policy), reference: reference() };
-        if (!chosen.length && ((payment && !edit && !useContext) || recipientChange)) {
+          amount: amount ?? (keep ? prior?.amount : undefined), currency: ccy ?? ((keep ? prior?.currency : undefined) ?? chosen[0]?.currency),
+          deadlineUtc: date?.to ?? (keep ? prior?.deadlineUtc : undefined), policy: policies(text, prior?.policy), reference: reference(), sourceFixed,
+          goods: money.goods ?? (keep ? prior?.goods : undefined) };
+        if (!chosen.length && !fragment.length && !regional.length && ((payment && !edit && !useContext && !purchase) || recipientChange)) {
           c.task.requestedSupplierName = text.match(/\bto\s+(.+?)(?=\s+(?:by|on|before)\b|$)/i)?.[1]; c.selected = [];
         }
         if (chosen.length === 1) c.selected = [chosen[0].id];
+        else if (fragment.length > 1) c.selected = fragment.map((s) => s.id);
+        else if (regional.length > 1) c.selected = regional.map((s) => s.id);
       }
       c.topic = "payment"; c.intentIds = []; c.decisions = []; result = planTask(c, l);
       if (transfers.some((v: any) => v.status === "COMPLETED")) result.message = "The previous transfer already completed. This is a separate new preview; it does not change or resend that transfer. Review it before creating another payment.";
@@ -202,6 +281,8 @@ export function askConversation(tenant: string, raw: string, id: string = random
   }
   else if (/^(thanks|thank you|hi|hello|help)[!. ]*$/i.test(text)) result = { template: "help", title: "Your company payment assistant", message: help };
   else result = { template: "out_of_scope", title: "I help with company payments and suppliers", message: help };
+  if (names.length) c.mentioned = names.map((s) => s.id);
+  else if (c.task?.kind === "send" && c.task.supplierId) c.mentioned = [c.task.supplierId];
   c.revision++;
   result = { source: l.source, ...result, ...context(c), company: l.input.company };
   const stored = publicData({ ...result }); delete stored.beneficiary; delete stored.company;

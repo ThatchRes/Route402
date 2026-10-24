@@ -3,14 +3,14 @@
 // funds and releases them when the evidence arrives (the UK GBTD pilot locked a buyer's money until goods changed hands).
 // The fields answer the four questions banks say conditional payments need rules for: who sets the condition, how it is
 // proven, who can halt it, and what happens in a dispute or if it never happens.
-export type ConditionKind = "delivery_confirmed";
+export type ConditionKind = "delivery_confirmed" | "documents_presented";
 export type Enforcement = "route402_before_send" | "ledger_lock_and_release";
 
 export interface ConditionSpec {
   version: 1;
   kind: ConditionKind;
   setBy: { userId: string; role: string; at: string };                     // who set it
-  proof: { evidence: "bill_of_lading" | "goods_receipt"; confirmerRoles: string[]; notThePreparer: true }; // how it is proven
+  proof: { evidence: "bill_of_lading" | "goods_receipt" | "electronic_bill_of_lading"; confirmerRoles: string[]; notThePreparer: true }; // how it is proven
   haltableBy: string[];                                                    // roles that can stop it before release
   ifNotMet: { action: "keep_with_payer"; reviewAfterDays: number };        // nothing leaves the payer's account until met
   dispute: string;                                                         // where a disagreement goes
@@ -35,4 +35,12 @@ export function enforcementOn(rail: "bank_wire" | "stablecoin_usdc" | "tokenized
   return rail === "tokenized_deposit"
     ? { enforcement: "ledger_lock_and_release", how: "the ledger locks the funds at approval and releases them when the evidence is recorded" }
     : { enforcement: "route402_before_send", how: "Route402 holds the instruction and sends it only after the evidence is recorded" };
+}
+
+/** Letter-of-credit style condition: released when the shipping documents verify, including an eBL whose title passed to the buyer. */
+export function documentsCondition(userId: string, role: string, reviewAfterDays: number): ConditionSpec {
+  return { ...deliveryCondition(userId, role), kind: "documents_presented",
+    proof: { evidence: "electronic_bill_of_lading", confirmerRoles: ["receiving", "approver", "admin"], notThePreparer: true },
+    ifNotMet: { action: "keep_with_payer", reviewAfterDays },
+    dispute: "goes back to the approvers with the failed document checks; the funds have not been released to the supplier" };
 }

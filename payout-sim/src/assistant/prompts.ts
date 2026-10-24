@@ -41,6 +41,46 @@ export function window(text: string, nowUtc: string): { from: string; to: string
   if (wd >= 0) { const n = (wd - now.getUTCDay() + 7) % 7 || 7; return { from: nowUtc, to: end(day(n)), label: `by ${DAYS[wd]}` }; }
   return null;
 }
+// Every ISO country name the runtime knows ("Switzerland" -> CH), plus everyday aliases. Used for supplier countries.
+const REGION = new Intl.DisplayNames(["en"], { type: "region" });
+const COUNTRY_NAMES = new Map<string, string>();
+for (let a = 65; a < 91; a++) for (let b = 65; b < 91; b++) {
+  const code = String.fromCharCode(a, b), name = REGION.of(code);
+  if (name && name !== code && !/unknown/i.test(name)) COUNTRY_NAMES.set(name.toLowerCase(), code);
+}
+for (const [alias, code] of Object.entries({ usa: "US", "united states of america": "US", america: "US", uk: "GB", britain: "GB", "great britain": "GB",
+  england: "GB", holland: "NL", "the netherlands": "NL", "south korea": "KR", korea: "KR", uae: "AE", "czech republic": "CZ", swiss: "CH", deutschland: "DE" }))
+  COUNTRY_NAMES.set(alias, code);
+const editDistance = (a: string, b: string) => {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[a.length][b.length];
+};
+/** A country named in the text: an exact name anywhere, or, when `loose`, a short answer with a small typo ("Switzerlan"). */
+export function countryOf(text: string, loose = false): { code: string; name: string } | null {
+  const t = text.toLowerCase().replace(/[^a-z\s.'-]/g, " ").replace(/\s+/g, " ").trim();
+  const names = [...COUNTRY_NAMES.keys()].sort((x, y) => y.length - x.length);
+  const exact = names.find((n) => n.length > 2 && new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(t));
+  if (exact) return { code: COUNTRY_NAMES.get(exact)!, name: REGION.of(COUNTRY_NAMES.get(exact)!)! };
+  if (/^[a-z]{2}$/.test(t) && REGION.of(t.toUpperCase()) !== t.toUpperCase()) return { code: t.toUpperCase(), name: REGION.of(t.toUpperCase())! };
+  if (!loose || t.length < 4 || t.split(" ").length > 3) return null;
+  let best: { n: string; d: number } | null = null;
+  for (const n of names) {
+    const d = n.startsWith(t) ? 0 : editDistance(t, n);
+    if (d <= (t.length >= 8 ? 2 : 1) && (!best || d < best.d)) best = { n, d };
+  }
+  return best ? { code: COUNTRY_NAMES.get(best.n)!, name: REGION.of(COUNTRY_NAMES.get(best.n)!)! } : null;
+}
+// The usual payout currency for a supplier's country (a suggestion only; the person confirms it)
+const EURO = "AT BE CY DE EE ES FI FR GR HR IE IT LT LU LV MT NL PT SI SK".split(" ");
+export function usualCurrency(country: string): string | undefined {
+  if (EURO.includes(country)) return "EUR";
+  return ({ US: "USD", CA: "CAD", MX: "MXN", GB: "GBP", SG: "SGD", BR: "BRL", JP: "JPY", IN: "INR", AU: "AUD", CH: "CHF", PH: "PHP", NG: "NGN",
+    ZA: "ZAR", TR: "TRY", KR: "KRW", ID: "IDR", CN: "CNY", HK: "HKD", NZ: "NZD", SE: "SEK", NO: "NOK", DK: "DKK", PL: "PLN", VN: "VND" } as Record<string, string>)[country];
+}
+
 export function place(text: string) { const t = text.toLowerCase(); const k = Object.keys(PLACES).find((p) => (p !== "us" || /\bUS\b/.test(text)) && new RegExp(`\\b${p}\\b`).test(t)); return k ? PLACES[k] : null; }
 export function amountOf(text: string) {
   const m = text.replace(/\$/g, "").match(AMOUNT); if (!m) return null;
@@ -48,19 +88,24 @@ export function amountOf(text: string) {
   return n > 0 ? n : null;
 }
 
-export function planSend(l: Linked, supplierId: string, value: string | number, currency?: string, deadlineUtc?: string) {
+/** `sourceFixed`: the amount is what the company sends, in its home currency ("transfer 50000" means 50,000 USD for a US
+ *  company); the supplier receives the converted amount in its own currency. Otherwise the amount is what the supplier receives. */
+export function planSend(l: Linked, supplierId: string, value: string | number, currency?: string, deadlineUtc?: string, sourceFixed = false) {
   const ben = supplierRecords(l).find((b) => b.id === supplierId);
   if (!ben) return { clarification: "Choose a saved supplier before planning a payment." };
-  const dest = currency ?? ben.currency;
+  const home = l.input.company.homeCcy, dest = sourceFixed ? ben.currency : currency ?? ben.currency, amountCcy = sourceFixed ? home : dest;
   const receivingCurrencies = new Set([ben.currency, ...l.input.payables.filter((p) => p.beneficiary.id === ben.id).map((p) => p.ccy)]);
   if (!receivingCurrencies.has(dest)) return { template: "send_to", clarification: `${ben.name} has receiving details on file for ${[...receivingCurrencies].join(", ")}. Choose one of those currencies before planning this payment.` };
   let amount: string;
-  try { amount = Number(value).toFixed(decimals(dest)); toMinor(String(value), dest); if (!(Number(value) > 0)) throw new Error("positive amount required"); }
-  catch { return { clarification: `Enter a positive amount with valid precision for ${dest}.` }; }
+  try { amount = Number(value).toFixed(decimals(amountCcy)); toMinor(String(value), amountCcy); if (!(Number(value) > 0)) throw new Error("positive amount required"); }
+  catch { return { clarification: `Enter a positive amount with valid precision for ${amountCcy}.` }; }
   const v = validate(ben); if (v.status === "BLOCK") return { blocked: v.errors, beneficiary: ben.name };
-  const intent = { srcCcy: l.input.company.homeCcy, destCcy: dest, amountType: "RECIPIENT_FIXED" as const, amount, deadlineUtc };
+  const intent = { srcCcy: home, destCcy: dest, amountType: (sourceFixed ? "SOURCE_FIXED" : "RECIPIENT_FIXED") as "SOURCE_FIXED" | "RECIPIENT_FIXED", amount, deadlineUtc };
   const q: any = optimize({ ...intent, objective: "balanced", nowUtc: l.input.nowUtc, currentBank: l.input.company.currentBank, beneficiary: ben, beneficiaryAcceptsUsdc: !!ben.usdcWallet });
-  return { template: "send_to", title: `Send ${amount} ${dest} to ${ben.name}`, beneficiaryCheck: v.status, beneficiary: ben,
+  const shown = Number(amount).toLocaleString("en-US", { minimumFractionDigits: decimals(amountCcy), maximumFractionDigits: decimals(amountCcy) });
+  return { template: "send_to", title: sourceFixed ? `Send ${shown} ${home} to ${ben.name}${dest !== home ? ` (they receive ${dest})` : ""}` : `Send ${shown} ${dest} to ${ben.name}`,
+    message: sourceFixed && dest !== home ? `No currency was given, so I used your home currency: ${shown} ${home} leaves your account, fees included, and ${ben.name} receives the converted amount in ${dest}.` : undefined,
+    beneficiaryCheck: v.status, beneficiary: ben,
     preview: q.status === "OK" ? { route: q.allocations.map((a: any) => a.routeId).join(" + "), youPay: q.totals.sourceDebit,
       theyGet: q.totals.recipientNet, arrives: q.totals.arrivalUtc, yourBankWould: q.baseline?.sourceDebit, youSave: q.value.customerNetSaving, timing: q.timing } : q,
     intent, nextStep: "A new preview only: review and approve before execution." };

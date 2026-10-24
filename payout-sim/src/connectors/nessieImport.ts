@@ -68,7 +68,7 @@ export async function importFromNessie(customerId: string, company: CompanyProfi
       if (m) receivables.push({ id: m.id, ccy: m.ccy, amount: m.amount, dateUtc: m.dateUtc, status: m.status });
     }
   }
-  const input: PaymentRunInput = { company: { ...company, name: `${company.name} (Nessie ${customerId.slice(-6)})` }, nowUtc, payables, receivables };
+  const input: PaymentRunInput = { company: { ...company }, nowUtc, payables, receivables };
   return { input, source: "nessie", customerId, usdAvailable: usdBalance.toFixed(2), imported: { accounts: accounts.length, payables: payables.length, receivables: receivables.length }, unmapped };
 }
 

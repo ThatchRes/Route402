@@ -10,7 +10,7 @@ export interface CompanyProfile {
 }
 
 export const DEMO_COMPANY: CompanyProfile = {
-  companyId: "acme-imports", name: "Acme Imports Inc.", homeCcy: "USD", costOfCashPct: 6.0,
+  companyId: "acme-imports", name: "Northbridge Manufacturing Corp.", homeCcy: "USD", costOfCashPct: 6.0,
   // FX markup: measured big-bank pricing per corridor (Wise comparison data). Wire fee: median US outgoing international
   // wire fee, $45 (NerdWallet survey of bank fee schedules). A failed payment is valued as re-sending that wire.
   // A real customer replaces these with the numbers on its own bank's fee schedule.

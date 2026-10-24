@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40" fill="none">
+  <!-- Route402 mark: one payment comes in from the left, the router splits it, the chosen route (bright) wins over the alternative (dim) -->
+  <defs>
+    <linearGradient id="r402-bg" x1="4" y1="2" x2="36" y2="38" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3fb2a8"/>
+      <stop offset="1" stop-color="#16514d"/>
+    </linearGradient>
+  </defs>
+  <rect width="40" height="40" rx="11" fill="url(#r402-bg)"/>
+  <path d="M8 20H17" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/>
+  <path d="M17 20C22.5 20 23.5 28.5 31 28.5" stroke="#fff" stroke-opacity=".5" stroke-width="2.8" stroke-linecap="round"/>
+  <path d="M17 20C22.5 20 23.5 11.5 31 11.5" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/>
+  <circle cx="8" cy="20" r="3" fill="#fff"/>
+  <circle cx="31" cy="28.5" r="2.6" fill="#fff" fill-opacity=".5"/>
+  <circle cx="31" cy="11.5" r="3.6" fill="#fff"/>
+  <circle cx="31" cy="11.5" r="1.5" fill="#2a8a84"/>
+</svg>

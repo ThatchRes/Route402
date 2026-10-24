@@ -28,7 +28,10 @@ import { fmt, toMinor } from "../money.js";
 import { MARKET, marketSummary } from "./market.js";
 import { mountUi } from "./ui.js";
 import { TOKENS } from "./registry.js";
-import { usdcRouteAllowed } from "./depeg.js";
+import { issuerHeadroom, stablecoinPlanAllowed } from "./depeg.js";
+import { setTokenizedConfig } from "./tokenized.js";
+import { coinsOf, complianceChecks, disallowedCoins, railOf } from "./compliance.js";
+import { loadPolicy } from "../company/controls.js";
 import { planningNow } from "./timing.js";
 import { executionPolicy, planForDispatch } from "./dispatch.js";
 import { askConversation, conversationView, recordConversationReview, ConversationConflict } from "../assistant/conversation.js";
@@ -38,6 +41,14 @@ export const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "100kb", strict: true }));
 const TOKEN = () => process.env.ROUTER_TOKEN ?? "dev-token";
+setTokenizedConfig(loadPolicy().tokenized);   // the bank's tokenized-deposit tariff, if an admin has entered one
+// The compliance rules for one decided plan: country, rail, coins, the supplier's wallet when a leg pays it directly
+const complianceFor = (it: any, d: any) => {
+  const routeIds = (d.allocations ?? []).map((a: any) => String(a.routeId)), kind = railOf(routeIds);
+  return complianceChecks({ routeKind: kind, coins: coinsOf(routeIds), destCcy: it.destCcy, country: it.beneficiary?.country,
+    supplierWallet: routeIds.some((r: string) => r.includes("supplier_usdc_wallet")) ? it.beneficiary?.usdcWallet : undefined,
+    amountUsd: it.srcCcy === "USD" ? Number(String(d.totals.sourceDebit).split(" ")[0]) : 0, supplierName: it.beneficiary?.name }, loadPolicy());
+};
 const PAYOUT = process.env.PAYOUT_URL ?? "http://localhost:8403";
 const PAYOUT_H = () => ({ authorization: `Bearer ${process.env.PAYOUT_INTERNAL_TOKEN ?? "dev-token"}`, "content-type": "application/json" });
 const X402_DIR = process.env.X402_DIR ?? path.resolve("..", "x402-spike");
@@ -71,31 +82,42 @@ app.post("/v1/intents", (req, res) => {
 // The returned intentId is bound to that provider's plan, so executing it sends exactly what that provider quoted.
 const RISK: Record<string, { score: number; why: string }> = {
   bank: { score: 1, why: "your own bank's wire (business days and cut-offs apply)" },
+  bank_wire: { score: 1, why: "your own bank's wire (business days and cut-offs apply)" },
+  tokenized_deposit: { score: 1, why: "a deposit at your own bank, moved on its ledger 24/7" },
   stablecoin_live: { score: 2, why: "USD stablecoins; USDC-on-Base legs carry an on-chain settlement proof" },
   stablecoin: { score: 3, why: "local stablecoin rail: thinner liquidity, simulated off-ramp" },
 };
 app.post("/v1/provider-quote", async (req, res) => {
   const { provider, ...it } = req.body ?? {};
-  if (!["stablecoin", "bank"].includes(provider) || !validIntent(it)) return err(res, 400, "INVALID_INTENT", "provider + intent required");
+  if (!["stablecoin", "bank", "bank_wire", "tokenized_deposit"].includes(provider) || !validIntent(it)) return err(res, 400, "INVALID_INTENT", "provider + intent required");
   let r: any;
-  try { r = createIntent({ ...it, provider, objective: it.objective ?? "cheapest" }); } catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
+  // the stablecoin rail plans within each issuer's remaining room under the cap, splitting across issuers when one is full
+  // and skips coins the compliance rules forbid for this supplier; above every allowed issuer's cap, the rest goes by bank wire
+  try { r = createIntent({ ...it, provider, objective: it.objective ?? "cheapest", ...(provider === "stablecoin"
+    ? { issuerHeadroomUsd: issuerHeadroom(), excludeCoins: disallowedCoins(it.beneficiary?.country, loadPolicy()), bankComplement: true } : {}) }); }
+  catch (e: any) { return err(res, 422, "INVALID_INTENT", e.message); }
   const d = r.decision;
   if (d.status !== "OK") return res.json({ provider, status: "NO_QUOTE", reason: d.reason || (d.missing ?? []).join("; ") || "no route from this provider",
     deadlineUtc: it.deadlineUtc, earliestArrivalUtc: d.earliestArrivalUtc, excluded: (d.candidates ?? []).map((c: any) => ({ routeId: c.routeId, reason: c.reason })) });
   // Stablecoin safety: depeg circuit breaker + issuer cap. A paused rail returns no quote, so no agent can pick it.
   if (provider === "stablecoin") {
-    const g = await usdcRouteAllowed(Number(String(d.totals.sourceDebit).split(" ")[0]));
+    const g = await stablecoinPlanAllowed(d.allocations);
     if (!g.ok) return res.json({ provider, status: "NO_QUOTE", reason: g.reason, peg: g.peg });
   }
+  // Compliance: a plan that breaks a company rule returns no quote, so no agent and no person can pick it
+  const compliance = await complianceFor(r.intent ?? it, d);
+  if (!compliance.ok) return res.json({ provider, status: "NO_QUOTE", reason: compliance.reason, compliance: compliance.checks });
   // stablecoin risk: USD coins only (USDC/USDG/PYUSD...) = 2; any local-currency coin (thinner liquidity) = 3
   const usdOnly = d.allocations.every((a: any) => !String(a.routeId).includes(">")          // a swap into a local coin
     && (!a.token || TOKENS.find((t) => t.id === a.token)?.peg === "USD"));
-  const risk = provider !== "stablecoin" ? RISK[provider] : usdOnly ? RISK.stablecoin_live : RISK.stablecoin;
+  const tokenizedLeg = d.allocations.some((a: any) => String(a.routeId).startsWith("tokenized:"));
+  const risk = provider !== "stablecoin" ? (tokenizedLeg ? RISK.tokenized_deposit : RISK[provider]) : usdOnly ? RISK.stablecoin_live : RISK.stablecoin;
   res.json({ provider, status: "OK", intentId: r.intentId, quoteExpiresInSec: 900,
-    providerLabel: process.env.LOCAL_ROUTING === "1" ? "Local payout routes (synthetic simulation)" : provider === "bank" ? "Your bank" : "Our stablecoin rail",
+    providerLabel: process.env.LOCAL_ROUTING === "1" ? "Local payout routes (synthetic simulation)"
+      : provider === "stablecoin" && d.allocations.some((a: any) => String(a.routeId).startsWith("bank:")) ? "Our stablecoin rail + your bank wire" : tokenizedLeg ? "Your bank (tokenized deposit)" : provider === "stablecoin" ? "Our stablecoin rail" : "Your bank",
     plan: { kind: d.plan, sourceDebit: d.totals.sourceDebit, recipientNet: d.totals.recipientNet, arrivalUtc: d.totals.arrivalUtc,
             allocations: d.allocations.map((a: any) => ({ routeId: a.routeId, label: a.label, x402Executable: a.x402Executable, amount: a.amount, arrivalUtc: a.arrivalUtc })) },
-    timing: d.timing, simulation: d.simulation, costVsMidBps: d.costVsMidBps, risk,
+    timing: d.timing, simulation: d.simulation, costVsMidBps: d.costVsMidBps, risk, compliance: compliance.checks,
     baseline: d.baseline ? { sourceDebit: d.baseline.sourceDebit, meetsDeadline: d.baseline.meetsDeadline } : null, value: d.value, provenance: d.provenance });
 });
 app.get("/v1/intents/:id", (req, res) => { const i = load().intents[String(req.params.id)]; return i ? res.json(i) : err(res, 404, "NOT_FOUND", "intent"); });
@@ -182,10 +204,12 @@ export async function dispatchDue() {
     dispatching.add(t.transferId);
     try {
       let check = planForDispatch(t.terms, now());
-      if (check.ok && check.decision.allocations.some((a: any) => a.token === "USDC")) {
-        const gate = await usdcRouteAllowed(Number(check.decision.totals.sourceDebit.split(" ")[0]));
+      if (check.ok && check.decision.allocations.some((a: any) => String(a.routeId).startsWith("coin:"))) {
+        const gate = await stablecoinPlanAllowed(check.decision.allocations);
         if (!gate.ok) check = { ok: false, code: "RAIL_PAUSED", reason: gate.reason };
       }
+      // Compliance again just before money moves (sanctions lists and policy can change after approval)
+      if (check.ok) { const c = await complianceFor(t.terms.intent, check.decision); if (!c.ok) check = { ok: false, code: "COMPLIANCE_HOLD", reason: c.reason }; }
       // Recheck after asynchronous rail checks; nothing has been funded yet, so a pause can safely free the reservation.
       if (check.ok) check = planForDispatch(t.terms, now());
       if (!check.ok) {

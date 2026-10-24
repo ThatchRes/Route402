@@ -22,7 +22,7 @@ const supplierByName = (name) => STATE?.suppliers?.find((s) => s.name === name);
 function workspaceNote() {
   if (!STATE) return "Route402 · demo";
   return STATE.localSimulation ? `Local simulation · ${STATE.connected ? "Linked company data" : "Demo company data"} · Simulated quotes and payouts · No x402 spending`
-    : `Testnet demo · ${STATE.connected ? `Connected: ${STATE.source.replace("Nessie customer", "Capital One ·")}` : "Demo company data"} · Testnet money only · Supplier payouts simulated`;
+    : `Testnet demo · ${STATE.connected ? "Connected to Capital One" : "Demo company data"} · Testnet money only · Supplier payouts simulated`;
 }
 const docPage = (P, html) => { P.innerHTML = `<div class="doc">${html}<p class="app-note">${esc(workspaceNote())}</p></div>`; };
 function download(name, text, type) {   // client-side export of data already on screen
@@ -151,73 +151,78 @@ function pageCreate(P, q) {
   const R = d.key === quoteKey(d) ? d.routes : null, ok = (R?.routes ?? []).filter((r) => r.status === "OK");
   const sel = ok.find((r) => r.provider === d.selected), rec = recRoute(R), budget = d.mode === "budget";
   const busy = d.agentBusy, err = d.formErr ?? {};
-  const field = (k, label, control, hint = "") => `<div class="field3 ${err[k] ? "err" : ""}" id="ff-${k}"><label for="${k}">${esc(label)}</label>${control}${err[k] ? `<span class="e">${esc(err[k])}</span>` : hint ? `<span class="h">${esc(hint)}</span>` : ""}</div>`;
+  const field = (k, label, control, hint = "") => `<div class="field3 ${err[k] ? "err" : ""}" id="ff-${k}"><div class="flabel"><label for="${k}">${esc(label)}</label>${hint ? `<span class="h">${esc(hint)}</span>` : ""}</div>${control}${err[k] ? `<span class="e">${esc(err[k])}</span>` : ""}</div>`;
   const sel3 = (id, opts, attrs = "") => `<div class="sel3">${`<select id="${id}" ${attrs}>${opts}</select>`}${IC("chevron-down", 14)}</div>`;
+  // Each section is a field card: title and a short note above, the inputs, then a footer strip for context
+  const card = (title, note, body, foot = "") => `<section class="fsec"><div class="fsec-head"><h3>${title}</h3>${note}</div>
+    <div class="fbox"><div class="fbox-body">${body}</div>${foot ? `<div class="fbox-foot">${foot}</div>` : ""}</div></section>`;
   const routeName = (r) => RAIL[r.provider] ?? r.provider, arrival = (r) => (r.economics.transitDays < 0.05 ? "minutes · 24/7" : `${r.economics.transitDays.toFixed(1)} days`);
   const others = ok.filter((r) => r !== sel);
   const diff = (r) => { if (!sel) return ""; const dv = budget ? num(r.supplierGets) - num(sel.supplierGets) : r.economics.allInUsd - sel.economics.allInUsd;
     return budget ? `${fmt(Math.abs(dv))} ${b.ccy} ${dv < 0 ? "less" : "more"} for the supplier` : `${usd(Math.abs(dv), 2)} ${dv > 0 ? "more" : "less"} all-in`; };
   const x = sel?.breakdown, e = sel?.economics;
-  docPage(P, `${docIntro("Manual payment", "Enter the details yourself. The same review and approval comes next.", `<a class="text-btn t12" href="#/chat">Ask the agent instead ↗</a>`)}
+  docPage(P, `<div class="mp">${docIntro("Manual payment", "Enter the details yourself. The same review and approval comes next.", `<a class="text-btn t12" href="#/chat">Ask the agent instead ↗</a>`)}
   <div class="doc-cols">
-    <form class="doc-main g22" id="mp-form" novalidate>
+    <form class="doc-main mp-form" id="mp-form" novalidate>
       <div class="draft-ref"><span class="eyebrow">${b ? esc(b.id) : "NEW PAYMENT REQUEST"}</span>${badge("Draft · Unsent")}</div>
-      <section class="fsec"><div class="fsec-head"><h3>Recipient &amp; receiving details</h3><button type="button" class="text-btn" id="mp-add">+ Add supplier</button></div>
-        ${field("bill", "Saved supplier and invoice", sel3("bill", `<option value="">Choose a saved supplier</option>${startable.map((x2) => `<option value="${esc(x2.id)}" ${x2.id === d.billId ? "selected" : ""}>${esc(x2.supplier)} · ${esc(x2.id)} · ${money(`${x2.amount} ${x2.ccy}`)}</option>`).join("")}`))}
-        ${b ? `<div class="pair">${detail("Location / currency", `${esc(COUNTRY[b.country] ?? b.country)} · ${esc(b.ccy)}`)}${detail("Receiving account", esc(s?.maskedAccount ?? R?.bill?.maskedAccount ?? "—"))}</div>
-          <p class="note11">${esc(b.issues[0] ?? `Saved receiving details · ${b.check === "OK" ? "format checks passed" : "review required"}`)}${b.acceptsUsdc ? " · accepts USDC" : ""}</p>` : `<p class="note11">${startable.length} invoice${startable.length === 1 ? "" : "s"} ready to pay. Blocked suppliers and invoices that already have a request are not listed.</p>`}
-      </section>
-      <div class="divider"></div>
-      <section class="fsec"><h3>Source &amp; total debit</h3>
-        ${field("source", "Source account", sel3("source", `<option>${esc(R?.sourceAccount ?? (STATE.connected ? "Operating account (Capital One)" : "USD operating account (demo)"))}</option>`))}
-        <div class="seg" role="radiogroup" aria-label="Amount"><label class="${budget ? "" : "on"}"><input type="radio" name="mode" value="invoice" ${budget ? "" : "checked"} />Supplier receives the invoice amount</label>
-          <label class="${budget ? "on" : ""}"><input type="radio" name="mode" value="budget" ${budget ? "checked" : ""} />Fix the total debit</label></div>
-        <div class="pair">${field("usd", "Total debit · USD", budget ? `<input id="usd" inputmode="decimal" placeholder="0.00" value="${esc(d.budgetUsd ?? "")}" />`
-            : `<input id="usd" readonly value="${sel ? esc(fmt(num(sel.youPay))) : ""}" placeholder="${b ? "Calculated from the quote" : "—"}" aria-describedby="usd-h" />`)}
-          ${field("ccy", "Recipient currency", sel3("ccy", b ? `<option>${esc(b.ccy)} · ${esc(new Intl.DisplayNames(["en"], { type: "currency" }).of(b.ccy) ?? b.ccy)}</option>` : "<option>—</option>"))}</div>
-        <p class="note10" id="usd-h">${budget ? "Include all fees in your total debit." : `The supplier receives ${b ? money(`${b.amount} ${b.ccy}`) : "the invoice amount"}; the total debit includes all fees.`} Recipient currency must match saved receiving details.</p>
-      </section>
-      <div class="divider"></div>
-      <section class="fsec"><h3>Invoice &amp; delivery</h3>
-        <div class="pair">${field("inv", "Invoice reference", `<input id="inv" readonly value="${esc(b?.id ?? "")}" placeholder="From the saved invoice" />`)}
-          ${field("due", "Requested delivery", `<input id="due" type="date" value="${esc((d.due ?? "").slice(0, 10))}" />`, b ? `Invoice due ${dUtcY(b.dueUtc)}` : "")}</div>
-        ${field("purpose", "Purpose", `<input id="purpose" maxlength="120" value="${esc(d.purpose)}" placeholder="Enter purpose" />`)}
-        <label class="check2"><input type="checkbox" id="deliver" ${d.deliver ? "checked" : ""} /> <span><b>Release only after delivery is confirmed</b> (bill of lading or goods receipt). On our stablecoin rail the money is locked in escrow at approval and returned after ${esc(POLICY.escrowDeadlineDays)} days if not released.</span></label>
-      </section>
-      <div class="divider"></div>
-      <section class="fsec"><div class="fsec-head"><h3>Route preference</h3><span class="eyebrow">${STATE.localSimulation ? "SIMULATED QUOTES" : "ROUTER QUOTES"}</span></div>
-        ${!b ? `<p class="note11">Choose a saved supplier to see the available routes.</p>` : d.routesErr ? notice(esc(d.routesErr), "warn")
+      ${card("Who you’re paying", `<button type="button" class="text-btn" id="mp-add">+ Add supplier</button>`,
+        `${field("bill", "Saved supplier and invoice", sel3("bill", `<option value="">Choose a saved supplier</option>${startable.map((x2) => `<option value="${esc(x2.id)}" ${x2.id === d.billId ? "selected" : ""}>${esc(x2.supplier)} · ${esc(x2.id)} · ${money(`${x2.amount} ${x2.ccy}`)}</option>`).join("")}`), "Saved suppliers only")}
+        ${b ? `<div class="pair">${detail("Location / currency", `${esc(COUNTRY[b.country] ?? b.country)} · ${esc(b.ccy)}`)}${detail("Receiving account", esc(s?.maskedAccount ?? R?.bill?.maskedAccount ?? "—"))}</div>` : ""}`,
+        b ? `<p class="note11">${esc(b.issues[0] ?? `Saved receiving details · ${b.check === "OK" ? "format checks passed" : "review required"}`)}${b.acceptsUsdc ? " · accepts USDC" : ""}</p>`
+          : `<p class="note11">${startable.length} invoice${startable.length === 1 ? "" : "s"} ready to pay. Blocked suppliers and invoices that already have a request are not listed.</p>`)}
+      ${card("How much", `<span class="fsec-note">Fees are always included in what you pay</span>`,
+        `${field("source", "Pay from", sel3("source", `<option>${esc(R?.sourceAccount ?? (STATE.connected ? "Operating account (Capital One)" : "USD operating account (demo)"))}</option>`))}
+        <div class="seg" role="radiogroup" aria-label="Amount"><label class="${budget ? "" : "on"}"><input type="radio" name="mode" value="invoice" ${budget ? "" : "checked"} />Pay the full invoice amount</label>
+          <label class="${budget ? "on" : ""}"><input type="radio" name="mode" value="budget" ${budget ? "checked" : ""} />Set how much we send</label></div>
+        <div class="pair">${field("usd", "You pay · USD", budget ? `<input id="usd" inputmode="decimal" placeholder="0.00" value="${esc(d.budgetUsd ?? "")}" />`
+            : `<input id="usd" readonly value="${sel ? esc(fmt(num(sel.youPay))) : ""}" placeholder="${b ? "Calculated from the quote" : "—"}" aria-describedby="usd-h" />`, budget ? "You set this" : "From the quote")}
+          ${field("ccy", "Recipient currency", sel3("ccy", b ? `<option>${esc(b.ccy)} · ${esc(new Intl.DisplayNames(["en"], { type: "currency" }).of(b.ccy) ?? b.ccy)}</option>` : "<option>—</option>"))}</div>`,
+        `<p class="note11" id="usd-h">${budget ? "Fees come out of this amount; the supplier gets what is left, converted." : `The supplier gets ${b ? money(`${b.amount} ${b.ccy}`) : "the full invoice amount"}; what you pay already includes every fee.`} The currency must match the supplier’s saved bank account.</p>`)}
+      ${card("Invoice &amp; deadline", `<span class="fsec-note">Only routes that arrive by this date are offered</span>`,
+        `<div class="pair">${field("inv", "Invoice reference", `<input id="inv" readonly value="${esc(b?.id ?? "")}" placeholder="From the saved invoice" />`)}
+          ${field("due", "Must arrive by", `<input id="due" type="date" value="${esc((d.due ?? "").slice(0, 10))}" />`, b ? `Invoice due ${dUtcY(b.dueUtc)}` : "")}</div>
+        ${field("purpose", "Purpose", `<textarea id="purpose" rows="3" maxlength="120" placeholder="Write a note for your approvers…">${esc(d.purpose)}</textarea>`, "Shown to approvers · 120 characters")}`,
+        "")}
+      ${releaseCard(d, b, sel)}
+      ${card("How the money travels", `<span class="eyebrow">${STATE.localSimulation ? "SIMULATED QUOTES" : "ROUTER QUOTES"}</span>`,
+        !b ? `<p class="note11">Choose a saved supplier to see the available routes.</p>` : d.routesErr ? notice(esc(d.routesErr), "warn")
           : !R ? `<div class="routebox"><i class="skel-line"></i></div>` : !sel ? notice("No route can deliver this payment as requested. Try a later delivery date.", "warn")
           : `<div class="routebox">${IC("circle-dot", 18)}<div><b>${esc(routeName(sel))} · ${sel === rec ? "Recommended" : "Selected"}</b><span>${sel === rec ? "Lowest all-in cost within the requested delivery" : diff(rec).replace(/more|less/, (w) => (w === "more" ? "less" : "more")) + " than the recommended route"} · ${e.meetsDeadline ? `arrives ${dUtc(sel.arrivalUtc)}` : "may miss the requested date"} · ${sel.provider === "stablecoin" ? "supplier accepts USDC" : "saved receiving details"}</span></div></div>
             ${others.length ? `<p class="routes-alt">Change route: ${others.map((r) => `<button type="button" class="text-btn" data-pick="${r.provider}">${esc(routeName(r))} · ${money(budget ? r.supplierGets : r.youPay)}</button>`).join("  /  ")}</p>
               <p class="note10">${others.map((r) => `${esc(routeName(r))}: ${esc(diff(r))}, ${r.economics.meetsDeadline ? `arrives ${dUtc(r.arrivalUtc)}` : "may arrive late"}.`).join(" ")}</p>` : ""}
-            ${R.routes.filter((r) => r.status !== "OK").map((r) => `<p class="note10">${esc(RAIL[r.provider] ?? r.provider)}: ${esc(r.reason ?? "not available")}</p>`).join("")}
-            <a class="text-btn" href="#/payments/compare">Compare every route in detail →</a>`}
-      </section>
+            ${R.routes.filter((r) => r.status !== "OK").map((r) => `<p class="note10">${esc(RAIL[r.provider] ?? r.provider)}: ${esc(r.reason ?? "not available")}</p>`).join("")}`,
+        b && sel ? `<a class="text-btn" href="#/payments/compare">Compare every route in detail →</a>` : "")}
+      <div class="mp-actions">
+        <button type="button" class="btn-solid" id="go" ${busy ? "disabled" : ""}>${busy ? `<span class="spinner"></span>Checking quotes and supplier…` : `Continue to review ${IC("arrow-right-white", 15)}`}</button>
+        <p class="note11">No money moves when you complete this form or select a route.</p>
+      </div>
+      ${d.agentErr ? `<p class="note11 bad">Agents unavailable: ${esc(d.agentErr)}</p>` : ""}
     </form>
-    <aside class="doc-aside w310" aria-label="Payment summary">
+    <aside class="doc-aside mp-summary" aria-label="Payment summary">
       <span class="eyebrow">PAYMENT SUMMARY</span>
-      <p class="serif30">${sel ? (budget ? usd(d.budgetUsd, 2) : money(sel.youPay)) : "—"}</p><p class="note11">Total debit · All fees included</p>
+      <div><p class="serif30">${sel ? (budget ? usd(d.budgetUsd, 2) : money(sel.youPay)) : "—"}</p><p class="note11">Total you pay, fees included</p></div>
       <div class="divider"></div>
       ${detail("To", esc(b?.supplier ?? "Choose a supplier"))}${b ? detail("Invoice", esc(b.id)) : ""}
-      ${sel ? `${drow("Transfer fee", usd(x.transferFeeUsd, 2))}${x.payoutFeeUsd ? drow("Payout fee", usd(x.payoutFeeUsd, 2)) : ""}${drow("Conversion cost vs mid-market", usd(x.conversionCostUsd, 2))}
-        ${drow("Total fees included", usd(e.pricedUsd, 2))}${drow("Principal", usd(x.convertedPrincipalUsd, 2))}${drow("Rate", b.ccy === "USD" ? "No conversion" : `${Number(sel.fxRate).toFixed(4)} ${b.ccy} / USD`)}
+      ${detail("Deadline", d.due ? esc(dUtcY(d.due)) : "—", b ? `Invoice due ${esc(dUtcY(b.dueUtc))}` : "")}
+      ${sel ? `<div class="divider"></div>
+        ${drow("Exchange rate", b.ccy === "USD" ? "No conversion" : `${Number(sel.fxRate).toFixed(4)} ${b.ccy} / USD`)}${drow("Exchange-rate cost", usd(x.conversionCostUsd, 2))}
+        ${drow("Transfer fee", usd(x.transferFeeUsd, 2))}${x.payoutFeeUsd ? drow("Payout fee", usd(x.payoutFeeUsd, 2)) : ""}
+        ${drow("Total fees included", usd(e.pricedUsd, 2))}${drow("Amount converted", usd(x.convertedPrincipalUsd, 2))}
         <div class="divider"></div>${detail(budget ? "Estimated recipient amount" : "Supplier receives", money(sel.supplierGets))}
         ${detail(`${routeName(sel)} · ${arrival(sel)}`, `Estimated arrival ${dUtc(sel.arrivalUtc)}`)}
         <p class="note10">Quote captured ${esc(tUtc(sel.capturedAt))}; expires ${esc(utc(sel.expiresAt))} (<span data-exp="${esc(sel.expiresAt)}">${leftText(sel.expiresAt)}</span>). Next, the agents buy a paid quote and screen the supplier; you review that exact quote.</p>` : ""}
-      ${notice("No money moves when you complete this form or select a route.")}
-      <button class="btn-solid" id="go" ${busy ? "disabled" : ""}>${busy ? `<span class="spinner"></span>Checking quotes and supplier…` : `Continue to review ${IC("arrow-right-white", 15)}`}</button>
-      ${d.agentErr ? `<p class="note11 bad">Agents unavailable: ${esc(d.agentErr)}</p>` : ""}
       <p class="note10">No additional recipient deductions assumed. Actual quotes may differ. Format checks are not bank verification.</p>
     </aside>
-  </div>`);
+  </div></div>`);
   const set = (patch) => { DRAFT = { ...DRAFT, ...patch, formErr: null }; saveDraft(); pageCreate(P, new URLSearchParams()); loadDraftQuotes(P, new URLSearchParams()); };
-  $("#bill").onchange = () => { DRAFT = { billId: $("#bill").value, mode: DRAFT.mode, purpose: DRAFT.purpose, deliver: DRAFT.deliver }; set({}); };
+  $("#bill").onchange = () => { DRAFT = { billId: $("#bill").value, mode: DRAFT.mode, purpose: DRAFT.purpose, deliver: DRAFT.deliver, release: DRAFT.release, latestShipment: DRAFT.latestShipment, inspection: DRAFT.inspection }; set({}); };
   $$("[name=mode]").forEach((r) => r.onchange = () => set({ mode: r.value }));
   if (budget) $("#usd").onchange = () => set({ budgetUsd: Number($("#usd").value.replace(/,/g, "")) || undefined });
   $("#due").onchange = () => set({ due: $("#due").value ? new Date(`${$("#due").value}T20:00:00Z`).toISOString() : undefined });
   $("#purpose").onchange = () => { DRAFT.purpose = $("#purpose").value; saveDraft(); };
-  $("#deliver").onchange = () => { DRAFT.deliver = $("#deliver").checked; saveDraft(); };
+  $$("[name=release]").forEach((x2) => x2.onchange = () => { DRAFT.release = x2.value; DRAFT.deliver = x2.value === "delivery"; saveDraft(); pageCreate(P, new URLSearchParams()); });
+  $("#ship-by")?.addEventListener("change", () => { DRAFT.latestShipment = $("#ship-by").value; saveDraft(); });
+  $("#inspect")?.addEventListener("change", () => { DRAFT.inspection = $("#inspect").checked; saveDraft(); });
   $$("[data-pick]").forEach((x2) => x2.onclick = () => { DRAFT.selected = x2.dataset.pick; saveDraft(); pageCreate(P, new URLSearchParams()); });
   $("#mp-add").onclick = () => { CHAT_INPUT = "Add a supplier"; location.hash = "#/chat"; };
   $("#mp-form").onsubmit = (ev) => ev.preventDefault();
@@ -227,6 +232,10 @@ function pageCreate(P, q) {
     if (DRAFT.mode === "budget" && !(DRAFT.budgetUsd > 0)) errs.usd = "Enter an amount greater than 0.00 USD.";
     DRAFT.purpose = $("#purpose").value.trim(); if (!DRAFT.purpose) errs.purpose = "Purpose is required.";
     if (!DRAFT.due) errs.due = "Choose a requested delivery date.";
+    if (DRAFT.release === "documents") {
+      if (!DRAFT.latestShipment) errs.shipBy = "Enter the latest date the goods may be shipped.";
+      else if (DRAFT.due && DRAFT.latestShipment > DRAFT.due.slice(0, 10)) errs.shipBy = "The latest shipment date must be on or before the payment deadline.";
+    }
     if (Object.keys(errs).length) { DRAFT.formErr = errs; saveDraft(); return pageCreate(P, new URLSearchParams()); }
     if (!DRAFT.routes) return;
     // Same agent step as the compare page: paid quotes + supplier screen. Review always shows the agents' exact quote.
@@ -237,6 +246,28 @@ function pageCreate(P, q) {
   loadDraftQuotes(P, q);
 }
 
+// When the approved money is released: on approval, after receiving confirms delivery, or when the shipping documents
+// verify. The third replaces a letter of credit: same promise to the supplier, no bank examination fee or five-day wait.
+function releaseCard(d, b, sel) {
+  const mode = d.release ?? (d.deliver ? "delivery" : "now"), err = d.formErr ?? {};
+  const opt = (v, label) => `<label class="${mode === v ? "on" : ""}"><input type="radio" name="release" value="${v}" ${mode === v ? "checked" : ""} />${label}</label>`;
+  const debit = sel ? num(sel.youPay) : b ? num(b.amount) / Number(STATE.market?.mids?.[b.ccy]?.split(" ")[0] ?? 1) : 0;
+  const lcFee = Math.round(debit * (POLICY.lcFeePct ?? 1)) / 100;
+  const docsBody = mode !== "documents" ? "" : `<div class="pair"><div class="field3 ${err.shipBy ? "err" : ""}"><div class="flabel"><label for="ship-by">Latest shipment date</label><span class="h">Goods must be on board by</span></div>
+      <input id="ship-by" type="date" value="${esc(d.latestShipment ?? "")}" />${err.shipBy ? `<span class="e">${esc(err.shipBy)}</span>` : ""}</div>
+      <div class="field3"><div class="flabel"><label>Documents required</label><span class="h">Checked automatically</span></div>
+      <p class="docs-list">✓ Electronic bill of lading, with title passed to you<br>✓ Commercial invoice matching ${esc(b?.id ?? "the invoice")}<br>
+      <label class="check2"><input type="checkbox" id="inspect" ${d.inspection ? "checked" : ""} /> <span>Inspection certificate</span></label></p></div></div>
+    <div class="lc-compare"><div><span>Letter of credit at your bank</span><b>≈ ${usd(lcFee, 0)} fee</b><small>${esc(POLICY.lcFeePct ?? 1)}% of the payment, plus up to 5 banking days to examine documents</small></div>
+      <div><span>Document-checked escrow</span><b class="good">No examination fee</b><small>released minutes after the documents verify</small></div></div>`;
+  return `<section class="fsec"><div class="fsec-head"><h3>When the money is released</h3><span class="fsec-note">You approve now either way</span></div>
+    <div class="fbox"><div class="fbox-body"><div class="seg" role="radiogroup" aria-label="When the money is released">${opt("now", "As soon as it’s approved")}${opt("delivery", "After delivery is confirmed")}${opt("documents", "When shipping documents verify")}</div>
+      ${docsBody}</div>
+      <div class="fbox-foot"><p class="note11">${mode === "documents" ? "Replaces a letter of credit: the supplier knows the money is committed, and it is released the moment an electronic bill of lading shows the goods shipped on time and title passed to you."
+        : mode === "delivery" ? `Someone other than the preparer confirms the goods arrived (bill of lading or goods receipt). On our stablecoin rail the money is locked in escrow at approval and returned after ${esc(POLICY.escrowDeadlineDays)} days if not released.`
+        : "The payment is sent as soon as it is approved."}</p></div></div></section>`;
+}
+
 // ================================================================== REVIEW & APPROVE (Figma 58:3670)
 // One document for both moments: the preparer's review before submitting, and an approver's review of a request.
 function reviewDocument({ q, T, supplier, invoice, ref, purpose, due, routeLabel, routeWhy, editHref, changeHref, alts }) {
@@ -244,20 +275,20 @@ function reviewDocument({ q, T, supplier, invoice, ref, purpose, due, routeLabel
   return `<div class="doc-main g18">
     <div class="tx-head"><div><h2 class="serif28">${esc(q.recipient.name)}</h2><p class="note11">${esc([invoice, ref, COUNTRY[q.recipient.country] ?? q.recipient.country].filter(Boolean).join(" · "))}</p></div>
       ${editHref ? `<a class="text-btn" href="${editHref}">Edit details ↗</a>` : s ? `<a class="text-btn" href="#/suppliers/${encodeURIComponent(s.id)}">Supplier ↗</a>` : ""}</div>
-    <div class="flow2"><div><span class="eyebrow">TOTAL DEBIT · ALL FEES INCLUDED</span><b class="serif32">${money(q.sourceDebit)}</b><small>${esc(q.sourceAccount)}</small></div>
-      ${IC("arrow-right-24", 24)}<div><span class="eyebrow">${q.amountType === "SOURCE_FIXED" ? "ESTIMATED RECIPIENT AMOUNT" : "RECIPIENT AMOUNT · QUOTED"}</span><b class="serif32">${money(q.recipientNet)}</b><small>${esc(shortName(q.recipient.name))} · ${esc(q.recipient.ccy)} account ${esc(masked)}</small></div></div>
+    <div class="flow2"><div><span class="eyebrow">YOU PAY · FEES INCLUDED</span><b class="serif32">${money(q.sourceDebit)}</b><small>${esc(q.sourceAccount)}</small></div>
+      ${IC("arrow-right-24", 24)}<div><span class="eyebrow">${q.amountType === "SOURCE_FIXED" ? "THEY RECEIVE · ESTIMATE" : "THEY RECEIVE"}</span><b class="serif32">${money(q.recipientNet)}</b><small>${esc(shortName(q.recipient.name))} · ${esc(q.recipient.ccy)} account ${esc(masked)}</small></div></div>
     <div class="divider"></div>
     <div class="pair">${detail(`Receiving account · ${q.recipient.ccy}`, esc(masked))}${detail("Purpose", esc(purpose || "—"))}</div>
     <div class="pair">${detail("Requested delivery", esc(dUtcY(due)))}${detail("Estimated arrival", esc(tUtc(q.arrivalUtc)))}</div>
     <div class="divider"></div>
-    <div class="breakdown"><h3>Cost &amp; conversion</h3>
-      ${drow("Transfer fee", T.transferFee)}${T.payoutFee ? drow("Payout fee", T.payoutFee) : ""}${drow("Total fees · included in debit", feesLine(T))}
-      ${drow("Converted principal", T.principal)}${T.converts ? drow(`${q.simulation ? "Simulated" : "Quoted"} exchange rate`, `1 ${T.fundedCcy} = ${T.rate} ${T.dest}`) : ""}
-      ${drow(`Recipient amount${T.converts ? ` · ${T.principal.split(" ")[0]} × ${T.rate}` : ""}`, money(q.recipientNet))}
-      <p class="note10">The conversion cost is built into the rate; there is no separate conversion fee. No additional recipient deductions assumed${q.simulation ? " in this simulation" : ""}. Actual quotes may differ.</p></div>
+    <div class="breakdown"><h3>What this costs</h3>
+      ${drow("Transfer fee", T.transferFee)}${T.payoutFee ? drow("Payout fee", T.payoutFee) : ""}${drow("Total fees (already in what you pay)", feesLine(T))}
+      ${drow("Amount converted", T.principal)}${T.converts ? drow(`${q.simulation ? "Simulated" : "Quoted"} exchange rate`, `1 ${T.fundedCcy} = ${T.rate} ${T.dest}`) : ""}
+      ${drow(`They receive${T.converts ? ` · ${T.principal.split(" ")[0]} × ${T.rate}` : ""}`, money(q.recipientNet))}
+      <p class="note10">The provider’s margin is built into the exchange rate, so there is no separate conversion fee. We assume the supplier’s bank takes nothing extra${q.simulation ? " (simulated prices)" : ""}.</p></div>
     <div class="divider"></div>
     <div class="route2"><div class="route2-head"><span>${IC("landmark", 18)}<b>${esc(routeLabel)}</b></span>${changeHref ? `<a class="text-btn" href="${changeHref}">Change route</a>` : `<span class="note11">Route fixed at submission</span>`}</div>
-      <p class="t12">${esc(routeWhy)}</p><p class="note10">Delivery is estimated, not guaranteed. Verified historical reliability is unavailable.</p>
+      <p class="t12">${esc(routeWhy)}</p><p class="note10">Arrival time is an estimate, not a guarantee.</p>
       ${alts ?? ""}</div>
   </div>`;
 }
@@ -283,7 +314,7 @@ async function pageReview(P) {
   const d = DRAFT, b = billOf(d.billId), dec = chosenDecision();
   if (!b || !dec) { location.hash = DRAFT.billId ? "#/payments/compare" : "#/payments/new"; return; }
   setCrumbs("Payments", "Manual request", "Review");
-  docPage(P, `${docIntro("Review & approve", "One deliberate submission. Every detail in view.")}<div class="doc-cols"><div class="doc-main"><i class="skel-line"></i></div></div>`);
+  docPage(P, `${docIntro("Review & approve", "Check the details, then send it to your approvers. No money moves yet.")}<div class="doc-cols"><div class="doc-main"><i class="skel-line"></i></div></div>`);
   const [q, ...altQs] = await Promise.all([quoteTerms(dec.intentId), ...(dec.options ?? []).map((o) => (o.provider !== dec.chosen && o.intentId ? quoteTerms(o.intentId) : null))]);
   if (!location.hash.startsWith("#/payments/review")) return;
   if (!q) { docPage(P, `${docIntro("Review & approve", "One deliberate submission. Every detail in view.")}${notice("This quote is no longer available. Refresh the quotes before submitting.", "warn")}<a class="btn-line" href="#/payments/compare">Refresh quotes</a>`); return; }
@@ -299,8 +330,9 @@ async function pageReview(P) {
         ${quoteClock(q, "After expiry, submitting is blocked until a refreshed quote is reviewed.")}
         ${detail("Preparer", ME ? `${esc(ME.name)} · ${esc(ME.title)}` : "Sign in to submit")}
         ${detail("Approval needed", `${two ? `Two approvers (over ${usd(POLICY.dualApprovalOverUsd)})` : "One approver"} other than you${dec.decision === "review" ? " · call-back first" : ""}`)}
-        ${detail("Total debit to submit", `${money(q.sourceDebit)}, including ${esc(feesLine(T))} fees`)}
-        ${detail(q.amountType === "SOURCE_FIXED" ? "Estimated recipient amount" : "Recipient amount", money(q.recipientNet))}
+        ${detail("You pay", `${money(q.sourceDebit)}, including ${esc(feesLine(T))} fees`)}
+        ${detail(q.amountType === "SOURCE_FIXED" ? "They receive (estimate)" : "They receive", money(q.recipientNet))}
+        ${agentTrail(DRAFT.agent ?? {})}
         <div class="divider"></div>
         ${expired ? `<button class="btn-line" id="refresh">Refresh quotes</button>` : `${ack("ok", `I’ve checked the supplier, invoice, fees and delivery estimate. I understand this ${STATE.localSimulation ? "runs a local simulation" : "sends testnet money and a simulated payout"} only.`)}
           <button class="btn-solid" id="submit">Submit for approval ${IC("check-white-15", 15)}</button><div id="sub-err"></div>`}
@@ -316,7 +348,8 @@ async function pageReview(P) {
     if (!$("#ok").checked) { $("#sub-err").innerHTML = `<p class="note11 bad">Tick the confirmation first.</p>`; return; }
     $("#submit").disabled = true;
     try {
-      const out = await api("/requests", { decisions: [chosenDecision()], releaseOnDelivery: d.deliver ? [b.id] : [], confirmed: true, purpose: d.purpose, mode: d.mode });
+      const docs = d.release === "documents" ? { [b.id]: { latestShipmentUtc: `${d.latestShipment}T23:59:59Z`, documents: d.inspection ? ["inspection_certificate"] : [] } } : {};
+      const out = await api("/requests", { decisions: [chosenDecision()], releaseOnDelivery: d.release !== "documents" && d.deliver ? [b.id] : [], documentary: docs, confirmed: true, purpose: d.purpose, mode: d.mode });
       const one = out.requests?.[0]; if (!one?.requestId) throw new Error(one?.skipped ?? out.error ?? "not submitted");
       DRAFT = {}; saveDraft(); location.hash = `#/payments/${one.requestId}`;
     } catch (err) { $("#sub-err").innerHTML = `<p class="note11 bad">${esc(err.message)}</p>`; $("#submit").disabled = false; }
@@ -331,11 +364,11 @@ async function pageApprove(P, r, q) {
   setCrumbs("Payments", r.id, "Review");
   const sub = q ? reviewDocument({ q, T, invoice: r.payable.startsWith("chat_") ? null : r.payable, ref: r.id, purpose: r.purpose, due: r.timing?.deadlineUtc,
       routeLabel: q.legs[0]?.label ?? RAIL[r.provider] ?? r.provider, routeWhy: r.agentReasons?.[0] ?? "Chosen by the preparer", alts: `<details class="chat-details"><summary>Why the agent chose this route</summary><ul class="reasons">${(r.agentReasons ?? []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details>
-        ${r.allowReroute ? `<p class="note10">Reroute allowed: another quoted route to the same supplier may be used if it meets the deadline within the approved debit cap.</p>` : ""}` })
+        ${r.allowReroute ? `<p class="note10">Backup route allowed: if this route stops working, another quoted route to the same supplier can be used, as long as it arrives on time and costs no more than you approved.</p>` : ""}` })
     : `<div class="doc-main g18"><h2 class="serif28">${esc(r.supplier)}</h2>${notice(`The quote terms for ${esc(r.id)} are no longer available here. Approving still uses the stored request: ${usd(r.debitUsd, 2)} for ${esc(money(r.recipientGets))}.`, "warn")}</div>`;
   const ready = A.approve?.allowed, title = ready ? "Ready for your approval" : s === "NEEDS_CALLBACK" ? "Call-back needed first" : !ME ? "Sign in to review" : "Waiting for approval";
   const why = !ME ? "Sign in as an approver to act on this payment." : s === "NEEDS_CALLBACK" ? (A.callback?.allowed ? null : A.callback?.why) : ready ? null : A.approve?.why;
-  docPage(P, `${docIntro("Review & approve", "One deliberate approval. Every detail in view.", badge(statusText(s), "warn"))}
+  docPage(P, `${docIntro("Review & approve", "Check the details. Your approval is what lets this payment go.", badge(statusText(s), "warn"))}
     <div class="doc-cols">${sub}
       <aside class="doc-aside w312 g20" aria-label="Approval">
         <span class="eyebrow">APPROVAL · ${esc(utc(new Date().toISOString()))}</span>
@@ -344,8 +377,8 @@ async function pageApprove(P, r, q) {
         ${detail("Approver", ME ? `${esc(ME.name)} · ${esc(ME.title)}` : "Not signed in")}
         ${detail("Approvals", `${r.approvals.length} of ${r.approvalsRequired}`, r.approvals.map((a) => `${esc(nameOf(a.by))} · ${esc(tUtc(a.at))}`).join("<br>"))}
         ${detail("Prepared by", `${esc(nameOf(r.preparedBy))}`, esc(tUtc(r.preparedAt)))}
-        ${detail("Total debit to approve", q ? `${money(q.sourceDebit)}, including ${esc(feesLine(T))} fees` : usd(r.debitUsd, 2))}
-        ${detail(q?.amountType === "SOURCE_FIXED" ? "Estimated recipient amount" : "Recipient amount", money(q?.recipientNet ?? r.recipientGets))}
+        ${detail("You pay", q ? `${money(q.sourceDebit)}, including ${esc(feesLine(T))} fees` : usd(r.debitUsd, 2))}
+        ${detail(q?.amountType === "SOURCE_FIXED" ? "They receive (estimate)" : "They receive", money(q?.recipientNet ?? r.recipientGets))}
         <div class="divider"></div>
         ${s === "NEEDS_CALLBACK" ? notice(esc(cbNote(r.detailsNote)), "warn") : ""}
         ${A.callback?.allowed ? `<button class="btn-line" data-act="callback">Record call-back</button>` : ""}
@@ -353,11 +386,12 @@ async function pageApprove(P, r, q) {
           <button class="btn-solid" id="approve" ${ready ? "" : "disabled"}>Approve payment ${IC("check-white-15", 15)}</button>` : ""}
         ${why ? `<p class="note11 bad">${esc(why)}</p>` : ""}${!ME ? `<button class="btn-line" id="ap-signin">Sign in</button>` : ""}
         <div id="act-form"></div>
+        ${complianceBlock(r)}
         <p class="note10">${s === "NEEDS_CALLBACK" ? "Approval opens once someone other than the preparer records the call-back." : "Only this action approves."} ${r.approvalsRequired > 1 ? "Two different approvers are required before release. " : ""}Reading this review does not approve or send a payment.</p>
         ${A.reject?.allowed ? `<button class="text-btn danger" data-act="reject">Reject payment</button>` : ""}
         <div class="divider"></div>
         <a class="text-btn" href="#/payments">← All payments</a>
-        <p class="note10">ISO 20022 instruction: <a href="/ui/requests/${esc(r.id)}/iso20022" download>pain.001 ↓</a></p>
+        <p class="note10">Standard bank payment file (ISO 20022): <a href="/ui/requests/${esc(r.id)}/iso20022" download>download ↓</a></p>
       </aside>
     </div>`);
   $$("[data-act]").forEach((x) => x.onclick = () => act(r, x.dataset.act, P));
@@ -368,12 +402,176 @@ async function pageApprove(P, r, q) {
   });
 }
 
+// Shipping-document check (in place of a letter of credit): what is required, each presentation and its checks, and the
+// letter-of-credit comparison from the company's own LC fee setting.
+function documentsBlock(r) {
+  const D = r.documentary; if (!D) return "";
+  const t = D.terms, last = D.presentations.at(-1), lcFee = Math.round(r.debitUsd * (POLICY.lcFeePct ?? 1)) / 100;
+  const label = STATE.documents?.labels ?? {};
+  return `<div class="divider"></div><div class="breakdown"><h3>Shipping documents (instead of a letter of credit)</h3>
+    <p class="t12">Ship by ${esc(dUtcY(t.latestShipmentUtc))} · present within ${t.presentationDays} days of shipment · ${t.documents.map((x) => esc(label[x] ?? x)).join(", ")}</p>
+    ${last ? `<ul class="doc-checks">${last.checks.map((c) => `<li class="${c.ok ? "ok" : "bad"}"><b>${c.ok ? "✓" : "✗"} ${esc(c.label)}</b><span>${esc(c.detail)}</span></li>`).join("")}</ul>
+      <p class="note10">${last.ok ? "All checks passed; the release condition is met." : "Not released: fix the failed checks and present again."} ${last.simulated ? "eBL platform simulated in this demo." : ""} ${D.presentations.length} presentation${D.presentations.length === 1 ? "" : "s"} recorded.</p>`
+      : `<p class="note11">No documents presented yet.</p>`}
+    <div class="lc-compare"><div><span>As a letter of credit</span><b>≈ ${usd(lcFee, 0)} fee</b><small>${esc(POLICY.lcFeePct ?? 1)}% at your bank, plus up to 5 banking days of document checks</small></div>
+      <div><span>Document-checked escrow</span><b class="good">No examination fee</b><small>${r.delivery ? `released ${esc(tUtc(r.delivery.at))}` : "released the moment the documents verify"}</small></div></div></div>`;
+}
+// The compliance rules this payment passed when it was prepared (they run again just before money moves)
+function complianceBlock(r) {
+  const C2 = r.compliance; if (!C2?.checks?.length) return "";
+  const shown = C2.checks.filter((c) => c.status !== "n/a");
+  return `<div class="divider"></div><div class="breakdown"><h3>Compliance checks</h3>
+    <ul class="doc-checks">${shown.map((c) => `<li class="${c.status === "pass" ? "ok" : c.status === "fail" ? "bad" : "warn"}"><b>${c.status === "pass" ? "✓" : c.status === "fail" ? "✗" : "!"} ${esc(c.label)}</b><span>${esc(c.detail)}</span></li>`).join("")}</ul>
+    ${C2.travelRule ? `<p class="note10">Travel Rule record attached (${esc(C2.travelRule.standard)}): ${esc(C2.travelRule.originator.legalPerson)} → ${esc(C2.travelRule.beneficiary.legalPerson)}, ${esc(C2.travelRule.amount)}.</p>` : ""}
+    <p class="note10">Checked ${esc(tUtc(C2.checkedAt))}; checked again just before the money moves.</p></div>`;
+}
+
+// ================================================================== IMPACT (payment pages)
+// What this payment changed against the company's bank, and the running total across payments. Charts: inline SVG,
+// validated palette slots 1-2 (blue = Route402, orange = your bank), thin marks with 4px rounded data ends, direct labels,
+// hover tooltips (each value is also printed, so the tooltip never gates information).
+const VIZ = { ours: "var(--viz-1)", bank: "var(--viz-2)" };
+const svgEsc = (v) => esc(v);
+function vizTip() {
+  let t = document.getElementById("viz-tip");
+  if (!t) { t = document.createElement("div"); t.id = "viz-tip"; t.setAttribute("role", "status"); document.body.appendChild(t); }
+  return t;
+}
+document.addEventListener("pointermove", (e) => {
+  const m = e.target.closest?.("[data-tip]"), t = vizTip();
+  if (!m) { t.style.opacity = "0"; return; }
+  t.textContent = ""; const [v, l] = m.dataset.tip.split("|");
+  const b = document.createElement("b"); b.textContent = v; t.appendChild(b);
+  if (l) { const s = document.createElement("span"); s.textContent = l; t.appendChild(s); }
+  t.style.opacity = "1"; t.style.left = `${Math.min(innerWidth - 220, e.clientX + 14)}px`; t.style.top = `${e.clientY + 14}px`;
+});
+// Two horizontal bars on one baseline: Route402 vs your bank wire. HTML bars, so text stays at its normal size at any width.
+function barPair(title, rows, unitFmt) {
+  const max = Math.max(...rows.map((r) => r.value), 1e-9);
+  return `<figure class="viz"><figcaption>${esc(title)}</figcaption><div class="hbars" role="img" aria-label="${esc(`${title}: ${rows.map((r) => `${r.label} ${unitFmt(r.value)}`).join(", ")}`)}">
+    ${rows.map((r) => `<div class="hbar" data-tip="${esc(unitFmt(r.value))}|${esc(r.label)}"><span class="hbar-cat">${esc(r.label)}</span>
+      <span class="hbar-track"><i style="width:${Math.max(1.5, (r.value / max) * 100).toFixed(1)}%;background:${r.color}"></i></span><b>${esc(unitFmt(r.value))}</b></div>`).join("")}</div></figure>`;
+}
+// A line that grows over time, drawn to fit any tile: shapes are a stretched SVG, points and labels are HTML so text keeps
+// its size. Points: { t, v, kind: "realized" | "projected", label }. Two states of one quantity share one hue:
+// dark teal = realized, light teal = projected (validated one-hue ordinal pair). `marks` are labelled vertical lines.
+function growthChart(pts, { marks = [], endLabel, aria, legend = true } = {}) {
+  if (pts.length < 2) return `<p class="note11">This fills in as payments are made.</p>`;
+  const t0 = pts[0].t, t1 = Math.max(pts.at(-1).t, t0 + 3600e3), maxV = Math.max(...pts.map((p) => p.v), 1), top = maxV * 1.08;
+  const X = (t) => ((t - t0) / (t1 - t0)) * 100, Y = (v) => 100 - (v / top) * 100;
+  const seq = (a) => a.map((p) => `${X(p.t).toFixed(2)},${Y(p.v).toFixed(2)}`).join(" ");
+  const cut = pts.findLastIndex((p) => p.kind === "realized"), real = pts.slice(0, cut + 1), proj = cut >= 0 ? pts.slice(cut) : pts;
+  const area = (a) => (a.length > 1 ? `<polygon points="${X(a[0].t)},100 ${seq(a)} ${X(a.at(-1).t)},100" class="g-area ${a === real ? "real" : "proj"}"/>` : "");
+  const line = (a, k) => (a.length > 1 ? `<polyline points="${seq(a)}" class="g-line ${k}"/>` : "");
+  const short = (v) => (v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : v.toFixed(0));
+  const hasProj = proj.length > 1 && cut < pts.length - 1;
+  return `<div class="growth" role="img" aria-label="${esc(aria ?? "")}">
+    <span class="growth-y top">$${short(maxV)}</span><span class="growth-y bottom">$0</span>
+    <div class="growth-plot">
+      <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">${hasProj ? area(proj) : ""}${area(real)}${hasProj ? line(proj, "proj") : ""}${line(real, "real")}</svg>
+      ${marks.map((m) => `<i class="growth-today" style="left:${X(m.t)}%"><b>${esc(m.label)}</b></i>`).join("")}
+      ${pts.map((p, i) => `<span class="g-pt ${p.kind}${i === pts.length - 1 ? " end" : ""}" style="left:${X(p.t)}%;top:${Y(p.v)}%" data-tip="$${fmt(p.v, 0)}|${esc(p.label)}"></span>`).join("")}
+      <span class="growth-end" style="top:${Y(pts.at(-1).v)}%">${esc(endLabel ?? `$${short(pts.at(-1).v)}`)}</span>
+    </div>
+    <span class="growth-x">${esc(day(new Date(t0).toISOString()))}</span><span class="growth-x right">${esc(day(new Date(t1).toISOString()))}</span>
+  </div>${legend && hasProj ? `<p class="growth-legend"><span><i class="real"></i>Paid</span><span><i class="proj"></i>Open bills, projected</span></p>` : ""}`;
+}
+
+// A grid of six tiles of different shapes forming one flat-edged rectangle. Drag a tile onto another (or focus it and press
+// [ or ]) to swap places; the slots keep their shapes so the edges stay flat. Each grid remembers its own layout.
+const BENTO_SLOTS = ["a", "b", "c", "d", "e", "f"];
+function bento(key, title, sub, tiles, order) {
+  try { const o = JSON.parse(localStorage.getItem(`r402-bento-${key}`) ?? "null"); if (Array.isArray(o) && o.length === 6 && o.every((x) => x in tiles)) order = o; } catch {}
+  return `<section class="bento-wrap" aria-label="${esc(title)}">
+    <div class="bento-head"><h3 class="serif26">${esc(title)}</h3><span class="note11">${esc(sub)} · drag tiles to rearrange</span></div>
+    <div class="bento" data-bento="${key}">${BENTO_SLOTS.map((slot, i) => `<div class="b-tile" draggable="true" tabindex="0" aria-label="Tile; drag, or press [ or ] to move" data-tile="${order[i]}" style="grid-area:${slot}">${tiles[order[i]]}</div>`).join("")}</div>
+  </section>`;
+}
+function swapTiles(from, to) {
+  const grid = from.closest(".bento"); if (!grid || grid !== to.closest(".bento")) return;
+  const a = from.style.gridArea, b = to.style.gridArea; from.style.gridArea = b; to.style.gridArea = a;
+  const order = BENTO_SLOTS.map((s) => [...grid.querySelectorAll(".b-tile")].find((x) => x.style.gridArea.split(" ")[0] === s)?.dataset.tile);
+  try { localStorage.setItem(`r402-bento-${grid.dataset.bento}`, JSON.stringify(order)); } catch {}
+}
+document.addEventListener("dragstart", (e) => { const t = e.target.closest?.(".b-tile"); if (t) { e.dataTransfer.setData("text/plain", t.dataset.tile); t.classList.add("dragging"); } });
+document.addEventListener("dragend", (e) => e.target.closest?.(".b-tile")?.classList.remove("dragging"));
+document.addEventListener("dragover", (e) => { if (e.target.closest?.(".b-tile")) e.preventDefault(); });
+document.addEventListener("drop", (e) => {
+  const to = e.target.closest?.(".b-tile"); if (!to) return; e.preventDefault();
+  const from = to.closest(".bento").querySelector(`.b-tile[data-tile="${e.dataTransfer.getData("text/plain")}"]`); if (from && from !== to) swapTiles(from, to);
+});
+document.addEventListener("keydown", (e) => {
+  const t = e.target.closest?.(".b-tile"); if (!t || !["[", "]"].includes(e.key)) return;
+  const tiles = [...t.closest(".bento").querySelectorAll(".b-tile")], slot = (x) => BENTO_SLOTS.indexOf(x.style.gridArea.split(" ")[0]);
+  const target = tiles.find((x) => slot(x) === slot(t) + (e.key === "]" ? 1 : -1)); if (target) { swapTiles(t, target); t.focus(); }
+});
+const howWeDidIt = (checks) => `<span class="eyebrow">How we did it</span>
+  <ul class="b-list"><li>Every route priced against the live market rate, fees and time in transit included</li>
+    <li>${checks ? `${checks} compliance checks` : "Compliance checks"} before quoting and again before release</li>
+    <li>Independent quotes and a supplier screen bought by our agents</li></ul>
+  <p class="note10">The routing models themselves stay with Route402.</p>`;
+const daysLabel = (d) => (d >= 1.5 ? `${d.toFixed(1)} days` : `${Math.max(1, Math.round(d * 24))} hours`);
+
+// One payment's impact: only this payment. Its advantage over your bank wire builds in two parts: the price difference at
+// send, then the value of the cash for each day it is no longer in transit (your cost of cash), until the wire would land.
+function impactPanel(r, q, impact) {
+  const row = impact?.payments?.find((x) => x.id === r.id), an = q?.analysis;
+  if (!row) return "";
+  const done = row.status === "COMPLETED", saved = Math.max(0, row.savedUsd), sooner = row.bankDays != null && row.ourDays != null ? row.bankDays - row.ourDays : 0;
+  const routes = an?.searched?.routes ?? row.routesCompared ?? 0, checks = (r.compliance?.checks ?? []).filter((c) => c.status === "pass").length;
+  const coc = STATE.costOfCashPct ?? 6, perDay = (row.debitUsd * coc) / 100 / 365, timeValue = sooner > 0.04 ? perDay * sooner : 0, total = saved + timeValue;
+  const sent = Date.parse(an?.plannedAtUtc ?? r.preparedAt), ours = sent + (row.ourDays ?? 0) * 86400e3, bank = sent + (row.bankDays ?? 0) * 86400e3;
+  const chart = total > 0.5
+    ? growthChart([{ t: sent, v: saved, kind: "realized", label: "Price difference at send" }, { t: ours, v: saved, kind: "realized", label: "Arrived by Route402" },
+        { t: bank, v: total, kind: "realized", label: `Bank wire would land · +$${fmt(timeValue, 0)} cash value` }],
+        { marks: sooner > 0.04 ? [{ t: ours, label: "Arrived" }, { t: bank, label: "Wire would land" }] : [], aria: `This payment's advantage grows from $${fmt(saved, 0)} to $${fmt(total, 0)}`, legend: false })
+      + `<p class="b-sub">Price difference at send, plus ${esc(coc)}% cost of cash for each day it is not in transit</p>`
+    : `${barPair("", [{ label: "This payment", value: row.bpsOurs ?? 0, color: "var(--g-real)" }, { label: "Bank wire", value: row.bpsBank ?? 0, color: "var(--g-proj)" }], (v) => `${(v / 100).toFixed(2)}%`)}
+       <p class="b-sub">Cost above the market rate. Your bank wire matched or beat the ${routes > 1 ? `${routes - 1} other route${routes > 2 ? "s" : ""}` : "alternatives"} for this payment.</p>`;
+  const tiles = {
+    saved: `<span class="eyebrow">${done ? "This payment" : "This payment · expected"}</span>
+      ${saved > 0.5 ? `<div class="b-num">$${fmt(saved, 0)} saved</div><p class="b-sub">against your bank wire for the same payment, after our fee</p>`
+        : `<div class="b-num">Best price confirmed</div><p class="b-sub">Your bank wire was the cheapest route for this payment, so it went that way.</p>`}
+      <dl class="b-facts"><div><dt>You paid</dt><dd>${esc(money(`${row.debitUsd} USD`))}</dd></div><div><dt>Total advantage</dt><dd>${total > 0.5 ? `$${fmt(total, 0)}` : "—"}</dd></div></dl>`,
+    speed: `<span class="eyebrow">Speed</span><div class="b-num">${sooner > 0.04 ? `${daysLabel(sooner)} sooner` : "Same as a wire"}</div>
+      <p class="b-sub">${row.ourDays != null ? `${row.ourDays < 0.05 ? "minutes" : daysLabel(row.ourDays)} here vs ${daysLabel(row.bankDays)} by bank wire` : ""}</p>`,
+    cost: `<span class="eyebrow">Cost above market</span><div class="b-num">${row.bpsOurs != null ? `${(row.bpsOurs / 100).toFixed(2)}%` : "—"}</div>
+      <p class="b-sub">${row.bpsBank != null ? `vs ${(row.bpsBank / 100).toFixed(2)}% through your bank` : ""}</p>`,
+    routes: `<span class="eyebrow">Routes compared</span><div class="b-num">${routes}</div><p class="b-sub">for this payment</p>`,
+    chart: `<span class="eyebrow">${total > 0.5 ? "How this payment's advantage builds" : "Price check"}</span>${chart}`,
+    process: howWeDidIt(checks),
+  };
+  return bento("payment", done ? "Impact of this payment" : "Expected impact", "This payment only, measured against your bank wire", tiles, ["saved", "speed", "cost", "routes", "chart", "process"]);
+}
+
+// All payments (Payments page): what has been saved on paid payments, and where it grows as the open bills are paid
+function portfolioPanel(g, impact) {
+  if (!g) return "";
+  const T = g.totals, paid = impact?.payments ?? [], grand = T.realizedUsd + T.projectedUsd, pts = [];
+  let total = 0;
+  for (const x of g.realized) { total += x.savedUsd; pts.push({ t: Date.parse(x.at), v: total, kind: "realized", label: `${x.supplier} · paid, +$${fmt(x.savedUsd, 0)}` }); }
+  const now = Math.max(Date.now(), pts.at(-1)?.t ?? 0); pts.push({ t: now, v: total, kind: "realized", label: "Today" });
+  for (const x of g.projected) { total += x.savedUsd; pts.push({ t: Math.max(now, Date.parse(x.payOnUtc)), v: total, kind: "projected", label: `${x.supplier} · open bill, +$${fmt(x.savedUsd, 0)} by ${day(x.payOnUtc)}` }); }
+  const tiles = {
+    growth: `<span class="eyebrow">Savings growth</span><div class="b-num">$${fmt(T.realizedUsd, 0)} <em>→</em> $${fmt(grand, 0)}</div>
+      <p class="b-sub">Saved on paid payments so far, and where it grows as your open bills are paid on their best routes${g.projected.length ? ` (by ${esc(day(g.projected.at(-1).payOnUtc))})` : ""}.</p>
+      <dl class="b-facts"><div><dt>Paid payments</dt><dd>${paid.filter((p) => p.status === "COMPLETED").length}</dd></div><div><dt>Open bills with a route</dt><dd>${g.projected.length} of ${g.open?.bills ?? g.projected.length}</dd></div></dl>`,
+    paid: `<span class="eyebrow">Paid so far</span><div class="b-num">$${fmt(T.realizedUsd, 0)}</div><p class="b-sub">saved across ${plural(g.realized.length, "completed payment")}</p>`,
+    projected: `<span class="eyebrow">Open bills, projected</span><div class="b-num">+$${fmt(T.projectedUsd, 0)}</div>
+      <p class="b-sub">on ${g.projected.length} of ${g.open?.bills ?? g.projected.length} open bills, after our fee${g.open?.blocked || g.open?.noRoute ? ` (${[g.open.blocked && `${g.open.blocked} need bank details fixed`, g.open.noRoute && `${g.open.noRoute} with no route by the deadline yet`].filter(Boolean).join(", ")})` : ""}</p>`,
+    speed: `<span class="eyebrow">Speed</span><div class="b-num">${T.avgDaysFaster > 0.04 ? daysLabel(T.avgDaysFaster) : "—"}</div><p class="b-sub">${T.fasterBills} of ${g.projected.length} open bills arrive sooner than a wire</p>`,
+    chart: `<span class="eyebrow">Cumulative savings vs your bank</span>${growthChart(pts, { marks: [{ t: now, label: "Today" }], aria: `Savings ${fmt(T.realizedUsd, 0)} USD paid so far, growing to ${fmt(grand, 0)} USD as open bills are paid` })}`,
+    process: howWeDidIt(0),
+  };
+  return bento("portfolio", "Savings across your payments", "Paid payments plus open bills, against your bank wire", tiles, ["growth", "paid", "speed", "projected", "chart", "process"]);
+}
+
 // ================================================================== PAYMENT TRACKING (Figma 58:3832)
 async function pageTracking(P, id) {
   const r = REQS.find((x) => x.id === id);
   if (!r) { setCrumbs("Payments", id); docPage(P, `${docIntro("Payment", "")}${notice(`No payment request ${esc(id)} in this workspace.`, "warn")}<a class="text-btn" href="#/payments">← All payments</a>`); return; }
-  const [t, q, audit] = await Promise.all([r.transferId ? api(`/transfers/${encodeURIComponent(r.transferId)}`).catch(() => null) : null,
-    !r.transferId ? quoteTerms(r.intentId) : null, api("/audit").catch(() => ({ entries: [] }))]);
+  const [t, q, audit, impact] = await Promise.all([r.transferId ? api(`/transfers/${encodeURIComponent(r.transferId)}`).catch(() => null) : null,
+    quoteTerms(r.intentId), api("/audit").catch(() => ({ entries: [] })), api("/impact").catch(() => null)]);
   if (location.hash !== `#/payments/${id}`) return;
   if (["NEEDS_CALLBACK", "AWAITING_APPROVAL"].includes(r.status)) return pageApprove(P, r, q);
   setCrumbs("Payments", r.id);
@@ -397,7 +595,7 @@ async function pageTracking(P, id) {
   r.approvals.forEach((a, i) => push(r.approvalsRequired > 1 ? `Approved ${i + 1} of ${r.approvalsRequired}` : "Approved", a.at, `${nameOf(a.by)} · ${USERS.find((u) => u.id === a.by)?.title ?? ""}`, "done"));
   if (r.rejected) push("Rejected", r.rejected.at, `${nameOf(r.rejected.by)} · ${r.rejected.why}`, "bad");
   if (r.escrow) push("Funds locked in escrow", null, r.escrow.state === "FAILED" ? r.escrow.error : `${r.escrow.amountUsdc} test USDC · ${r.escrow.chain}`, ["LOCKED", "RELEASED", "REFUNDED"].includes(r.escrow.state) ? "done" : r.escrow.state === "FAILED" ? "bad" : "now");
-  if (r.releaseOnDelivery) push("Delivery confirmed", r.delivery?.at, r.delivery ? `${r.delivery.documentRef} · ${nameOf(r.delivery.by)}` : "Bill of lading or goods receipt", r.delivery ? "done" : s === "AWAITING_DELIVERY" ? "now" : "todo");
+  if (r.releaseOnDelivery) push(r.documentary ? "Shipping documents verified" : "Delivery confirmed", r.delivery?.at, r.delivery ? `${r.delivery.documentRef} · ${nameOf(r.delivery.by)}` : r.documentary ? "Electronic bill of lading and commercial invoice" : "Bill of lading or goods receipt", r.delivery ? "done" : s === "AWAITING_DELIVERY" ? "now" : "todo");
   if (r.escrow?.state === "RELEASED") push("Escrow released to the supplier", null, "On-chain release", "done");
   if (r.escrow?.state === "REFUNDED") push("Escrow refunded to the company", null, "On-chain refund", "done");
   if (!["REJECTED", "REFUNDED"].includes(s)) {
@@ -413,25 +611,27 @@ async function pageTracking(P, id) {
     <div class="ev2-d"><div class="ev2-h"><b>${esc(e.title)}</b><span>${esc(e.at ? tUtc(e.at) : e.right ?? "")}</span></div><p>${esc(e.sub)}</p></div></div>`).join("");
   const mine = (audit.entries ?? []).filter((x) => x.ref === r.id || (r.transferId && x.ref === r.transferId)), done = ev.filter((e) => e.state === "done").length;
   const banner = { READY: ["Approved and releasing. Not yet settled; recipient credit and reconciliation remain pending.", ""], EXECUTING: [`Submitted for ${STATE.localSimulation ? "simulated" : "testnet"} processing, not yet settled. Recipient credit and reconciliation remain pending.`, ""],
-    AWAITING_DELIVERY: ["Approved. Release waits for receiving to confirm delivery.", ""], COMPLETED: [`Completed: recipient credit${completedAt ? ` and reconciliation recorded ${tUtc(completedAt)}` : " recorded"}.`, ""],
+    AWAITING_DELIVERY: [r.documentary ? "Approved. The money is released when the shipping documents verify (instead of a letter of credit)." : "Approved. Release waits for receiving to confirm delivery.", ""], COMPLETED: [`Completed: recipient credit${completedAt ? ` and reconciliation recorded ${tUtc(completedAt)}` : " recorded"}.`, ""],
     PAUSED: [`Paused by your safety policy. ${r.note ?? ""}`, "warn"], FAILED: [`Check ${r.id}${r.transferId ? ` / ${r.transferId}` : ""} before any retry. ${r.note ?? ""} Do not submit again: a new request for this bill is blocked until this one is resolved.`, "warn"],
     REJECTED: [`Rejected by ${nameOf(r.rejected?.by)}: ${r.rejected?.why ?? ""}`, "warn"], REFUNDED: [r.note ?? "Refunded.", ""] }[s] ?? [r.note ?? statusText(s), ""];
-  const acts = [["confirmDelivery", "Confirm delivery"], ["recheck", "Re-check and release"], ["refund", "Refund escrow"], ["reject", "Reject payment"]].filter(([k]) => A[k]?.allowed);
+  const acts = [["presentDocuments", "Present shipping documents"], ["confirmDelivery", "Confirm delivery"], ["recheck", "Re-check and release"], ["refund", "Refund escrow"], ["reject", "Reject payment"]].filter(([k]) => A[k]?.allowed);
   docPage(P, `${docIntro(`Payment to ${shortName(r.supplier)}`, `${r.id} · ${refLabel(r)} · ${statusText(s)} snapshot`, `<button class="btn-line" id="refresh">Refresh status ${IC("refresh-cw", 15)}</button>`)}
     ${notice(esc(banner[0]), banner[1])}
+    ${impactPanel(r, q, impact)}
     <div class="doc-cols">
       <section class="doc-main g20" aria-label="Payment progress">
         <div class="status-head"><span class="eyebrow">${esc((RAIL[r.provider] ?? r.provider).toUpperCase())}</span>${badge(statusText(s), reqBadgeKind(s))}</div>
-        <div class="flow2"><div><span class="eyebrow">TOTAL DEBIT · ALL FEES INCLUDED</span><b class="serif32">${money(debit)}</b><small>${esc(srcAcct)}</small></div>
-          ${IC("arrow-right-24", 24)}<div><span class="eyebrow">${credited ? "RECIPIENT CREDITED" : "ESTIMATED RECIPIENT AMOUNT"}</span><b class="serif32">${money(net)}</b><small>${esc(shortName(r.supplier))} · ${esc(r.ccy)} account ${esc(masked)}</small></div></div>
+        <div class="flow2"><div><span class="eyebrow">YOU PAY · FEES INCLUDED</span><b class="serif32">${money(debit)}</b><small>${esc(srcAcct)}</small></div>
+          ${IC("arrow-right-24", 24)}<div><span class="eyebrow">${credited ? "SUPPLIER RECEIVED" : "SUPPLIER RECEIVES · ESTIMATE"}</span><b class="serif32">${money(net)}</b><small>${esc(shortName(r.supplier))} · ${esc(r.ccy)} account ${esc(masked)}</small></div></div>
         <div class="divider"></div>
-        <div class="tl2-head"><h3>Payment timeline</h3><span>✓ Recorded event   ○ Pending / forecast</span></div>
+        <div class="tl2-head"><h3>Payment timeline</h3><span>✓ Happened   ○ Still to come</span></div>
         <div class="tl2">${timeline}</div>
         <div class="divider"></div>
         <div class="breakdown"><h3>Transfer details</h3>
           <div class="pair">${detail("Requested delivery", esc(dUtcY(r.timing?.deadlineUtc)))}${detail(credited ? "Recipient credited" : "Estimated arrival", esc(credited ? tUtc(credited) : dUtcY(arrival)))}</div>
-          <div class="pair">${detail("Fees included", esc(fees ?? "—"))}${detail("Conversion at approval", esc(conv ?? "—"))}</div>
-          <p class="note10">${t?.approval ? `Approved ${esc(tUtc(t.approval.at))} under signed terms ${esc(t.termsHash.slice(0, 12))}…` : `Prepared ${esc(tUtc(r.preparedAt))}`}${t?.deadlineStatus ? ` · deadline ${esc(String(t.deadlineStatus).toLowerCase())}` : ""}. No additional recipient deductions assumed.</p></div>
+          <div class="pair">${detail("Fees (already included)", esc(fees ?? "—"))}${detail("Exchange at approval", esc(conv ?? "—"))}</div>
+          <p class="note10">${t?.approval ? `Approved ${esc(tUtc(t.approval.at))}; the amounts are locked to what was approved (terms ${esc(t.termsHash.slice(0, 8))})` : `Prepared ${esc(tUtc(r.preparedAt))}`}${t?.deadlineStatus ? ` · deadline ${esc(String(t.deadlineStatus).toLowerCase())}` : ""}. We assume the supplier’s bank takes nothing extra.</p></div>
+        ${documentsBlock(r)}${complianceBlock(r)}
       </section>
       <aside class="doc-aside w310" aria-label="Recipient and audit">
         <span class="eyebrow">RECIPIENT</span><h2 class="serif26">${esc(r.supplier)}</h2>
@@ -441,7 +641,7 @@ async function pageTracking(P, id) {
         ${detail("Source", esc(srcAcct))}${detail("Purpose", esc(r.purpose ?? "—"))}
         <div class="divider"></div>
         <span class="eyebrow">AUDIT SNAPSHOT</span><p class="t11">${esc(mine.length ? tUtc(mine[0].at) : tUtc(new Date().toISOString()))}</p>
-        <p class="note11">${mine.length} audit entr${mine.length === 1 ? "y" : "ies"} · ${done} recorded timeline event${done === 1 ? "" : "s"}${completedAt ? "" : ". No settlement or reconciliation event yet"}. Hash chain ${audit.verify?.ok ? "verified" : "not verified"}.</p>
+        <p class="note11">${mine.length} audit entr${mine.length === 1 ? "y" : "ies"} · ${done} recorded timeline event${done === 1 ? "" : "s"}${completedAt ? "" : ". No settlement or reconciliation event yet"}. ${audit.verify?.ok ? "Tamper check passed." : "Tamper check failed: review the activity log."}</p>
         <button class="text-btn" id="export-audit">Export audit trail ↓</button>
         ${acts.length ? `<div class="divider"></div><span class="eyebrow">ACTIONS</span><div class="acts2">${acts.map(([k, l]) => `<button class="${k === "reject" ? "btn-line danger" : "btn-solid"}" data-act="${k}">${esc(l)}</button>`).join("")}</div>` : ""}
         <div id="act-form"></div>
@@ -449,7 +649,7 @@ async function pageTracking(P, id) {
         <span class="eyebrow">NEED AN UPDATE?</span>
         <p class="t11">If status is uncertain, check ${esc(r.id)}${r.transferId ? ` and ${esc(r.transferId)}` : ""} before retrying. Do not submit another payment to resolve a delay.</p>
         <a class="btn-line" href="#/activity">View activity log</a>
-        <p class="note10">Instruction: <a href="/ui/requests/${esc(r.id)}/iso20022" download>pain.001 ↓</a>${r.proof ? ` · <a href="${esc(r.proof)}" target="_blank" rel="noopener">settlement proof ↗</a>` : ""}${r.escrow?.lockTx ? ` · escrow ${txLink(r.escrow, r.escrow.lockTx)}` : ""}. ${t?.receipt ? "Receipt recorded with the transfer." : "Receipt available only after confirmed settlement."}</p>
+        <p class="note10">Bank payment file: <a href="/ui/requests/${esc(r.id)}/iso20022" download>download ↓</a>${r.proof ? ` · <a href="${esc(r.proof)}" target="_blank" rel="noopener">settlement proof ↗</a>` : ""}${r.escrow?.lockTx ? ` · escrow ${txLink(r.escrow, r.escrow.lockTx)}` : ""}. ${t?.receipt ? "Receipt recorded with the transfer." : "Receipt available only after confirmed settlement."}</p>
       </aside>
     </div>`);
   $("#refresh").onclick = () => route();

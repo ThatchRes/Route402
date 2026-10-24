@@ -4,9 +4,10 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Route402</title>
+  <link rel="icon" type="image/svg+xml" href="assets/logo-mark.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Inter:wght@400;500;600;700&family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="app.css" />
   <link rel="stylesheet" href="chat.css" />
   <link rel="stylesheet" href="screens.css" />
@@ -14,14 +15,12 @@
 <body>
 <div class="shell">
   <aside class="side" id="side">
-    <!-- Route 402 highway shield: Figma layers (Shield, Shield inset, Shield divider) + live text -->
-    <a class="logo" href="#/chat" aria-label="Route402 Agent home">
-      <img class="logo-shield" src="assets/shield.svg" width="60" height="66" alt="" />
-      <img class="logo-inset" src="assets/shield-inset.svg" width="46" height="53" alt="" />
-      <img class="logo-divider" src="assets/shield-divider.svg" width="44" height="3" alt="" />
-      <span class="logo-route" aria-hidden="true">ROUTE</span><span class="logo-402" aria-hidden="true">402</span>
+    <!-- Route402 lockup: the routing mark (one payment, two routes, the chosen one bright) + wordmark -->
+    <a class="logo" href="#/chat" aria-label="Route402 home">
+      <img class="logo-mark" src="assets/logo-mark.svg" width="34" height="34" alt="" />
+      <span class="logo-word" aria-hidden="true"><b>Route<i>402</i></b><small>AI payment routing</small></span>
     </a>
-    <div class="company"><b id="co-name">Your company</b><span id="co-sub">Importer</span></div>
+    <div class="company"><b id="co-name">Your company</b><span id="co-sub">Manufacturer</span></div>
     <nav class="nav" id="nav">
       <a href="#/chat" data-nav="chat"><img class="ico on" src="assets/sparkles-nav.svg" width="17" height="17" alt="" />Agent</a>
       <a href="#/payments" data-nav="payments"><img class="ico" src="assets/arrow-left-right.svg" width="17" height="17" alt="" />Payments</a>

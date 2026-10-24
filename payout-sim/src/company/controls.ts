@@ -5,12 +5,17 @@
 import { createHash, randomBytes, randomInt } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { ConditionSpec } from "./conditions.js";
+import type { DocCheck, DocumentaryTerms } from "./documents.js";
+import type { TokenizedConfig } from "../router/tokenized.js";
+import { DEFAULT_COMPLIANCE, type Check, type CompliancePolicy } from "../router/compliance.js";
 
 export type Role = "preparer" | "approver" | "receiving" | "admin";
-export interface User { id: string; name: string; title: string; roles: Role[]; approvalLimitUsd: number | null }
+export interface User { id: string; name: string; title: string; roles: Role[]; approvalLimitUsd: number | null; owner?: boolean }
 
 // Demo users. In production these come from the company's identity provider (SSO), not this file.
+// The owner holds every role and may act alone; each time that skips segregation of duties it is written to the audit log.
 export const USERS: User[] = [
+  { id: "alex", name: "Alex Rivera", title: "Owner · full authority", roles: ["preparer", "approver", "receiving", "admin"], approvalLimitUsd: null, owner: true },
   { id: "maya", name: "Maya Chen", title: "AP specialist", roles: ["preparer"], approvalLimitUsd: null },
   { id: "jordan", name: "Jordan Ellis", title: "Treasury manager", roles: ["approver"], approvalLimitUsd: 250_000 },
   { id: "priya", name: "Priya Raman", title: "CFO", roles: ["approver", "admin"], approvalLimitUsd: null },   // null = no limit (for approvers)
@@ -25,11 +30,15 @@ export interface Policy { dualApprovalOverUsd: number; // legacy display field; 
   depegFailClosed: boolean;      // pause it too when no live price can be read
   issuerCapUsd: number;          // most that may be in flight or in escrow with one stablecoin issuer at once
   escrowDeadlineDays: number;    // days after approval before an unreleased escrow can be refunded
-  fxRiskLimitUsd: number }       // flag a currency when its 95% one-sided FX move on open bills exceeds this
+  fxRiskLimitUsd: number;        // flag a currency when its 95% one-sided FX move on open bills exceeds this
+  tokenized?: TokenizedConfig | null;   // the tokenized-deposit network the company's bank offers, with its tariff (router/tokenized.ts)
+  compliance?: CompliancePolicy;        // compliance rules the router enforces (router/compliance.ts)
+  lcFeePct: number }             // what the company's bank charges for a letter of credit, to compare the document-checked escrow against
 const POLICY_FILE = "data/policy.json";
 // Defaults are starting company settings, editable by the admin; none of them is market data.
 const DEFAULT_POLICY: Policy = { dualApprovalOverUsd: Number.MAX_SAFE_INTEGER, requireCallbackOnDetailsChange: true, requoteTolerancePct: 0.5, quoteValidMinutes: 14,
-  depegBandPct: 0.5, depegFailClosed: true, issuerCapUsd: 250_000, escrowDeadlineDays: 30, fxRiskLimitUsd: 25_000 };
+  depegBandPct: 0.5, depegFailClosed: true, issuerCapUsd: 250_000, escrowDeadlineDays: 30, fxRiskLimitUsd: 25_000,
+  tokenized: null, compliance: DEFAULT_COMPLIANCE, lcFeePct: 1 };
 // Preserve the old response shape for the unchanged frontend, while disabling its legacy amount threshold.
 // The approval gate below always requires exactly one approval, including amounts above this display sentinel.
 export const loadPolicy = (): Policy => ({ ...DEFAULT_POLICY, ...(existsSync(POLICY_FILE) ? JSON.parse(readFileSync(POLICY_FILE, "utf8")) : {}), dualApprovalOverUsd: Number.MAX_SAFE_INTEGER });
@@ -58,18 +67,28 @@ export function verifyAudit(): { ok: boolean; entries: number; brokenAt?: number
 // ------------------------------------------------------------------ sessions with a second factor (demo)
 // Sign-in = choose a user + enter a one-time code. In the demo the code is shown on screen ("sent to your device");
 // in production this is SSO with a hardware key or authenticator app.
+// Sessions are kept on disk (only a hash of each token), so restarting the router does not sign everyone out.
+// A session lasts 12 hours from its last use.
 const pendingCodes = new Map<string, { code: string; exp: number }>();
-const sessions = new Map<string, { userId: string; exp: number }>();
+const SESSIONS = "data/sessions.json", SESSION_MS = 12 * 3600e3;
+const tokenHash = (t: string) => createHash("sha256").update(t).digest("hex");
+const loadSessions = (): Record<string, { userId: string; exp: number }> => { try { return read(SESSIONS, {}); } catch { return {}; } };
+const cookieToken = (cookie?: string) => /(?:^|;\s*)r402=([a-f0-9]+)/.exec(cookie ?? "")?.[1];
 export function issueCode(userId: string) { const code = String(randomInt(0, 1_000_000)).padStart(6, "0"); pendingCodes.set(userId, { code, exp: Date.now() + 5 * 60e3 }); return code; }
 export function signIn(userId: string, code: string): string | null {
   const p = pendingCodes.get(userId); if (!p || p.exp < Date.now() || p.code !== String(code).trim()) return null;
-  pendingCodes.delete(userId); const token = randomBytes(24).toString("hex"); sessions.set(token, { userId, exp: Date.now() + 8 * 3600e3 }); return token;
+  pendingCodes.delete(userId); const token = randomBytes(24).toString("hex"), all = loadSessions(), now = Date.now();
+  for (const [k, s] of Object.entries(all)) if (s.exp < now) delete all[k];
+  all[tokenHash(token)] = { userId, exp: now + SESSION_MS }; write(SESSIONS, all); return token;
 }
 export function sessionUser(cookie?: string): User | undefined {
-  const token = /(?:^|;\s*)r402=([a-f0-9]+)/.exec(cookie ?? "")?.[1]; const s = token ? sessions.get(token) : undefined;
-  return s && s.exp > Date.now() ? user(s.userId) : undefined;
+  const token = cookieToken(cookie); if (!token) return undefined;
+  const all = loadSessions(), k = tokenHash(token), s = all[k];
+  if (!s || s.exp < Date.now()) return undefined;
+  if (s.exp - Date.now() < SESSION_MS - 10 * 60e3) { s.exp = Date.now() + SESSION_MS; write(SESSIONS, all); }   // slide, at most every 10 min
+  return user(s.userId);
 }
-export function signOut(cookie?: string) { const t = /(?:^|;\s*)r402=([a-f0-9]+)/.exec(cookie ?? "")?.[1]; if (t) sessions.delete(t); }
+export function signOut(cookie?: string) { const t = cookieToken(cookie); if (!t) return; const all = loadSessions(); delete all[tokenHash(t)]; write(SESSIONS, all); }
 
 // ------------------------------------------------------------------ payment requests (prepare -> verify -> approve -> release)
 export type ReqStatus = "NEEDS_CALLBACK" | "AWAITING_APPROVAL" | "AWAITING_DELIVERY" | "READY" | "PAUSED" | "EXECUTING" | "COMPLETED" | "FAILED" | "REJECTED" | "REFUNDED";
@@ -85,6 +104,8 @@ export interface PaymentRequest {
   purpose?: string; mode?: "invoice" | "budget"; checkedBy?: { userId: string; at: string };   // preparer's deliberate confirmation
   allowReroute?: boolean; fallbackIntentIds?: string[]; timing?: any; deadlineStatus?: string; costReview?: boolean;
   status: ReqStatus; note?: string; transferId?: string; proof?: string;
+  documentary?: { terms: DocumentaryTerms; presentations: { by: string; at: string; eblRef: string; platform: string; ok: boolean; checks: DocCheck[]; simulated: boolean }[] };
+  compliance?: { checkedAt: string; checks: Check[]; travelRule?: any };
   escrow?: { chain: string; contract: string; lockId: string; amountUsdc: number; deadline: string; state: "LOCKING" | "LOCKED" | "RELEASED" | "REFUNDED" | "FAILED";
     lockTx?: string; releaseTx?: string; refundTx?: string; explorer?: string | null; error?: string };
 }
@@ -119,17 +140,22 @@ export function nextActions(r: PaymentRequest, u: User | undefined, p: Policy) {
   const st = computeStatus(r, p), out: Record<string, { allowed: boolean; why?: string }> = {};
   const no = (why: string) => ({ allowed: false, why });
   if (!u) return { status: st, actions: { approve: no("sign in first") } };
-  out.callback = st !== "NEEDS_CALLBACK" ? no("no call-back needed") : u.id === r.preparedBy ? no("the preparer cannot verify their own request")
+  const own = u.id === r.preparedBy && !u.owner;   // the owner may act on their own request (logged as an override)
+  out.callback = st !== "NEEDS_CALLBACK" ? no("no call-back needed") : own ? no("the preparer cannot verify their own request")
     : can(u, "approver") ? { allowed: true } : no("only an approver or admin can record a call-back");
   out.approve = st !== "AWAITING_APPROVAL" ? no(st === "NEEDS_CALLBACK" ? "verify the bank-detail change by call-back first" : "not awaiting approval")
     : !can(u, "approver") ? no("your role cannot approve payments")
-    : u.id === r.preparedBy ? no("segregation of duties: the preparer cannot approve")
+    : own ? no("segregation of duties: the preparer cannot approve")
     : r.approvals.some((a) => a.by === u.id) ? no("you already approved")
     : u.approvalLimitUsd != null && r.debitUsd > u.approvalLimitUsd ? no(`above your approval limit (${u.approvalLimitUsd.toLocaleString()} USD)`)
     : { allowed: true };
   out.reject = ["NEEDS_CALLBACK", "AWAITING_APPROVAL", "AWAITING_DELIVERY"].includes(st) && can(u, "approver") ? { allowed: true } : no("cannot reject now");
-  out.confirmDelivery = st !== "AWAITING_DELIVERY" ? no("not waiting for delivery")
-    : u.id === r.preparedBy ? no("the preparer cannot confirm delivery") : can(u, "receiving") || can(u, "approver") ? { allowed: true } : no("receiving, approver or admin only");
+  const docs = r.condition?.kind === "documents_presented";
+  const deliveryRole = st !== "AWAITING_DELIVERY" ? no("not waiting for delivery")
+    : own ? no("the preparer cannot confirm delivery") : can(u, "receiving") || can(u, "approver") ? { allowed: true } : no("receiving, approver or admin only");
+  // a document-checked payment is released only by verified documents, never by a typed-in confirmation
+  out.confirmDelivery = docs ? no("this payment is released when its shipping documents verify") : deliveryRole;
+  out.presentDocuments = docs ? deliveryRole : no("no document check on this payment");
   out.recheck = st === "PAUSED" && can(u, "approver") ? { allowed: true } : no("not paused");
   out.refund = r.escrow?.state === "LOCKED" && can(u, "approver") ? (Date.now() >= Date.parse(r.escrow.deadline) ? { allowed: true } : no(`refund opens at the escrow deadline (${r.escrow.deadline.slice(0, 10)})`)) : no("no locked escrow");
   return { status: st, actions: out };

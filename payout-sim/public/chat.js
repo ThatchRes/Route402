@@ -21,10 +21,16 @@ function saveChat() {
   renderChatHistory();
 }
 const CHAT_EXAMPLES = [
-  ["Find suppliers", "Which of my supplier companies use MXN?"],
   ["Plan a payment", "Pay my German suppliers this week"],
+  ["Find suppliers", "Which of my supplier companies use MXN?"],
+  ["See what you owe", "What do we owe our suppliers?"],
+  ["Fastest route", "Pay all my suppliers by Friday, fastest route"],
+  ["Check a payment", "What happened to my last payment?"],
   ["Add a supplier", "Add a supplier"],
 ];
+// Agent home: idle (choose chat or manual input, past payments beside it) -> chat (past payments slide away to a pull tab,
+// the composer widens, prompts fill the middle). The tab slides the panel back out; the chat reflows into the narrower space.
+let CHAT_OPEN = false, PANEL_OPEN = true;
 // Follow-ups the conversation planner understands while a draft is open (they fill the composer; nothing is sent automatically)
 const DRAFT_SUGGESTIONS = [["Explain these fees", "Explain these fees"], ["Change the deadline", "Change the deadline to "], ["Did it work?", "Did it work?"]];
 const ICON = (name, size, cls = "") => `<img class="${cls}" src="assets/${name}.svg" width="${size}" height="${size}" alt="" />`;
@@ -67,48 +73,132 @@ const greeting = () => { const h = new Date().getHours(), first = ME?.name?.spli
   return `Good ${h < 12 ? "morning" : h < 18 ? "afternoon" : "evening"}${first ? `, ${first}` : ""}.`; };
 
 function pageChat(P) {
-  P.innerHTML = `<div class="agent-home">
-    <section class="intro">
-      <div class="intro-text"><p class="eyebrow">YOUR FINANCIAL WORKSPACE</p><h1 id="greeting">${esc(greeting())}</h1><p class="lede">Ask, prepare and track. You stay in control of every payment.</p></div>
-      <a class="btn-line" href="#/payments/new">Manual payment ${ICON("plus", 15)}</a>
-    </section>
-    <div class="agent-cols">
-      <section class="convo" aria-label="Conversation with the payment agent">
-        <div class="convo-bar"><div class="convo-title">${ICON("message-square", 16)}<span id="convo-title"></span></div>
+  CHAT_OPEN = CHAT_OPEN || CHAT.length > 0 || !!CHAT_INPUT;
+  PANEL_OPEN = !CHAT_OPEN;
+  const started = CHAT.length > 0;
+  P.innerHTML = `<div class="agent-page${CHAT_OPEN ? " is-chat" : ""}${started ? " has-msgs" : ""}${PANEL_OPEN ? "" : " panel-closed"}" id="agent">
+    <div class="agent-main">
+      <div class="agent-scroll" id="agent-scroll"><div class="agent-col">
+        <div class="convo-bar"><div class="convo-title">${ICON("message-square", 15)}<span id="convo-title"></span></div>
           <button class="text-btn" id="new-chat" data-new-chat>+ New conversation</button></div>
+        <section class="hero" aria-label="Start">
+          <span class="hero-icon" aria-hidden="true">${ICON("sparkles-agent", 24)}</span>
+          <div class="hero-swap">
+            <div class="hero-idle"><p class="hero-hi" id="greeting">${esc(greeting())}</p><h1>How do you want to pay today?</h1>
+              <p class="hero-sub">Chat with the agent, or enter the payment yourself. Either way, nothing moves until your company approves it.</p>
+              <div class="choices">
+                <button type="button" class="choice" data-open-chat>${ICON("message-square", 16)}<span><b>Chat with the agent</b><small>Describe it in plain words. The agent compares routes and buys quotes.</small></span></button>
+                <a class="choice" href="#/payments/new">${ICON("sliders-horizontal", 16)}<span><b>Manual input</b><small>Pick a saved supplier and invoice, then fill in each field.</small></span></a>
+              </div></div>
+            <div class="hero-chat"><p class="hero-hi">Ask about suppliers, fees or a payment</p><h1>What should we work on?</h1>
+              <p class="hero-sub">Pick a prompt to send it, or write your own below.</p>
+              <ul class="prompt-list" id="hero-prompts"></ul></div>
+          </div>
+        </section>
         <div class="convo-log" id="chat-content" aria-live="polite"></div>
-        <div class="composer-wrap"><form class="composer" id="chat-form">
-          <label class="sr-only" for="chat-input">Your request to the payment agents</label>
-          <textarea id="chat-input" rows="1" maxlength="500" placeholder="Ask about fees, a supplier or a payment…" aria-describedby="chat-input-note"></textarea>
-          <div class="composer-bottom"><span class="attach" id="chat-attach">${ICON("paperclip", 16, "clip")}<span id="chat-input-note"></span></span>
-          <button type="submit" class="chat-send" id="chat-send" aria-label="Send request to agents">${ICON("arrow-up", 16)}</button></div>
-        </form><div class="suggestions" id="chat-suggestions"></div></div>
-      </section>
-      <aside class="context" id="chat-context-panel" aria-label="In this conversation"></aside>
+      </div></div>
+      <div class="dock"><div class="agent-col">
+        <div class="suggest-row" id="chat-suggestions"></div>
+        <div class="dock-row">
+          <form class="composer" id="chat-form">
+            <label class="sr-only" for="chat-input">Your request to the payment agents</label>
+            <textarea id="chat-input" rows="1" maxlength="500" placeholder="Ask the agent to plan a payment…" aria-describedby="chat-input-note"></textarea>
+            <div class="composer-foot"><div><div class="composer-bottom">
+              <span class="attach" id="chat-attach">${ICON("paperclip", 14, "clip")}<span id="chat-input-note"></span></span>
+              <button type="button" class="foot-link" id="close-draft" hidden>Close draft</button>
+              <a class="foot-link" href="#/payments/new">Manual input</a>
+              <button type="submit" class="chat-send" id="chat-send" aria-label="Send request to agents">${ICON("arrow-up", 16)}</button>
+            </div></div></div>
+          </form>
+          <a class="manual-btn" id="manual-btn" href="#/payments/new">${ICON("plus", 14)}Manual input</a>
+        </div>
+        <p class="app-note" id="chat-context">Route402 · demo</p>
+      </div></div>
     </div>
-    <p class="app-note" id="chat-context">Route402 · demo</p>
+    <aside class="agent-panel" aria-label="Past payments">
+      <button type="button" class="panel-grip" id="panel-toggle" aria-controls="past-payments"><span></span></button>
+      <div class="panel-body" id="past-payments"></div>
+    </aside>
   </div>`;
-  const input = $("#chat-input"); input.value = CHAT_INPUT;
+  const root = $("#agent"), input = $("#chat-input"); input.value = CHAT_INPUT;
+  input.addEventListener("focus", openChatUi);
   input.addEventListener("input", () => { CHAT_INPUT = input.value; syncChatComposer(); });
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!CHAT_BUSY) $("#chat-form").requestSubmit(); }
+    if (e.key === "Escape" && !CHAT.length && !input.value) { input.blur(); closeChatUi(); }
   });
   $("#chat-form").onsubmit = (e) => { e.preventDefault(); sendChat(input.value); };
-  $("#chat-suggestions").addEventListener("click", (e) => {
-    const s = e.target.closest("[data-suggest]"); if (!s) return;
-    input.value = s.dataset.suggest; CHAT_INPUT = input.value; syncChatComposer(); input.focus(); input.setSelectionRange(input.value.length, input.value.length);
+  // Clicking away from an empty, unstarted chat folds it back to the idle look
+  root.addEventListener("pointerdown", (e) => {
+    if (CHAT_OPEN && !CHAT.length && !input.value.trim() && !e.target.closest(".composer, .prompt-list, [data-open-chat], .agent-panel")) closeChatUi();
   });
+  root.addEventListener("click", (e) => {
+    const s = e.target.closest("[data-suggest]");
+    // A complete prompt sends right away; an open-ended one ("Change the deadline to …") goes in the box to finish
+    if (s && !s.dataset.suggest.endsWith(" ")) { if (!CHAT_BUSY) { openChatUi(); sendChat(s.dataset.suggest); } return; }
+    if (s) { openChatUi(); input.value = s.dataset.suggest; CHAT_INPUT = input.value; syncChatComposer(); input.focus(); input.setSelectionRange(input.value.length, input.value.length); return; }
+    if (e.target.closest("[data-open-chat]")) { openChatUi(); input.focus(); return; }
+    if (e.target.closest("#panel-toggle")) { PANEL_OPEN = !PANEL_OPEN; syncPanel(); return; }
+    // Closes the unsubmitted draft only; it never cancels an in-flight payment or moves money
+    if (e.target.closest("#close-draft")) { const d = activeDraft(); if (d) { CHAT[d.index].closed = true; saveChat(); renderChatMessages(); } }
+  });
+  syncHero(); syncPanel();
   $("#chat-content").addEventListener("click", (e) => {
     const prepare = e.target.closest("[data-chat-prepare]");
     if (prepare) prepareChat(Number(prepare.dataset.chatPrepare));
     const supplier = e.target.closest("[data-chat-supplier]");
     if (supplier) confirmChatSupplier(Number(supplier.dataset.chatSupplier));
   });
-  $("#chat-context-panel").addEventListener("click", (e) => {
-    const close = e.target.closest("[data-close-draft]");
-    if (close) { const m = CHAT[Number(close.dataset.closeDraft)]; if (m) { m.closed = true; saveChat(); renderChatMessages(); } }
-  });
-  renderChatMessages(); updateChatContext(); renderChatHistory(); void restoreChatContext();
+  renderChatMessages(); updateChatContext(); renderChatHistory(); scrollChat(false); void restoreChatContext();
+}
+
+function syncHero() {
+  const idle = $(".hero-idle"), chat = $(".hero-chat"), manual = $("#manual-btn"); if (!idle) return;
+  idle.inert = CHAT_OPEN; chat.inert = !CHAT_OPEN;
+  manual.tabIndex = CHAT_OPEN ? -1 : 0; manual.toggleAttribute("aria-hidden", CHAT_OPEN);
+}
+function openChatUi() { if (CHAT_OPEN) return; CHAT_OPEN = true; PANEL_OPEN = false; $("#agent")?.classList.add("is-chat"); syncHero(); syncPanel(); }
+function closeChatUi() { if (!CHAT_OPEN || CHAT.length) return; CHAT_OPEN = false; PANEL_OPEN = true; CHAT_INPUT = ""; $("#agent")?.classList.remove("is-chat"); syncHero(); syncPanel(); }
+
+// Past payments panel: open beside the idle page, slid away to a pull tab while chatting
+function syncPanel() {
+  const root = $("#agent"); if (!root) return;
+  root.classList.toggle("panel-closed", !PANEL_OPEN);
+  const t = $("#panel-toggle"); t.setAttribute("aria-expanded", String(PANEL_OPEN)); t.setAttribute("aria-label", PANEL_OPEN ? "Hide past payments" : "Show past payments");
+  $("#past-payments").inert = !PANEL_OPEN;
+}
+const promptItems = () => [...(activeDraft() ? DRAFT_SUGGESTIONS : []), ...CHAT_EXAMPLES].map(([label, prompt], i) =>
+  `<li style="--i:${i}"><button type="button" data-suggest="${esc(prompt)}"><span>${label === prompt.trim() ? "" : esc(label)}</span>${esc(prompt.trim())}${prompt.endsWith(" ") ? " …" : ""}</button></li>`).join("");
+// Once the conversation has started, a few short follow-ups sit above the box
+const suggestRow = () => (activeDraft() ? DRAFT_SUGGESTIONS : CHAT_EXAMPLES.slice(0, 3)).map(([label, prompt]) => `<button type="button" data-suggest="${esc(prompt)}">${esc(label)}</button>`).join("");
+
+function impactCard() {
+  // Same numbers as the Payments page: paid so far, plus open bills projected on their best routes (GET /ui/growth).
+  // Treasury levers from the payment run (early-pay discounts, bad details caught) are listed separately, never added in.
+  const g = typeof GROWTH !== "undefined" ? GROWTH : null, run = STATE?.run; if (!g) return "";
+  const T = g.totals, s = run?.savings ?? {}, blocked = (run?.lines ?? []).filter((l) => /BLOCKED/.test(l.status ?? "")).length;
+  const row = (big, text) => `<div class="imp-row"><b>${esc(big)}</b><span>${esc(text)}</span></div>`;
+  return `<section class="impact-card" aria-label="Savings vs your bank"><span class="imp-label">Savings vs your bank wire</span>
+    <div class="imp-big">$${fmt(T.realizedUsd + T.projectedUsd, 0)}</div>
+    <p class="imp-sub">$${fmt(T.realizedUsd, 0)} on ${plural(g.realized.length, "paid payment")} + $${fmt(T.projectedUsd, 0)} projected on ${plural(g.projected.length, "open bill")}, after our fee</p>
+    ${T.avgDaysFaster > 0.04 ? row(`${T.avgDaysFaster.toFixed(1)} days faster`, `average on ${T.fasterBills} of ${g.projected.length} open bills, vs a bank wire`) : ""}
+    ${s.earlyPayDiscounts && num(s.earlyPayDiscounts) > 0 ? row(`+ ${money(s.earlyPayDiscounts, 0)}`, "early-payment discounts the faster routes make reachable (not included above)") : ""}
+    ${blocked ? row(`${blocked} caught`, `payment${blocked === 1 ? "" : "s"} with bad bank details stopped before sending`) : ""}
+    <a class="imp-link" href="#/payments">See the growth chart →</a>
+  </section>`;
+}
+function renderPastPayments() {
+  const el = $("#past-payments"); if (!el) return;
+  if (!STATE) { el.innerHTML = `<p class="panel-sub">Loading payments…</p>`; return; }
+  const rows = [...REQS].sort((a, b) => String(b.preparedAt).localeCompare(String(a.preparedAt))).map((r) => ({ href: `#/payments/${r.id}`, name: r.supplier,
+    sub: `${refLabel(r)} · ${day(r.preparedAt)}`, amount: usd(r.debitUsd, 2), status: r.status }));
+  const tracked = new Set(REQS.map((r) => r.transferId).filter(Boolean));
+  for (const t of STATE.transfers ?? []) if (!tracked.has(t.transferId) && !reqFor(t.reference)) rows.push({ name: t.supplier ?? t.reference, sub: t.reference, amount: money(t.debit), status: t.status });
+  el.innerHTML = `${impactCard()}<div class="pp-head"><b>Past payments</b><a href="#/payments">View all</a></div>
+    ${rows.length ? rows.slice(0, 14).map((r) => `<${r.href ? `a href="${esc(r.href)}"` : "div"} class="pp-row"><span class="pp-ico" aria-hidden="true">${esc(initials(r.name))}</span>
+      <span class="pp-main"><b title="${esc(r.name)}">${esc(r.name)}</b><small>${esc(r.sub)}</small></span>
+      <span class="pp-side"><b>${r.amount}</b><span class="tag ${statusKind(r.status)}">${esc(statusText(r.status))}</span></span></${r.href ? "a" : "div"}>`).join("")
+    : `<p class="panel-sub">No payments yet. Ones you prepare in chat or by manual input show up here.</p>`}`;
 }
 
 function updateChatContext(available = true) {
@@ -130,6 +220,7 @@ function syncChatComposer() {
   const nc = $("#new-chat"); if (nc) nc.disabled = CHAT_BUSY;
   const draft = activeDraft(), name = draft && draftName(draft.d, QUOTES[draft.d.intentId]?.data);
   $("#chat-attach").classList.toggle("on", !!draft && !CHAT_FOLLOWUP);
+  $("#close-draft").hidden = !draft || !!requestFor(draft.d);
   $("#chat-input-note").textContent = CHAT_FOLLOWUP ? "Reply with the missing detail, or type a new request"
     : draft ? `${name} draft attached` : "Follow up naturally · Enter to send";
   renderChatHistory();
@@ -139,17 +230,65 @@ function syncChatComposer() {
 const timeOf = (ms) => (ms ? new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) : "");
 function renderChatMessages() {
   const content = $("#chat-content"); if (!content) return;
+  const root = $("#agent");
+  root.classList.toggle("has-msgs", CHAT.length > 0);
+  if (CHAT.length && !CHAT_OPEN) { CHAT_OPEN = true; root.classList.add("is-chat"); syncHero(); }
   const title = chatTitle(); $("#convo-title").textContent = title ?? "New conversation";
   const mine = initials(ME?.name) || "–";
   content.innerHTML = CHAT.length ? CHAT.map((m, i) => m.role === "user"
-    ? `<article class="msg user"><div class="msg-author"><span class="ini">${esc(m.by ?? (m.at ? "" : mine))}</span><b>You</b>${m.at ? `<time>${esc(timeOf(m.at))}</time>` : ""}</div><p class="msg-text">${esc(m.text)}</p></article>`
-    : `<article class="msg agent"><div class="msg-author">${ICON("sparkles-agent", 16)}<b>Route402 Agent</b>${m.answer?.decisions?.length ? `<span class="badge">${quotesKind(m.answer)}</span>` : ""}${m.at ? `<time>${esc(timeOf(m.at))}</time>` : ""}</div>
+    ? `<article class="msg user" data-msg="${i}"><div class="msg-author"><span class="ini">${esc(m.by ?? (m.at ? "" : mine))}</span><b>You</b>${m.at ? `<time>${esc(timeOf(m.at))}</time>` : ""}</div><p class="msg-text">${esc(m.text)}</p></article>`
+    : `<article class="msg agent${TYPING?.index === i ? " typing" : ""}" data-msg="${i}"><div class="msg-author">${ICON("sparkles-agent", 16)}<b>Route402 Agent</b>${m.answer?.decisions?.length ? `<span class="badge">${quotesKind(m.answer)}</span>` : ""}${m.at ? `<time>${esc(timeOf(m.at))}</time>` : ""}</div>
       <div class="msg-body">${m.error ? `<p class="chat-error" role="alert">${esc(m.error)}</p><p class="msg-note">Your request wasn't completed. You can send it again.</p>` : chatAnswer(m.answer, i)}</div></article>`).join("")
-    : `<p class="msg-empty">Ask the agent to plan a payment, find a supplier or check a transfer. Payments need your company's approval before any money moves.</p>`;
-  if (CHAT_BUSY) content.insertAdjacentHTML("beforeend", `<article class="msg agent"><div class="msg-author">${ICON("sparkles-agent", 16)}<b>Route402 Agent</b></div><div class="msg-body chat-working" role="status"><span class="spinner" aria-hidden="true"></span> Your agents are reviewing the request…<small>Quote and supplier checks can take a few minutes.</small></div></article>`);
-  const sug = $("#chat-suggestions");
-  if (sug) sug.innerHTML = (activeDraft() ? DRAFT_SUGGESTIONS : CHAT_EXAMPLES).map(([label, prompt]) => `<button type="button" data-suggest="${esc(prompt)}">${esc(label)}</button>`).join("");
-  renderContext(); syncChatComposer();
+    : "";
+  if (CHAT_BUSY) content.insertAdjacentHTML("beforeend", `<article class="msg agent"><div class="msg-author">${ICON("sparkles-agent", 16)}<b>Route402 Agent</b></div><div class="msg-body"><div class="chat-working" role="status"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Your agents are working on this…</span><small>Payment requests take longer: the agents buy live quotes and check the supplier first.</small></div>
+    <ol class="crew" aria-label="Agents on this request">${[["Concierge agent", "reads your request and finds the right suppliers and invoices"], ["Compliance agent", "checks the supplier and their bank details"],
+      ["Routing agent", "buys live quotes from each payment route and compares cost and speed"]].map(([who, what]) => `<li><span class="dot" aria-hidden="true"></span><b>${who}</b> ${what}</li>`).join("")}</ol></div></article>`);
+  $("#hero-prompts").innerHTML = promptItems(); $("#chat-suggestions").innerHTML = suggestRow();
+  renderPastPayments(); syncChatComposer(); captureTyping();
+}
+
+// ------------------------------------------------------------------ scrolling and the typed-out reply
+const chatScroller = () => $("#agent-scroll");
+const nearBottom = () => { const s = chatScroller(); return !s || s.scrollHeight - s.scrollTop - s.clientHeight < 140; };
+const scrollChat = (smooth = true) => { const s = chatScroller(); if (s) s.scrollTo({ top: s.scrollHeight, behavior: smooth && !matchMedia("(prefers-reduced-motion: reduce)").matches ? "smooth" : "auto" }); };
+// A new reply is revealed like a streamed answer: text word by word, tables and quote cards as whole blocks.
+// Re-renders (quotes loading) rebuild the DOM, so progress is kept as a character count and re-applied to the fresh DOM.
+let TYPING = null;   // { index, shown, units, blocks, total }
+const ATOMIC = ".proposal, .chat-table-wrap, .alts, details, .review-row, dl, button, .how";
+function startTyping(index) {
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  TYPING = { index, shown: 0 }; requestAnimationFrame(tickTyping);
+}
+function captureTyping() {
+  if (!TYPING) return;
+  const body = $(`[data-msg="${TYPING.index}"] .msg-body`); if (!body) { TYPING = null; return; }
+  const blocks = [...body.children], units = [];
+  blocks.forEach((b, bi) => {
+    if (b.matches(ATOMIC)) { units.push({ bi, cost: 24 }); return; }
+    const w = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
+    for (let n; (n = w.nextNode());) if (n.nodeValue.trim()) units.push({ bi, node: n, full: n.nodeValue, cost: n.nodeValue.length });
+  });
+  Object.assign(TYPING, { blocks, units, total: units.reduce((a, u) => a + u.cost, 0) });
+  paintTyping();
+}
+function paintTyping() {
+  let left = TYPING.shown, reached = -1;
+  for (const u of TYPING.units) {
+    const take = Math.max(0, Math.min(u.cost, left)); left -= u.cost;
+    if (u.node) u.node.nodeValue = take >= u.cost ? u.full : u.full.slice(0, u.full.lastIndexOf(" ", take) + 1 || take);
+    if (take > 0) reached = Math.max(reached, u.bi);
+  }
+  TYPING.blocks.forEach((b, bi) => b.classList.toggle("unrevealed", bi > reached));
+}
+function tickTyping() {
+  if (!TYPING?.units) return;
+  const follow = nearBottom();
+  // About 75 characters a second, a comfortable reading pace; very long replies speed up so none takes more than ~8 seconds
+  const now = performance.now(), dt = Math.min(100, now - (TYPING.at ?? now)); TYPING.at = now;
+  TYPING.shown += (Math.max(75, TYPING.total / 8) * dt) / 1000;
+  if (TYPING.shown >= TYPING.total) { TYPING = null; renderChatMessages(); } else paintTyping();
+  if (follow) scrollChat(false);
+  if (TYPING) requestAnimationFrame(tickTyping);
 }
 const quotesKind = (a) => (STATE?.localSimulation || (a.paidCalls?.length && a.paidCalls.every((c) => c.mock)) ? "Simulated quotes" : "Testnet quotes");
 
@@ -161,7 +300,7 @@ async function sendChat(text) {
     CHAT.push({ role: "assistant", error: "Please shorten this message to 500 characters.", at: Date.now() }); saveChat(); renderChatMessages(); return;
   }
   CHAT.push({ role: "user", text, at: Date.now(), by: initials(ME?.name) || undefined }); CHAT_INPUT = ""; CHAT_BUSY = true;
-  $("#chat-input").value = ""; saveChat(); renderChatMessages(); setCrumbs("Agent", chatTitle());
+  $("#chat-input").value = ""; saveChat(); renderChatMessages(); setCrumbs("Agent", chatTitle()); scrollChat();
   try {
     const answer = await api("/ask", { text: request, conversationId: CHAT_ID, conversationRevision: CHAT_REVISION });
     if (!answer || !["ok", "clarification", "blocked"].includes(answer.status)) throw new Error(answer?.error || "The agents returned an incomplete response. Please try again.");
@@ -174,7 +313,8 @@ async function sendChat(text) {
     // A timed-out agent call may already have stored the draft. Synchronize its revision without retrying paid tools.
     try { const saved = await api(`/conversations/${CHAT_ID}`); if (Number.isInteger(saved.conversationRevision)) CHAT_REVISION = saved.conversationRevision; } catch {}
   } finally {
-    CHAT_BUSY = false; saveChat(); renderChatMessages();
+    CHAT_BUSY = false; saveChat();
+    if (location.hash.startsWith("#/chat") && $("#chat-content")) { const follow = nearBottom(); startTyping(CHAT.length - 1); renderChatMessages(); if (follow) scrollChat(); }
     const input = $("#chat-input"); if (input) { input.value = CHAT_INPUT; syncChatComposer(); input.focus(); }
     const nc = $("#new-chat"); if (nc) nc.disabled = false;
   }
@@ -192,7 +332,8 @@ function quote(intentId) {
   }
   return QUOTES[intentId];
 }
-const draftName = (d, q) => q?.recipient?.name ?? billOf(d.payable)?.supplier ?? d.payable;
+// Chat-made payments have internal references (chat_…); never show one as the recipient's name
+const draftName = (d, q) => q?.recipient?.name ?? billOf(d.payable)?.supplier ?? d.supplier ?? d.beneficiary?.name ?? (String(d.payable).startsWith("chat_") ? "Supplier" : d.payable);
 // Match on the payable reference: a request keeps it, while its intent can be re-quoted at release (same as reqFor)
 const requestFor = (d) => reqFor(d.payable);
 const whenUtc = (iso) => (iso ? `${new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" })} · ${utc(iso)}` : "-");
@@ -201,7 +342,6 @@ const nonZero = (s) => Number(num(s)) !== 0;
 const maskOf = (q) => maskedFor(q.recipient.name, q.recipient.maskedAccount);
 const feesText = (q) => q.legs.map((l) => [`${money(l.fundingFee)} transfer`, nonZero(l.payoutFee) ? `${money(l.payoutFee)} payout` : null].filter(Boolean).join(" + ")).join(" · ");
 const fxText = (q) => q.legs.filter((l) => Number(l.fxRate) !== 1 || !l.funded.endsWith(q.recipient.ccy)).map((l) => `${money(l.funded)} × ${fxFmt(l.fxRate)}`).join(" · ");
-const window_ = (q) => `${whenUtc(q.capturedAt).replace(" UTC", "")}–${utc(q.expiresAt)}`;
 // The latest answer in the current revision whose agent plan can still be prepared (or is already being tracked)
 function activeDraft() {
   for (let i = CHAT.length - 1; i >= 0; i--) {
@@ -247,13 +387,98 @@ function chatAnswer(a, index) {
   if (actionable.length && decisions.length > 1) html += reviewAction(a, index, current, actionable, `Review ${actionable.length} payment${actionable.length === 1 ? "" : "s"}`);
   if (!decisions.length && view.lines?.length) html += chatTable(["Invoice", "Plan", "Amount to convert"], view.lines.map((r) => [r.payable, r.status || r.route || "See plan", r.convertedAmount ? `${r.convertedAmount} ${r.ccy}` : "Paid from balance"]));
   if (p.tip) html += `<p class="msg-text">${esc(p.tip)}</p>`;
-  if (a.paidCalls?.length || a.hops?.length) html += `<details class="chat-details"><summary>Agent activity${a.paidCalls?.length ? ` · ${a.paidCalls.length} tool calls · ${esc(a.spentUsdc)} test USDC${a.paidCalls.every((c) => c.mock) ? " · local simulation" : ""}` : ""}</summary>
-    <ol>${(a.hops ?? []).map((h) => `<li><b>${esc(h.from)} → ${esc(h.to)}</b> · ${esc(h.message)}</li>`).join("")}</ol>
-    ${(a.paidCalls ?? []).map((c) => {
-      const href = typeof c.explorer === "string" && /^https:\/\/sepolia\.basescan\.org\/tx\/0x[0-9a-f]+$/i.test(c.explorer) ? c.explorer : null;
-      return `<p>${esc(c.service)} · ${esc(c.priceUsdc)} test USDC ${c.mock ? "(mock)" : href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">View transaction ↗</a>` : ""}</p>`;
-    }).join("")}</details>`;
+  html += agentTrail(a);
   return html;
+}
+
+// ------------------------------------------------------------------ the agents' work, in plain words
+// Built only from what the agents reported (hops with timings, paid calls); nothing here is estimated.
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+const secs = (ms) => (ms == null ? "" : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
+const usdc = (list) => list.reduce((s, c) => s + Number(c.priceUsdc || 0), 0);
+function agentTrail(a) {
+  const hops = a?.hops ?? [], paid = a?.paidCalls ?? [], decisions = a?.decisions ?? [];
+  if (!paid.length && !decisions.length) return "";   // nothing but the concierge reading the request: no trail to show
+  const quotes = paid.filter((c) => /quote/i.test(c.service ?? "")), screens = paid.filter((c) => !/quote/i.test(c.service ?? ""));
+  const providers = [...new Set(quotes.map((c) => String(c.service).split(/[:_]/).pop()))].map((p) => RAIL[p]?.replace(/^(Our|Your) /, "") ?? p);
+  const screenHop = hops.find((h) => h.to === "compliance"), screenDone = hops.find((h) => h.from === "compliance"), quoteHop = hops.find((h) => h.to === "providers");
+  const last = hops.findLast?.((h) => h.ms != null) ?? [...hops].reverse().find((h) => h.ms != null);
+  const suppliers = Number(/\((\d+) suppliers?\)/.exec(screenHop?.message ?? "")?.[1] ?? decisions.length);
+  const sim = paid.length && paid.every((c) => c.mock) ? " (simulated, no real payment)" : "";
+  const pay = (list) => (list.length && usdc(list) > 0 ? ` · paid ${usdc(list).toFixed(3).replace(/0+$/, "").replace(/\.$/, "")} test USDC${sim}` : sim);
+  // this run's time next to the running average across all agent runs in this workspace
+  const avg = a.agentStats?.average, vsAvg = (ms, k) => (ms == null ? "" : `${secs(ms)}${avg?.[k] && avg.runs > 1 ? ` · avg ${secs(Math.round(avg[k]))}` : ""}`);
+  const steps = [["Concierge agent", "Read your request and matched it to your suppliers and invoices", ""]];
+  if (screenHop) steps.push(["Compliance agent", `Checked ${plural(suppliers, "supplier")} and their bank details before any money could move${pay(screens)}`, vsAvg(screenDone?.ms, "compliance")]);
+  if (quoteHop || quotes.length) steps.push(["Routing agent", `Bought ${plural(quotes.length, "live quote")}${providers.length ? ` (${providers.join(", ")})` : ""} and compared total cost and arrival time${pay(quotes)}`, vsAvg(quoteHop?.ms, "routing")]);
+  if (decisions.length) {
+    const ok = decisions.filter((d) => d.decision === "approve"), review = decisions.filter((d) => d.decision === "review"), held = decisions.filter((d) => !["approve", "review"].includes(d.decision));
+    const railName = (p) => (RAIL[p] ?? p).replace(/^(Our|Your) /, (w) => w.toLowerCase());
+    const pref = { cheapest: "lowest total cost", fastest: "fastest arrival", lowest_risk: "lowest risk" }[a.policy] ?? "lowest total cost";
+    const what = decisions.length === 1
+      ? (ok.length ? `Recommended ${railName(ok[0].chosen)}, the best fit for ${pref}` : review.length ? `Recommended ${railName(review[0].chosen)}, but flagged a check for a person first` : `Held this payment: ${(held[0].reasons ?? [])[0] ?? "no route qualified"}`)
+      : [ok.length && `${ok.length} recommended`, review.length && `${review.length} need a check first`, held.length && `${held.length} held`].filter(Boolean).join(", ");
+    steps.push(["Decision", `${what}. You still review and approve before anything is sent.`, ""]);
+  }
+  // how the work was split between the agents (paid calls each one made), as one stacked bar with a legend
+  const split = [["Routing agent", quotes.length, "var(--viz-1)"], ["Compliance agent", screens.length, "var(--viz-2)"]].filter(([, n]) => n > 0), total = split.reduce((s, [, n]) => s + n, 0);
+  const splitBar = total ? `<div class="split" role="img" aria-label="${esc(split.map(([w, n]) => `${w}: ${n} of ${total} calls`).join(", "))}">
+      <div class="split-bar">${split.map(([w, n, c]) => `<i style="flex:${n};background:${c}" title="${esc(`${w}: ${n} call${n === 1 ? "" : "s"}`)}"></i>`).join("")}</div>
+      <div class="split-legend">${split.map(([w, n, c]) => `<span><i style="background:${c}"></i>${esc(w)} · ${n} call${n === 1 ? "" : "s"}</span>`).join("")}${avg?.runs > 1 ? `<span class="muted">avg ${avg.paidCalls.toFixed(1)} calls per request</span>` : ""}</div></div>` : "";
+  const receipts = paid.map((c) => {
+    const href = typeof c.explorer === "string" && /^https:\/\/sepolia\.basescan\.org\/tx\/0x[0-9a-f]+$/i.test(c.explorer) ? c.explorer : null;
+    return `<li>${esc(c.service)} · ${esc(c.priceUsdc)} test USDC${c.buyer ? ` · bought by ${esc(c.buyer)}` : ""} ${c.mock ? "(simulated)" : href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">View on chain ↗</a>` : ""}</li>`;
+  }).join("");
+  return `<section class="agent-trail" aria-label="How your agents handled this">
+    <div class="trail-head"><b>How your agents handled this</b><span>${[last?.ms != null ? `${vsAvg(last.ms, "total")} total` : "", paid.length ? plural(paid.length, "paid call") : ""].filter(Boolean).join(" · ")}</span></div>
+    <ol>${steps.map(([who, what, t]) => `<li><span class="dot" aria-hidden="true"></span><div><b>${esc(who)}</b><p>${esc(what)}</p></div>${t ? `<time>${esc(t)}</time>` : ""}</li>`).join("")}</ol>
+    ${splitBar}
+    ${receipts ? `<details class="chat-details"><summary>Receipts for the data the agents bought</summary><ul class="receipts">${receipts}</ul></details>` : ""}
+  </section>`;
+}
+// The headline of a payment answer: money saved and time saved against your bank wire, from the router's own analysis
+const daysText = (h) => (h >= 36 ? `${(h / 24).toFixed(1)} days sooner` : h >= 1 ? `${Math.round(h)} hours sooner` : h > -1 ? "About the same time" : `${Math.round(-h)} hours later`);
+function impactRow(d, q) {
+  const an = q?.analysis; if (!an?.baseline) return "";
+  const net = num(an.value?.customerNetSaving), gross = num(an.value?.customerSavings), ccy = String(an.value?.customerNetSaving ?? "").split(" ")[1] ?? "USD";
+  const hours = (Date.parse(an.baseline.arrivalUtc) - Date.parse(q.arrivalUtc)) / 3600e3;
+  if (!(net > 0.005) && hours < 1) return `<div class="save-hero neutral"><div><span>Compared with your bank wire</span><b>Your bank is the best route here</b><small>No cheaper or faster route met this payment’s deadline</small></div></div>`;
+  const share = num(q.sourceDebit) ? (net / num(q.sourceDebit)) * 100 : 0, bps = an.costVsMidBps ?? {};
+  return `<div class="save-hero">
+    <div><span>You save vs your bank wire</span><b>${esc(fmt(net))} ${esc(ccy)}</b><small>${gross > net ? `after Route402’s ${esc(money(an.value.platformFee))} fee · ` : ""}${share.toFixed(2)}% of the payment</small></div>
+    <div><span>Arrives</span><b>${esc(daysText(hours))}</b><small>${esc(whenUtc(q.arrivalUtc))} vs ${esc(whenUtc(an.baseline.arrivalUtc))}</small></div>
+    ${bps.plan != null && bps.bank != null ? `<div><span>Cost above the market rate</span><b>${(bps.plan / 100).toFixed(2)}% vs ${(bps.bank / 100).toFixed(2)}%</b><small>this route vs your bank</small></div>` : ""}
+  </div>`;
+}
+// What was searched and the math behind the decision, with this payment's own numbers
+function howWeGotHere(d, q) {
+  const an = q?.analysis; if (!an) return "";
+  const all = [an, ...(d.options ?? []).filter((o) => o.intentId && o.intentId !== d.intentId).map((o) => quote(o.intentId)?.data?.analysis).filter(Boolean)];
+  const routes = all.reduce((s, x) => s + (x.searched?.routes ?? 0), 0), eligible = all.reduce((s, x) => s + (x.searched?.eligible ?? 0), 0);
+  const rails = [...new Set(all.flatMap((x) => x.searched?.rails ?? []))], nets = [...new Set(all.flatMap((x) => x.searched?.networks ?? []))];
+  const excluded = {}; all.forEach((x) => Object.entries(x.searched?.excluded ?? {}).forEach(([k, n]) => { excluded[k] = (excluded[k] ?? 0) + n; }));
+  const T = typeof termsOf === "function" ? termsOf(q) : null, b = an.baseline, v = an.value ?? {}, m = an.model ?? {}, bps = an.costVsMidBps ?? {};
+  const src = String(q.sourceDebit).split(" ")[1], dest = q.recipient.ccy, fixedSource = q.amountType === "SOURCE_FIXED";
+  const transit = (iso) => Math.max(0, (Date.parse(iso) - Date.parse(an.plannedAtUtc ?? q.capturedAt)) / 86400e3);
+  const ourDays = transit(q.arrivalUtc), bankDays = b ? transit(b.arrivalUtc) : null, perDay = num(q.sourceDebit) * (m.costOfCashPct ?? 0) / 100 / 365;
+  const cash = bankDays != null && bankDays > ourDays ? perDay * (bankDays - ourDays) : 0;
+  const line = (k, v2) => `<div class="math-row"><span>${esc(k)}</span><b>${v2}</b></div>`;
+  return `<section class="how" aria-label="How we got here">
+    <div class="how-head"><b>How we got here</b><span>${routes} routes compared · ${eligible} qualified</span></div>
+    <div class="how-grid">
+      <div><span class="how-k">Where we searched</span><p>${esc(rails.join(", "))}${nets.length ? ` · ${nets.length} blockchain network${nets.length === 1 ? "" : "s"} (${esc(nets.join(", "))})` : ""}</p>
+        ${Object.keys(excluded).length ? `<p class="muted">Ruled out: ${Object.entries(excluded).map(([k, n]) => `${n} ${esc(k)}`).join(" · ")}</p>` : ""}</div>
+      <div><span class="how-k">Decision rule</span><p>${an.objective === "fastest" ? "Fastest arrival that meets the deadline" : an.objective === "cheapest" ? "Lowest total cost that meets the deadline" : "Lowest total cost plus the cost of money in transit"}, after the compliance and safety checks</p></div>
+    </div>
+    <div class="math">
+      ${line("Market rate", `1 ${esc(src)} = ${esc(Number(m.mid).toFixed(4))} ${esc(dest)} <small>${esc(m.midSource ?? "")}</small>`)}
+      ${T ? line("This route", `${esc(money(q.sourceDebit))} = ${esc(feesLine(T))} fees + ${esc(T.principal)} converted${T.converts ? ` at ${esc(T.rate)}` : ""}`) : ""}
+      ${bps.plan != null ? line("Cost above the market rate", `${(bps.plan / 100).toFixed(2)}% this route · ${bps.bank != null ? `${(bps.bank / 100).toFixed(2)}% your bank` : "no bank baseline"} <small>(what you pay − its value at the market rate) ÷ value at the market rate</small>`) : ""}
+      ${b ? line(fixedSource ? "Supplier receives" : "Your bank would charge", fixedSource ? `${esc(money(q.recipientNet))} here vs ${esc(money(b.recipientNet))} through your bank` : `${esc(money(b.sourceDebit))} vs ${esc(money(q.sourceDebit))} here`) : ""}
+      ${v.customerSavings ? line("Saving", `${esc(money(v.customerSavings))}${num(v.platformFee) ? ` − ${esc(money(v.platformFee))} Route402 fee = <strong>${esc(money(v.customerNetSaving))} you keep</strong> <small>${esc(v.feeRule ?? "")}</small>` : ""}`) : ""}
+      ${bankDays != null ? line("Money in transit", `${ourDays.toFixed(1)} days here vs ${bankDays.toFixed(1)} days by bank wire${cash > 0.5 ? ` · at your ${esc(m.costOfCashPct)}% cost of cash that is worth <strong>${esc(fmt(cash))} ${esc(src)}</strong> (amount × ${esc(m.costOfCashPct)}% ÷ 365 × ${(bankDays - ourDays).toFixed(1)} days)` : ""}`) : ""}
+    </div>
+  </section>`;
 }
 
 // Review action: the existing prepare-for-approval flow (creates payment requests; nothing moves until approvals are met)
@@ -270,17 +495,19 @@ const BADGE = { approve: ["", "Recommended"], review: ["warn", "Needs review"], 
 function proposal(d, a, index, current, withAction) {
   const opt = d.options?.find((o) => o.provider === d.chosen) ?? {}, [kind, badge] = BADGE[d.decision] ?? BADGE.hold;
   const qs = quote(d.intentId), q = qs?.data, name = draftName(d, q);
-  const head = `<div class="proposal-head"><b>${esc(opt.label ?? (d.chosen ? RAIL[d.chosen] ?? d.chosen : name))}</b><span class="badge ${kind}">${esc(badge)}</span></div>`;
+  const leg = q?.legs?.[0], tokenized = String(leg?.routeId ?? "").startsWith("tokenized:");   // your bank's quote can be its tokenized-deposit rail
+  const head = `<div class="proposal-head"><b>${esc(tokenized ? leg.label : opt.label ?? (d.chosen ? RAIL[d.chosen] ?? d.chosen : name))}</b><span class="badge ${kind}">${esc(badge)}</span></div>`;
   const reasons = (d.reasons ?? []).filter((r) => !r.startsWith("compared:"));
   if (!d.intentId) return `<section class="proposal held">${head}<p class="msg-text">${esc(name)}</p><ul class="reasons">${reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul></section>`;
   const amount = (label, value) => `<div class="amt"><span>${esc(label)}</span><b>${q ? money(value) : qs?.status === "error" ? "—" : `<i class="skel-line"></i>`}</b></div>`;
-  const rows = q ? [["Fees included", feesText(q)], ["Conversion", fxText(q)], ["Estimated arrival", `${whenUtc(q.arrivalUtc)}${q.plan === "split" ? ` · split across ${q.legs.length} routes` : ""}`]].filter(([, v]) => v) : [];
+  const rows = q ? [["Fees (already included)", feesText(q)], ["Exchange", fxText(q)], ["Estimated arrival", `${whenUtc(q.arrivalUtc)}${q.plan === "split" ? ` · split across ${q.legs.length} routes` : ""}`]].filter(([, v]) => v) : [];
   const timing = d.timing ?? {}, note = [q && q.recipient.maskedAccount !== "no account on file" ? `Saved ${q.recipient.ccy} details ${maskOf(q)}` : null,
     timing.deadlineUtc ? `Requested delivery: ${dayUtc(timing.deadlineUtc)}` : null, timing.latestStartUtc ? `Start by ${whenUtc(timing.latestStartUtc)}` : null].filter(Boolean).join(" · ");
   const alts = (d.options ?? []).filter((o) => o.provider !== d.chosen);
   return `<section class="proposal">${head}
-    <div class="amounts">${amount("TOTAL DEBIT · FEES INCLUDED", q?.sourceDebit)}${ICON("arrow-right", 18, "arrow")}${amount(`${name.toUpperCase()} RECEIVES · QUOTED`, q?.recipientNet)}</div>
+    <div class="amounts">${amount("You pay, fees included", q?.sourceDebit)}${ICON("arrow-right", 18, "arrow")}${amount(`${name} receives`, q?.recipientNet)}</div>
     ${qs?.status === "error" ? `<p class="msg-note">Quote details unavailable: ${esc(qs.error)}</p>` : ""}
+    ${impactRow(d, q)}
     <div class="divider"></div>
     ${rows.map(([k, v]) => `<div class="row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}
     ${note ? `<p class="proposal-note">${esc(note)}</p>` : ""}
@@ -288,7 +515,8 @@ function proposal(d, a, index, current, withAction) {
     ${withAction ? reviewAction(a, index, current, [d]) : ""}
   </section>
   ${alts.length ? `<div class="alts">${alts.map((o) => alternative(o, d, q)).join("")}</div>` : ""}
-  ${q ? `<p class="msg-note">${q.amountType === "SOURCE_FIXED" ? `All routes use the same ${esc(money(q.sourceDebit))} total debit.` : `All routes deliver ${esc(money(q.recipientNet))} to ${esc(name)}.`} Quotes are ${q.simulation ? "simulated" : "testnet"} and held until ${esc(utc(q.expiresAt))}. No verified reliability history is available.</p>` : ""}
+  ${howWeGotHere(d, q)}
+  ${q ? `<p class="msg-note">${q.amountType === "SOURCE_FIXED" ? `Every option below sends the same ${esc(money(q.sourceDebit))}; they differ in what ${esc(name)} receives.` : `Every option below delivers ${esc(money(q.recipientNet))} to ${esc(name)}; they differ in what you pay.`} These ${q.simulation ? "simulated" : "test-network"} prices hold until ${esc(utc(q.expiresAt))}.</p>` : ""}
   ${reasons.length ? `<details class="chat-details"><summary>Why the agent chose this route</summary><ul class="reasons">${reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul></details>` : ""}`;
 }
 function alternative(o, d, chosenQ) {
@@ -308,31 +536,6 @@ function alternative(o, d, chosenQ) {
   return `<details class="alt"><summary>${ICON("chevron-right", 14, "chev")}<div class="tradeoff"><b>${esc(title)}</b>${line ? `<span>${esc(line)}</span>` : ""}${small ? `<small>${esc(small)}</small>` : ""}</div></summary>
     <div class="alt-more">${o.riskWhy ? `<p>Risk ${esc(o.risk)}/5 · ${esc(o.riskWhy)}</p>` : ""}${o.costBps != null ? `<p>${(o.costBps / 100).toFixed(2)}% above mid-market</p>` : ""}
     ${bill ? `<a href="#/payments/new?bill=${esc(bill.id)}">Compare routes for ${esc(bill.id)} and choose a different one →</a>` : `<p>To use a different route, ask the agent with a fastest or cheapest preference.</p>`}</div></details>`;
-}
-
-// ------------------------------------------------------------------ "In this conversation" panel (the active draft only)
-function renderContext() {
-  const el = $("#chat-context-panel"); if (!el) return;
-  const draft = activeDraft();
-  const head = `<div class="ctx-head"><span class="eyebrow">IN THIS CONVERSATION</span><details class="menu"><summary aria-label="More actions">${ICON("more-horizontal", 16)}</summary>
-    <div class="menu-pop"><a href="#/payments">All payments</a><a href="#/payments/new">Manual payment</a><button type="button" data-new-chat>New conversation</button></div></details></div>`;
-  if (!draft) { el.innerHTML = `${head}<p class="ctx-empty">No payment draft yet. Ask the agent to plan a payment, or start a manual payment.</p>`; return; }
-  const { d, index, count } = draft, q = quote(d.intentId)?.data, req = requestFor(d), name = draftName(d, q), bill = billOf(d.payable);
-  const detail = (k, v, sub = "") => `<div class="ctx-detail"><span>${esc(k)}</span><b title="${esc(v.replace(/<[^>]+>/g, ""))}">${v}</b>${sub ? `<small>${esc(sub)}</small>` : ""}</div>`;
-  const prev = (STATE?.transfers ?? []).find((t) => t.supplier === name && t.reference !== d.payable && t.transferId !== req?.transferId);
-  el.innerHTML = `${head}
-    <span class="badge ${req ? (statusKind(req.status) === "ok" ? "" : "warn") : ""}">${esc(req ? statusText(req.status) : "Unsubmitted draft")}</span>
-    ${detail("Reference", req ? `<a href="#/payments/${esc(req.id)}">${esc(req.id)}</a>` : esc(q?.reference ?? d.payable))}
-    ${detail("Recipient", esc(name), q ? [COUNTRY[q.recipient.country] ?? q.recipient.country, q.recipient.ccy, maskOf(q)].filter(Boolean).join(" · ") : "")}
-    ${bill ? detail("Invoice", esc(bill.id), `${money(`${bill.amount} ${bill.ccy}`)} · due ${dayY(bill.dueUtc)}`) : ""}
-    ${q ? detail("Source", esc(q.sourceAccount)) : ""}
-    ${count > 1 ? `<p class="ctx-note">+ ${count - 1} more payment${count > 2 ? "s" : ""} in this plan</p>` : ""}
-    <div class="divider"></div>
-    <div class="ctx-block"><span class="eyebrow">QUOTE WINDOW</span>${q ? `<p>${esc(window_(q))} · <span data-exp="${esc(q.expiresAt)}">${leftText(q.expiresAt)}</span></p><small>Ask again for a fresh quote after expiry.</small>` : `<small>Loading quote…</small>`}</div>
-    <div class="divider"></div>
-    <div class="ctx-block"><span class="eyebrow">PREVIOUS PAYMENT</span>${prev ? `<p class="clip"><b title="${esc(prev.reference)}">${esc(prev.reference)}</b> · <b>${esc(statusText(prev.status))}</b></p><small>${money(prev.debit)} → ${money(prev.credit)}</small><small class="xs">${esc(prev.transferId)}${reqFor(prev.reference) ? ` · ${esc(reqFor(prev.reference).id)}` : ""}</small>` : `<small>No earlier transfer to ${esc(name)} in this workspace.</small>`}</div>
-    ${req ? "" : `<div class="divider"></div><button type="button" class="text-btn" data-close-draft="${index}">Close unsubmitted draft</button>
-    <small class="xs">Closes this draft only. It does not cancel an in-flight payment or move money.</small>`}`;
 }
 
 function prepareChat(index) {
