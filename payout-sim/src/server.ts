@@ -306,4 +306,4 @@ app.post("/quotes/preview", express.json(), (req, res) => {
 });
 
 const port = Number(process.env.PORT ?? 8403);
-if (process.env.PAYOUT_NO_LISTEN !== "1") app.listen(port, () => { console.log(`payout-sim on :${port} (simulated provider, labeled synthetic rates)`); resumeAll(); });
+if (process.env.PAYOUT_NO_LISTEN !== "1") app.listen(port, process.env.LOCAL_ROUTING === "1" ? "127.0.0.1" : "0.0.0.0", () => { console.log(`payout-sim on :${port} (simulated provider, labeled synthetic rates)`); resumeAll(); });

@@ -38,6 +38,7 @@ const savePaid = (m: Record<string, any>) => { mkdirSync("data", { recursive: tr
 const mask = (b: any) => { const a = String(b.iban ?? b.accountNumber ?? b.usdcWallet ?? "").replace(/\s+/g, ""); return a ? `${a.slice(0, 2)}•• •••• ${a.slice(-4)}` : "no account on file"; };
 
 export function mountUi(app: express.Express, port: number) {
+  C.reconcileApprovalPolicy();
   const self = async (method: string, p: string, body?: any, extra: Record<string, string> = {}) => {
     const r = await fetch(`http://127.0.0.1:${port}${p}`, { method, body: body ? JSON.stringify(body) : undefined,
       headers: { "content-type": "application/json", authorization: `Bearer ${process.env.ROUTER_TOKEN ?? "dev-token"}`, ...extra } });
@@ -51,9 +52,6 @@ export function mountUi(app: express.Express, port: number) {
       headers: { "content-type": "application/json", authorization: `Bearer ${process.env.X402_INTERNAL_TOKEN ?? ""}` } });
     const j: any = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error ?? `escrow HTTP ${r.status}`); return j;
   };
-  const local = (req: express.Request, res: express.Response, next: express.NextFunction) =>
-    ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "") ? next() : res.status(403).json({ error: "local only" });
-
   app.use("/app", browserSecurity, express.static(fileURLToPath(new URL("../../public/", import.meta.url))));
   app.get("/", browserSecurity, (_req, res) => res.redirect("/app/"));
   const ui = express.Router();
@@ -110,13 +108,16 @@ export function mountUi(app: express.Express, port: number) {
   // Prompt -> the Fetch.ai concierge (agents buy quotes + screens with x402, then approve/hold)
   ui.post("/ask", async (req, res) => {
     try { validateChatRequest(req.body); } catch (e: any) { return res.status(422).json({ error: e.message }); }
+    const companyId = loadLinked().input.company.companyId;
     try {
       const r = await fetch(`${process.env.AGENT_GATEWAY_URL ?? "http://127.0.0.1:8100"}/ask`, { method: "POST", signal: AbortSignal.timeout(280_000),
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ text: req.body.text, conversationId: req.body?.conversationId,
           conversationRevision: req.body?.conversationRevision, policy: req.body?.policy || undefined, tenantId: process.env.AGENT_TENANT ?? "demo-tenant",
           correlationId: `ui-${Date.now().toString(36)}`, serviceToken: process.env.AGENT_SERVICE_TOKEN ?? process.env.ROUTER_TOKEN ?? "dev-token" }) });
-      const answer: any = await r.json(); if (r.ok) recordUiReview(process.env.AGENT_TENANT ?? "demo-tenant", answer);
+      const answer: any = await r.json();
+      if (loadLinked().input.company.companyId !== companyId) return res.status(409).json({ status: "error", error: "The linked company changed during this request. Open a new chat." });
+      if (r.ok) recordUiReview(process.env.AGENT_TENANT ?? "demo-tenant", answer);
       res.status(r.ok ? 200 : 502).json(answer);
     } catch (e: any) { res.status(502).json({ status: "error", error: `agents not reachable (${e.cause?.code ?? e.message}): start workers.py and gateway.py` }); }
   });
@@ -157,7 +158,7 @@ export function mountUi(app: express.Express, port: number) {
     const u = need(req, res); if (!u) return;
     if (!C.can(u, "admin")) return res.status(403).json({ error: "admin only" });
     const p = { ...C.loadPolicy(), ...req.body }, before = C.loadPolicy();
-    p.dualApprovalOverUsd = Math.max(0, Number(p.dualApprovalOverUsd)); p.requoteTolerancePct = Math.max(0, Number(p.requoteTolerancePct));
+    p.dualApprovalOverUsd = C.loadPolicy().dualApprovalOverUsd; p.requoteTolerancePct = Math.max(0, Number(p.requoteTolerancePct));
     p.requireCallbackOnDetailsChange = !!p.requireCallbackOnDetailsChange; p.quoteValidMinutes = Math.min(14, Math.max(0, Number(p.quoteValidMinutes)));
     p.depegBandPct = Math.min(5, Math.max(0.01, Number(p.depegBandPct))); p.depegFailClosed = p.depegFailClosed !== false;
     p.issuerCapUsd = Math.max(0, Number(p.issuerCapUsd)); p.escrowDeadlineDays = Math.min(180, Math.max(0.0001, Number(p.escrowDeadlineDays)));
@@ -197,6 +198,7 @@ export function mountUi(app: express.Express, port: number) {
       if (prev && ["COMPLETED", "EXECUTING"].includes(prev.status)) { out.push({ payable: d.payable, skipped: `already ${prev.status.toLowerCase()}` }); continue; }
       if (Object.values(reqs).some((r) => r.payable === d.payable && !["REJECTED", "FAILED"].includes(r.status))) { out.push({ payable: d.payable, skipped: "already has an open payment request" }); continue; }
       const it = await self("GET", `/v1/intents/${d.intentId}`);
+      if (loadLinked().input.company.companyId !== co.companyId) return res.status(409).json({ error: "The linked company changed. Review the payment again." });
       if (!it?.intentId) { out.push({ payable: d.payable, skipped: "quote not found on this router: ask again" }); continue; }
       if (it.decision?.status !== "OK") { out.push({ payable: d.payable, skipped: "router has no eligible plan" }); continue; }
       const bill = l.input.payables.find((p) => p.id === d.payable), v: any = bill ? validate(bill.beneficiary) : { warnings: [] };
@@ -445,7 +447,9 @@ export function mountUi(app: express.Express, port: number) {
           currentBank: { label: bank.label, fxMarkupBps: bank.fxMarkupBps, wireFeeUsd: bank.wireFeeUsd, businessDays: bank.businessDays, measured: bank.measured },
           payments: [{ payable: bill.id, destCcy: bill.ccy, amount: budget ? Number(req.body.usd).toFixed(2) : bill.amount, amountType: budget ? "SOURCE_FIXED" : "RECIPIENT_FIXED",
             deadlineUtc: req.body?.due ?? bill.dueUtc, beneficiary: bill.beneficiary, reference: bill.id }] }) });
-      const answer: any = await r.json(); if (r.ok) recordUiReview(process.env.AGENT_TENANT ?? "demo-tenant", answer);
+      const answer: any = await r.json();
+      if (loadLinked().input.company.companyId !== l.input.company.companyId) return res.status(409).json({ status: "error", error: "The linked company changed. Review the payment again." });
+      if (r.ok) recordUiReview(process.env.AGENT_TENANT ?? "demo-tenant", answer);
       res.status(r.ok ? 200 : 502).json(answer);
     } catch (e: any) { res.status(502).json({ status: "error", error: `agents not reachable (${e.cause?.code ?? e.message}): start workers.py and gateway.py` }); }
   });

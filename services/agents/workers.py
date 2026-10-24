@@ -11,8 +11,10 @@ from uagents import Agent, Bureau, Context
 
 import backend
 import reasoning
-from addressbook import RESOLVER, WORKERS_PORT, LIQUIDITY, RECONCILIATION, COMPLIANCE, COMPLIANCE_SEED
-from guard import redact, USAGE
+from addressbook import RESOLVER, WORKERS_PORT, GATEWAY, ROUTING, EXECUTOR, LIQUIDITY, RECONCILIATION, COMPLIANCE, COMPLIANCE_SEED
+from guard import redact, USAGE, safe_id, RateLimiter
+from local_network import configure_local_network
+configure_local_network()
 from models import (RouteRequest, RouteResult, FundingCheckRequest, FundingCheckResult,
                     LiquidityRequest, LiquidityResult, ExecuteStepRequest, ExecuteStepResult,
                     ReconcileRequest, ReconcileResult, InvestigateRequest, InvestigateResult,
@@ -31,11 +33,27 @@ def log(ctx, corr, text):
     ctx.logger.info(redact(f"[{corr}] {text}"))
 
 
+_SENDERS = {"on_route": {GATEWAY}, "on_funding_check": {ROUTING}, "on_liquidity": {GATEWAY},
+            "on_execute": {GATEWAY}, "on_reconcile": {GATEWAY, EXECUTOR}, "on_investigate": {GATEWAY},
+            "on_screen": {ROUTING}, "on_procure": {GATEWAY}}
+_TENANTS = {v.strip() for v in os.getenv("ALLOWED_TENANTS", "demo-tenant").split(",") if v.strip()}
+_MESSAGES = RateLimiter(120)
+
+
 def guarded(handler):
     """Invalid IDs or tool failures produce a logged rejection, never a crash or a guessed answer."""
     @functools.wraps(handler)
     async def wrapper(ctx, sender, msg):
         try:
+            if sender not in _SENDERS.get(handler.__name__, set()):
+                raise ValueError("unauthorized agent sender")
+            if getattr(msg, "tenantId", None) not in _TENANTS:
+                raise ValueError("tenant not allowed")
+            safe_id(msg.correlationId, "correlationId")
+            if not _MESSAGES.allow(f"{sender}:{handler.__name__}"):
+                raise ValueError("agent message rate limit")
+            if isinstance(msg, ProcureRequest) and len(msg.payments) > 25:
+                raise ValueError("at most 25 payments per review")
             await handler(ctx, sender, msg)
         except Exception as e:  # noqa: BLE001
             USAGE.rejected[type(e).__name__] += 1

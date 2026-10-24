@@ -10,6 +10,7 @@ import asyncio
 asyncio.set_event_loop(asyncio.new_event_loop())   # Python 3.14: uAgents needs a loop to exist
 
 import json
+import re
 import hashlib
 import time
 from decimal import Decimal
@@ -18,6 +19,8 @@ from uagents import Agent, Context
 import backend
 import llm
 import reasoning
+from local_network import configure_local_network
+configure_local_network()
 from addressbook import RESOLVER, ROUTING, INVESTIGATION, LIQUIDITY, EXECUTOR, RECONCILIATION, COMPLIANCE, GATEWAY_PORT
 from guard import RateLimiter, JobDedupe, USAGE, safe_id, redact
 from models import (ParseBody, ParseResult, RouteJobBody, InvestigateBody, LiquidityBody, ExecuteBody,
@@ -114,6 +117,14 @@ def spent(paid):
 
 
 async def concierge_ask(ctx, tenant, corr, text, policy=None, conversation_id=None, conversation_revision=None) -> AskResult:
+    if not isinstance(text, str) or not text.strip() or len(text) > 500:
+        return AskResult(correlationId=corr, status="error", error="Use a message between 1 and 500 characters")
+    if conversation_id is not None and (not isinstance(conversation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", conversation_id)):
+        return AskResult(correlationId=corr, status="error", error="Invalid conversation ID")
+    if conversation_revision is not None and (type(conversation_revision) is not int or conversation_revision < 0):
+        return AskResult(correlationId=corr, status="error", error="Invalid conversation revision")
+    if policy is not None and policy not in ("cheapest", "fastest", "lowest_risk"):
+        return AskResult(correlationId=corr, status="error", error="Invalid routing policy")
     policy = reasoning.policy_from_text(text, policy)
     try:
         r = await backend.assistant_ask(tenant, corr, text, conversation_id, conversation_revision)
@@ -148,7 +159,7 @@ async def ask(ctx: Context, req: AskBody) -> AskResult:
     err = check(req, "ask")
     if err:
         return AskResult(correlationId=req.correlationId, status="error", error=err)
-    return await concierge_ask(ctx, req.tenantId, req.correlationId, req.text[:500], req.policy, req.conversationId, req.conversationRevision)
+    return await concierge_ask(ctx, req.tenantId, req.correlationId, req.text, req.policy, req.conversationId, req.conversationRevision)
 
 
 @gateway.on_rest_post("/review", ReviewBody, AskResult)
@@ -353,7 +364,7 @@ if CHAT:
         else:
             ctx.logger.info(redact(f"[{corr}] chat from {sender[:16]}...: {text[:120]}"))
             conversation_id = "fetch_" + hashlib.sha256(sender.encode()).hexdigest()[:32]
-            answer = format_answer(await concierge_ask(ctx, CHAT_TENANT, corr, text[:500], conversation_id=conversation_id))
+            answer = format_answer(await concierge_ask(ctx, CHAT_TENANT, corr, text, conversation_id=conversation_id))
         await ctx.send(sender, ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(),
                                            content=[TextContent(type="text", text=answer),   # parts redacted above; tx links kept
                                                     EndSessionContent(type="end-session")]))

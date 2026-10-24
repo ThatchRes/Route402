@@ -432,7 +432,7 @@ app.post("/v1/company/beneficiaries/validate", (req, res) => safe(res, () => (Ar
 
 const port = Number(process.env.ROUTER_PORT ?? 8404);
 if (process.env.ROUTER_NO_LISTEN !== "1") {
-  app.listen(port, () => console.log(`router on :${port} (optimizer + orchestration; market data: ${MARKET.mode}${process.env.LOCAL_ROUTING === "1" ? "; LOCAL simulation" : ""})`));
+  app.listen(port, process.env.LOCAL_ROUTING === "1" ? "127.0.0.1" : "0.0.0.0", () => console.log(`router on :${port} (optimizer + orchestration; market data: ${MARKET.mode}${process.env.LOCAL_ROUTING === "1" ? "; LOCAL simulation" : ""})`));
   // Recover scheduled work, but never replay an in-flight funding or payout request after a restart.
   update((db) => { for (const t of Object.values(db.transfers)) if (t.status === "EXECUTING") {
     t.status = "NEEDS_RECONCILIATION"; t.history.push({ at: now(), status: t.status, note: "router restarted; inspect existing evidence before any further send" });

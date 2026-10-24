@@ -3,6 +3,7 @@
 export function unsafeInstruction(text: string) {
   const t = text.normalize("NFKC").replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "");
   return /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(t)
+    || /^(?:(?:please|can you|could you)\s+)?(?:approve|execute|release|refund|delete|mark (?:as )?(?:paid|delivered))\b/i.test(t)
     || /\b(?:ignore|disregard|forget|override|bypass|disable|skip)\b.{0,70}\b(?:instructions?|rules?|checks?|approvals?|controls?|policy|policies|screens?|safety|security|limits?)\b/is.test(t)
     || /\b(?:system|developer)\s*(?:prompt|message)\b|\byou are now\b|\b(?:reveal|print|show|read|send|export)\b.{0,50}\b(?:secrets?|private keys?|api keys?|service tokens?|environment variables?|\.env)\b/is.test(t)
     || /<\/?(?:system|developer|assistant|tool)\b|\[INST\]|\[\/?SYSTEM\]|(?:^|\n)\s*(?:system|developer|assistant|tool)\s*:/i.test(t);
