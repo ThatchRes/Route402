@@ -6,6 +6,7 @@ import { createHash, randomBytes, randomInt } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { ConditionSpec } from "./conditions.js";
 import type { DocCheck, DocumentaryTerms } from "./documents.js";
+import type { Alert } from "./monitoring.js";
 import type { TokenizedConfig } from "../router/tokenized.js";
 import { DEFAULT_COMPLIANCE, STABLECOINS, type Check, type CompliancePolicy } from "../router/compliance.js";
 import { DEFAULT_ADAPTIVE_EXPOSURE, type AdaptiveExposurePolicy } from "../router/exposure.js";
@@ -131,6 +132,8 @@ export interface PaymentRequest {
   status: ReqStatus; note?: string; transferId?: string; proof?: string;
   documentary?: { terms: DocumentaryTerms; presentations: { by: string; at: string; eblRef: string; platform: string; ok: boolean; checks: DocCheck[]; simulated: boolean }[] };
   compliance?: { checkedAt: string; checks: Check[]; travelRule?: any };
+  alerts?: Alert[]; alertsReviewed?: { by: string; at: string };   // transaction-monitoring alerts (company/monitoring.ts)
+  platformFee?: string; feeRule?: string;  // Route402's fee for this payment, charged separately from the transfer
   escrow?: { chain: string; contract: string; lockId: string; amountUsdc: number; deadline: string; state: "LOCKING" | "LOCKED" | "RELEASED" | "REFUNDED" | "FAILED";
     lockTx?: string; releaseTx?: string; refundTx?: string; explorer?: string | null; error?: string };
 }

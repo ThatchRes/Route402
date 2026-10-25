@@ -42,6 +42,17 @@ function termsOf(q) {
     converts: !(fundedCcy === dest && q.legs.every((l) => Number(l.fxRate) === 1)) };
 }
 const feesLine = (T) => [T.transferFee, T.payoutFee].filter(Boolean).join(" + ");
+// Route402's own fee is not part of the transfer debit: it is shown on its own line wherever the amount is approved or reported
+const feeText = (fee) => (fee == null ? null : num(fee) > 0 ? `${money(fee)}, charged separately` : "None on this payment");
+const feeRow = (fee, rule) => (fee == null ? "" : `${drow("Route402 fee", feeText(fee))}${rule ? `<p class="note10">Route402 fee: ${esc(rule)}.</p>` : ""}`);
+// Transaction-monitoring alerts raised when the request was prepared (company/monitoring.ts)
+const reviewAlerts = (r) => (r.alerts ?? []).filter((a) => a.severity === "review");
+function alertsBlock(r) {
+  if (!r.alerts?.length) return "";
+  return `<div class="divider"></div><div class="breakdown"><h3>Monitoring alerts</h3>
+    <ul class="doc-checks">${r.alerts.map((a) => `<li class="${a.severity === "review" ? "warn" : "ok"}"><b>${a.severity === "review" ? "!" : "i"} ${esc(a.severity === "review" ? "Review" : "Note")}</b><span>${esc(a.detail)}</span></li>`).join("")}</ul>
+    <p class="note10">${r.alertsReviewed ? `Reviewed by ${esc(nameOf(r.alertsReviewed.by))} · ${esc(tUtc(r.alertsReviewed.at))}.` : reviewAlerts(r).length ? "The approver must acknowledge these before approving." : "For the approver's information."}</p></div>`;
+}
 const fxFmt = (r) => Number(r).toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 });
 // One masked-account format across screens: the supplier directory's, falling back to the quote's
 const maskedFor = (name, fallback) => supplierByName(name)?.maskedAccount ?? fallback ?? "—";
@@ -303,6 +314,7 @@ function reviewDocument({ q, T, supplier, invoice, ref, purpose, due, routeLabel
       ${drow("Transfer fee", T.transferFee)}${T.payoutFee ? drow("Payout fee", T.payoutFee) : ""}${drow("Total fees (already in what you pay)", feesLine(T))}
       ${drow("Amount converted", T.principal)}${T.converts ? drow(`${q.simulation ? "Simulated" : "Quoted"} exchange rate`, `1 ${T.fundedCcy} = ${T.rate} ${T.dest}`) : ""}
       ${drow(`They receive${T.converts ? ` · ${T.principal.split(" ")[0]} × ${T.rate}` : ""}`, money(q.recipientNet))}
+      ${feeRow(q.platformFee, q.feeRule)}
       <p class="note10">The provider’s margin is built into the exchange rate, so there is no separate conversion fee. We assume the supplier’s bank takes nothing extra${q.simulation ? " (simulated prices)" : ""}.</p></div>
     <div class="divider"></div>
     <div class="route2"><div class="route2-head"><span>${IC("landmark", 18)}<b>${esc(routeLabel)}</b></span>${changeHref ? `<a class="text-btn" href="${changeHref}">Change route</a>` : `<span class="note11">Route fixed at submission</span>`}</div>
@@ -349,6 +361,7 @@ async function pageReview(P) {
         ${detail("Preparer", ME ? `${esc(ME.name)} · ${esc(ME.title)}` : "Sign in to submit")}
         ${detail("Approval needed", `${two ? `Two approvers (over ${usd(POLICY.dualApprovalOverUsd)})` : "One approver"} other than you${dec.decision === "review" ? " · call-back first" : ""}`)}
         ${detail("You pay", `${money(q.sourceDebit)}, including ${esc(feesLine(T))} fees`)}
+        ${q.platformFee != null ? detail("Route402 fee", esc(feeText(q.platformFee))) : ""}
         ${detail(q.amountType === "SOURCE_FIXED" ? "They receive (estimate)" : "They receive", money(q.recipientNet))}
         ${agentTrail(DRAFT.agent ?? {})}
         <div class="divider"></div>
@@ -396,15 +409,17 @@ async function pageApprove(P, r, q) {
         ${detail("Approvals", `${r.approvals.length} of ${r.approvalsRequired}`, r.approvals.map((a) => `${esc(nameOf(a.by))} · ${esc(tUtc(a.at))}`).join("<br>"))}
         ${detail("Prepared by", `${esc(nameOf(r.preparedBy))}`, esc(tUtc(r.preparedAt)))}
         ${detail("You pay", q ? `${money(q.sourceDebit)}, including ${esc(feesLine(T))} fees` : usd(r.debitUsd, 2))}
+        ${(r.platformFee ?? q?.platformFee) != null ? detail("Route402 fee", esc(feeText(r.platformFee ?? q?.platformFee))) : ""}
         ${detail(q?.amountType === "SOURCE_FIXED" ? "They receive (estimate)" : "They receive", money(q?.recipientNet ?? r.recipientGets))}
         <div class="divider"></div>
         ${s === "NEEDS_CALLBACK" ? notice(esc(cbNote(r.detailsNote)), "warn") : ""}
         ${A.callback?.allowed ? `<button class="btn-line" data-act="callback">Record call-back</button>` : ""}
+        ${s === "AWAITING_APPROVAL" && reviewAlerts(r).length && !r.alertsReviewed ? `${notice(`${reviewAlerts(r).length} monitoring alert${reviewAlerts(r).length === 1 ? "" : "s"} to review: ${esc(reviewAlerts(r).map((a) => a.detail).join("; "))}.`, "warn")}${ack("ok-alerts", "I’ve reviewed the monitoring alerts on this payment.")}` : ""}
         ${s === "AWAITING_APPROVAL" ? `${ack("ok", `I’ve checked the beneficiary, invoice, fees and delivery estimate. I understand this approves ${STATE.localSimulation ? "simulated" : "testnet"} execution only.`)}
           <button class="btn-solid" id="approve" ${ready ? "" : "disabled"}>Approve payment ${IC("check-white-15", 15)}</button>` : ""}
         ${why ? `<p class="note11 bad">${esc(why)}</p>` : ""}${!ME ? `<button class="btn-line" id="ap-signin">Sign in</button>` : ""}
         <div id="act-form"></div>
-        ${complianceBlock(r)}
+        ${alertsBlock(r)}${complianceBlock(r)}
         <p class="note10">${s === "NEEDS_CALLBACK" ? "Approval opens once someone other than the preparer records the call-back." : "Only this action approves."} ${r.approvalsRequired > 1 ? "Two different approvers are required before release. " : ""}Reading this review does not approve or send a payment.</p>
         ${A.reject?.allowed ? `<button class="text-btn danger" data-act="reject">Reject payment</button>` : ""}
         <div class="divider"></div>
@@ -415,7 +430,7 @@ async function pageApprove(P, r, q) {
   $$("[data-act]").forEach((x) => x.onclick = () => act(r, x.dataset.act, P));
   $("#ap-signin")?.addEventListener("click", () => signIn(route));
   $("#approve")?.addEventListener("click", () => {
-    if (!$("#ok").checked) { $("#act-form").innerHTML = `<p class="note11 bad">Tick the confirmation first.</p>`; return; }
+    if (!$("#ok").checked || ($("#ok-alerts") && !$("#ok-alerts").checked)) { $("#act-form").innerHTML = `<p class="note11 bad">Tick ${$("#ok-alerts") ? "both confirmations" : "the confirmation"} first.</p>`; return; }
     $("#approve").disabled = true; act(r, "approve", P);
   });
 }
@@ -656,8 +671,9 @@ async function pageTracking(P, id) {
         <div class="breakdown"><h3>Transfer details</h3>
           <div class="pair">${detail("Requested delivery", esc(dUtcY(r.timing?.deadlineUtc)))}${detail(credited ? "Recipient credited" : "Estimated arrival", esc(credited ? tUtc(credited) : dUtcY(arrival)))}</div>
           <div class="pair">${detail("Fees (already included)", esc(fees ?? "—"))}${detail("Exchange at approval", esc(conv ?? "—"))}</div>
+          ${(r.platformFee ?? q?.platformFee) != null ? `<div class="pair">${detail("Route402 fee", esc(feeText(r.platformFee ?? q?.platformFee)))}${detail("Fee rule", esc(r.feeRule ?? q?.feeRule ?? "—"))}</div>` : ""}
           <p class="note10">${t?.approval ? `Approved ${esc(tUtc(t.approval.at))}; the amounts are locked to what was approved (terms ${esc(t.termsHash.slice(0, 8))})` : `Prepared ${esc(tUtc(r.preparedAt))}`}${t?.deadlineStatus ? ` · deadline ${esc(String(t.deadlineStatus).toLowerCase())}` : ""}. We assume the supplier’s bank takes nothing extra.</p></div>
-        ${exposureNote(q)}${documentsBlock(r)}${complianceBlock(r)}
+        ${exposureNote(q)}${documentsBlock(r)}${alertsBlock(r)}${complianceBlock(r)}
       </section>
       <aside class="doc-aside w310" aria-label="Recipient and audit">
         <span class="eyebrow">RECIPIENT</span><h2 class="serif26">${esc(r.supplier)}</h2>
