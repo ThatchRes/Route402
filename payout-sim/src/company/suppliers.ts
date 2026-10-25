@@ -32,7 +32,7 @@ export function addSupplier(l: Linked, draft: SupplierDraft, details: Record<str
   decimals(currency);
   if (supplierRecords(l).some((b) => b.name.trim().toLowerCase() === name.toLowerCase())) throw new Error("A supplier with this name already exists; choose the existing supplier");
   const beneficiary: Beneficiary = { id: `supplier_${randomUUID()}`, name, country, currency };
-  for (const key of ["iban", "swift", "accountNumber", "routing", "usdcWallet"] as const) {
+  for (const key of ["iban", "swift", "accountNumber", "routing", "usdcWallet", "street", "city", "postcode"] as const) {
     const value = details[key]; if (value != null && typeof value !== "string") throw new Error(`Invalid ${key}`);
     if (value) { if (String(value).length > 100) throw new Error(`Invalid ${key}`); beneficiary[key] = String(value).trim(); }
   }

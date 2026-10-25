@@ -1,7 +1,8 @@
 // Beneficiary validation BEFORE sending: catches the details that cause returns (return fees, double FX, delays).
 // Format checks only; a production version adds account-name verification and sanctions screening via a provider.
 export interface Beneficiary { id: string; name: string; country: string; currency: string; iban?: string; swift?: string; accountNumber?: string; routing?: string;
-  usdcWallet?: string }   // supplier accepts USDC at this address (USD-invoiced suppliers)
+  usdcWallet?: string;    // supplier accepts USDC at this address (USD-invoiced suppliers)
+  street?: string; city?: string; postcode?: string }   // supplier's address: ISO 20022 structured address and Travel Rule
 import { detailsChanged } from "./payees.js";
 const IBAN_OPTIONAL = new Set(["BR"]);   // IBAN exists but local account details are common
 

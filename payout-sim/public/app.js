@@ -379,7 +379,7 @@ const txLink = (e, tx) => (e.explorer && tx ? `<a href="${esc(e.explorer.replace
 async function act(r, kind, P) {
   if (!ME) return signIn(route);
   const f = $("#act-form"), send = async (p, body) => { try { await api(`/requests/${r.id}/${p}`, body); await route(); } catch (e) { f.innerHTML = `<div class="alert bad">${esc(e.message)}</div>`; } };
-  if (kind === "approve") return send("approve", {});
+  if (kind === "approve") return send("approve", { alertsReviewed: !!$("#ok-alerts")?.checked });
   if (kind === "recheck") return send("recheck", {});
   if (kind === "refund") return send("refund", {});
   const form = (fields, label, p, map, cls = "primary") => { f.innerHTML = `<div class="inline-form">${fields.map(([k, ph]) => `<input id="f-${k}" placeholder="${esc(ph)}" />`).join("")}<button class="btn sm ${cls}" id="f-go">${label}</button></div>`; $("#f-go").onclick = () => send(p, map()); };
@@ -406,12 +406,22 @@ async function pageActivity(P) {
   <div class="duo wide-left"><div class="panel2 scroll"><div class="ctrl" style="margin-top:0"><span class="label accent">Payment events</span>${a.verify.ok ? pill("ok", `Log intact · ${a.verify.entries} entries verified`) : pill("bad", `Log altered at entry ${a.verify.brokenAt}`)}</div>
       <table class="tbl compact"><thead><tr><th>#</th><th>When</th><th>Who</th><th>Event</th><th>Detail</th></tr></thead><tbody>${a.entries.map((e) => `<tr><td class="mono">${e.seq}</td><td>${when(e.at)}</td><td>${esc(nameOf(e.actor))}</td><td><b>${esc(e.action.replaceAll("_", " "))}</b></td>
         <td class="note">${esc(e.detail)}<div class="mono">#${esc(e.hash.slice(0, 12))}</div></td></tr>`).join("") || `<tr><td colspan="5" class="muted">No activity yet</td></tr>`}</tbody></table></div>
-    <div><div class="panel2"><span class="label accent">Reading the audit trail</span><h2 style="margin:6px 0">How to trust this log</h2><ul class="reasons">
+    <div>${alertsPanel()}<div class="panel2"><span class="label accent">Reading the audit trail</span><h2 style="margin:6px 0">How to trust this log</h2><ul class="reasons">
         <li>Each entry stores the fingerprint (SHA-256) of the entry before it. Changing or deleting any past entry breaks every fingerprint after it, and the badge turns red.</li>
         <li>"Route402" entries are automatic: re-quotes, safety pauses, escrow locks and releases, settlement.</li><li>Escrow and x402 entries carry transaction hashes you can check on the chain they name.</li>
         <li>Known limit: whoever controls this server could rewrite the whole chain consistently. Anchoring the latest fingerprint on a public chain would close that gap.</li></ul></div>
       <div class="panel2 scroll"><span class="label accent">Data the agents paid for (x402)</span><p class="small muted">${esc(c.spentUsdc ? `${c.spentUsdc} of ${c.capUsdc} test USDC` : c.note ?? "")}</p>
         <table class="tbl compact"><tbody>${(c.calls ?? []).slice(-15).reverse().map((x) => `<tr><td>${new Date(x.at).toLocaleTimeString()}</td><td>${esc(x.service)}</td><td>${x.transaction ? `<a class="mono" href="https://sepolia.basescan.org/tx/${esc(x.transaction)}" target="_blank" rel="noopener">${esc(x.transaction.slice(0, 10))}… ↗</a>` : esc(x.status)}</td></tr>`).join("") || `<tr><td class="muted">No paid calls yet</td></tr>`}</tbody></table></div></div></div>${foot()}`;
+}
+
+// Monitoring alerts across payment requests: review alerts the approver has not yet acknowledged come first
+function alertsPanel() {
+  const rows = REQS.filter((r) => r.alerts?.length).map((r) => ({ r, open: !r.alertsReviewed && r.alerts.some((a) => a.severity === "review") && !["REJECTED", "FAILED"].includes(r.status) }))
+    .sort((a, b) => b.open - a.open).slice(0, 12);
+  return `<div class="panel2 scroll"><span class="label accent">Monitoring alerts</span>
+    <p class="small muted">Raised when a payment is prepared: new payee or country, changed bank details, repeated payments, amounts just under a threshold. An approver reviews each one; suspicious-activity reports go through the licensed partner.</p>
+    <table class="tbl compact"><tbody>${rows.map(({ r, open }) => `<tr><td>${open ? pill("warn", "To review") : pill("ok", r.alertsReviewed ? "Reviewed" : "Noted")}</td>
+      <td><a href="#/payments/${esc(r.id)}"><b>${esc(r.supplier)}</b></a><div class="note">${esc(r.alerts.map((a) => a.detail).join(" · "))}</div></td></tr>`).join("") || `<tr><td class="muted">No alerts</td></tr>`}</tbody></table></div>`;
 }
 
 // ------------------------------------------------------------------ modals: sign-in, policy, connect, sources
@@ -447,6 +457,13 @@ $("#open-policy").addEventListener("click", () => {
       <td>${u.roles.includes("approver") ? (u.approvalLimitUsd ? usd(u.approvalLimitUsd) : "No limit") : "Cannot approve"}</td></tr>`).join("")}</tbody></table>
     <div style="text-align:right;margin-top:14px"><button class="btn ghost" id="m-x">Close</button></div>`);
   $("#m-x").onclick = closeModal;
+  $("#kyb-save")?.addEventListener("click", async () => {
+    const v = (n) => $(`[name="${n}"]`)?.value ?? "";
+    try { await api("/kyb", { status: v("k_status"), provider: v("k_provider"), caseRef: v("k_case"), legalName: v("k_name"), registrationNumber: v("k_reg"), country: v("k_country"),
+        street: v("k_street"), city: v("k_city"), postcode: v("k_post"), verifiedAt: v("k_date"), beneficialOwnersVerified: $("[name=k_ubo]").checked });
+      await loadAll(); $("#kyb-out").innerHTML = `<div class="alert ok">KYB result recorded and logged.</div>`;
+    } catch (err) { $("#kyb-out").innerHTML = `<div class="alert bad">${esc(err.message)}</div>`; }
+  });
   $("#issuer-default").oninput = (e) => {
     $$("[data-issuer-cap]").forEach((input) => { input.placeholder = `Default: ${e.target.value}`; });
   };
@@ -462,7 +479,9 @@ $("#open-policy").addEventListener("click", () => {
     body.tokenized = f.get("tk_network") ? { network: f.get("tk_network"), currencies: f.get("tk_currencies"), countries: f.get("tk_countries"), fxMarginBps: f.get("tk_fx"),
       feeUsd: f.get("tk_fee"), settlementMinutes: f.get("tk_minutes"), tariffSource: f.get("tk_source") } : null;
     body.compliance = { geniusEnforceFrom: f.get("c_from"), geniusPermittedTokens: f.get("c_tokens"), blockedCountries: f.get("c_blocked"),
-      travelRuleThresholdUsd: Number(f.get("c_travel")), micaForEea: f.get("c_mica") === "on", requireWalletScreening: f.get("c_screen") === "on" };
+      travelRuleThresholdUsd: Number(f.get("c_travel")), micaForEea: f.get("c_mica") === "on", requireWalletScreening: f.get("c_screen") === "on",
+      requireNameScreening: f.get("c_names") === "on", requirePartnerAgreements: f.get("c_partners") === "on", requireKyb: f.get("c_kyb") === "on",
+      partnerAgreements: Object.fromEntries([...e.target.querySelectorAll("[data-ramp]")].map((i) => [i.dataset.ramp, i.value.trim()]).filter(([, v]) => v)) };
     try { POLICY = await api("/policy", body); await loadAll(); $("#pol-out").innerHTML = `<div class="alert ok">Saved and logged.</div>`; } catch (err) { $("#pol-out").innerHTML = `<div class="alert bad">${esc(err.message)}</div>`; } };
 });
 function policyIssuerCaps(dis) {
@@ -525,7 +544,24 @@ function policyTokenized(dis) {
     <div class="field"><label class="label">Where the tariff comes from</label>${input("tk_source", c.tariffSource, "e.g. bank fee schedule, Oct 2026", "width:100%")}</div>
     ${(t.catalog ?? []).map((n) => `<p class="note">• <a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.label)}</a>: ${esc(n.status)}</p>`).join("")}</fieldset>`;
 }
+// The partner of record runs KYB; an admin records its result here (Route402 never marks a company verified by itself)
+function kybFields(dis) {
+  const k = STATE?.compliance?.kyb ?? {}, p = STATE?.compliance?.policy ?? {}, a = k.address ?? {};
+  const inp = (n, v, ph, extra = "") => `<div class="field"><label class="label">${esc(ph)}</label><input name="${n}" value="${esc(v ?? "")}" placeholder="${esc(ph)}" ${extra} ${dis} /></div>`;
+  return `<div class="pol-sec" style="margin-top:10px"><b>Company verification (KYB)</b>
+    <p class="note">${k.status ? `${esc(k.status === "verified" ? "Verified" : k.status === "pending" ? "Pending" : "Rejected")} by ${esc(k.provider)} · case ${esc(k.caseRef)} · recorded by ${esc(nameOf(k.recordedBy))} ${esc(when(k.recordedAt))}` : "No KYB result recorded. The licensed partner of record verifies the company, its beneficial owners and signers; record its result here."}</p>
+    <div class="field"><label><input type="checkbox" name="c_kyb" ${p.requireKyb ? "checked" : ""} ${dis} /> Block new payment requests until a verified KYB result is recorded</label></div>
+    <div class="pol-grid">
+      <div class="field"><label class="label">Partner's result</label><select name="k_status" ${dis}>${["", "verified", "pending", "rejected"].map((x) => `<option value="${x}" ${k.status === x ? "selected" : ""}>${x || "Choose…"}</option>`).join("")}</select></div>
+      ${inp("k_provider", k.provider, "KYB partner")}${inp("k_case", k.caseRef, "Partner case reference")}${inp("k_name", k.legalName, "Legal name")}
+      ${inp("k_reg", k.registrationNumber, "Registration number (EIN or company no.)")}${inp("k_country", k.country, "Country of registration (2 letters)", 'maxlength="2"')}
+      ${inp("k_street", a.street, "Registered street address")}${inp("k_city", a.city, "Town / city")}${inp("k_post", a.postcode, "Postcode")}
+      <div class="field"><label class="label">Verified on</label><input type="date" name="k_date" value="${esc(k.verifiedAt ?? "")}" ${dis} /></div></div>
+    <div class="field"><label><input type="checkbox" name="k_ubo" ${k.beneficialOwnersVerified ? "checked" : ""} ${dis} /> The partner verified the beneficial owners (25%+ owners and one controlling person)</label></div>
+    ${dis ? "" : `<button type="button" class="btn sm" id="kyb-save">Record KYB result</button>`}<div id="kyb-out"></div></div>`;
+}
 function policyCompliance(dis) {
+  const scr = STATE?.compliance?.screening ?? { mode: "none" };
   const p = STATE?.compliance?.policy ?? {}, input = (n, v, ph) => `<input name="${n}" value="${esc(v ?? "")}" placeholder="${esc(ph)}" ${dis} />`;
   return `<fieldset class="pol-sec"><legend>Compliance rules</legend>
     <p class="note">Checked before a route is quoted and again before money moves. These are company settings, not legal advice: have counsel confirm them.</p>
@@ -536,6 +572,11 @@ function policyCompliance(dis) {
       <div class="field"><label class="label">Travel Rule threshold (USD)</label>${input("c_travel", p.travelRuleThresholdUsd, "3000")}</div></div>
     <div class="field"><label><input type="checkbox" name="c_mica" ${p.micaForEea !== false ? "checked" : ""} ${dis} /> EU/EEA suppliers: only MiCA-authorized e-money tokens</label></div>
     <div class="field"><label><input type="checkbox" name="c_screen" ${p.requireWalletScreening !== false ? "checked" : ""} ${dis} /> Never pay a supplier wallet that could not be sanctions-screened</label></div>
+    <div class="field"><label><input type="checkbox" name="c_names" ${p.requireNameScreening ? "checked" : ""} ${dis} /> Hold any payment whose supplier name could not be sanctions-screened</label>
+      <p class="note">${scr.mode === "list" ? `Screening against ${fmt(scr.names, 0)} listed names loaded from the company's sanctions list files.` : scr.mode === "service" ? "Screening through the OpenSanctions match service." : "No sanctions list is loaded: set SANCTIONS_LIST_PATH to OFAC's SDN.CSV (and ALT.CSV, CONS_PRIM.CSV) or OPENSANCTIONS_API_KEY. Until then every payment shows “not screened”."}</p></div>
+    <div class="field"><label><input type="checkbox" name="c_partners" ${p.requirePartnerAgreements ? "checked" : ""} ${dis} /> Use a stablecoin payout only through an operator we have a signed agreement with</label></div>
+    <div class="pol-grid">${(STATE?.compliance?.offramps ?? []).map((o) => `<div class="field"><label class="label">${esc(o.label)}</label><input data-ramp="${esc(o.id)}" value="${esc(p.partnerAgreements?.[o.id] ?? "")}" placeholder="Licensed operator and agreement ref" maxlength="120" ${dis} /></div>`).join("")}</div>
+    ${kybFields(dis)}
     <p class="note"><a href="/ui/compliance/tax-report.csv" download>Download the digital-asset tax report (CSV) ↓</a> · fields for Form 1099-DA and CARF/DAC8 reporting</p></fieldset>`;
 }
 function showSources() {

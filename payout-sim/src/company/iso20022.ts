@@ -10,7 +10,12 @@ export interface Pain001Input {
   msgId: string; createdAt: string; debtorName: string; debtorAccountRef: string; executionDate: string;
   endToEndId: string; amount: string; ccy: string; beneficiary: Beneficiary; invoiceRef: string;
   condition?: { kind: string; evidence: string } | null;
+  debtorAddress?: { street?: string; city?: string; postcode?: string; country?: string };   // registered address from KYB
 }
+// Structured postal address (PostalAddress24, schema order). Swift CBPR+ stops accepting fully unstructured addresses in
+// November 2026; town and country are the minimum, and the Travel Rule asks for the full address.
+const pstl = (a: { street?: string; city?: string; postcode?: string; country?: string }) =>
+  `<PstlAdr>${a.street ? `<StrtNm>${x(a.street)}</StrtNm>` : ""}${a.postcode ? `<PstCd>${x(a.postcode)}</PstCd>` : ""}${a.city ? `<TwnNm>${x(a.city)}</TwnNm>` : ""}${a.country ? `<Ctry>${x(a.country)}</Ctry>` : ""}</PstlAdr>`;
 
 /** Fields a supplier record needs before a payment can be sent on ANY rail; what is missing is listed. */
 export function readiness(b: Beneficiary) {
@@ -19,6 +24,7 @@ export function readiness(b: Beneficiary) {
   if (!b.country) missing.push("creditor country");
   if (!b.iban && !b.accountNumber && !b.usdcWallet) missing.push("creditor account");
   if (!b.iban && !b.swift && !b.routing && !b.usdcWallet) missing.push("creditor bank identifier (BIC or routing)");
+  if (!b.city) missing.push("creditor town (structured address)");
   return { complete: missing.length === 0, missing };
 }
 
@@ -39,14 +45,14 @@ export function pain001(p: Pain001Input): string {
     <PmtInf>
       <PmtInfId>${x(p.msgId)}-1</PmtInfId><PmtMtd>TRF</PmtMtd>
       <ReqdExctnDt><Dt>${x(p.executionDate.slice(0, 10))}</Dt></ReqdExctnDt>
-      <Dbtr><Nm>${x(p.debtorName)}</Nm></Dbtr>
+      <Dbtr><Nm>${x(p.debtorName)}</Nm>${p.debtorAddress?.city ? pstl(p.debtorAddress) : ""}</Dbtr>
       <DbtrAcct><Id><Othr><Id>${x(p.debtorAccountRef)}</Id></Othr></Id></DbtrAcct>
       <DbtrAgt><FinInstnId><Nm>Company's own bank</Nm></FinInstnId></DbtrAgt>
       <CdtTrfTxInf>
         <PmtId><EndToEndId>${x(p.endToEndId)}</EndToEndId></PmtId>
         <Amt><InstdAmt Ccy="${x(p.ccy)}">${x(p.amount)}</InstdAmt></Amt>
         ${cdtrAgt}
-        <Cdtr><Nm>${x(b.name)}</Nm><PstlAdr><Ctry>${x(b.country)}</Ctry></PstlAdr></Cdtr>
+        <Cdtr><Nm>${x(b.name)}</Nm>${pstl({ street: b.street, postcode: b.postcode, city: b.city, country: b.country })}</Cdtr>
         ${cdtrAcct}
         <RmtInf><Strd><RfrdDocInf><Tp><CdOrPrtry><Cd>CINV</Cd></CdOrPrtry></Tp><Nb>${x(p.invoiceRef)}</Nb></RfrdDocInf>${cond}</Strd></RmtInf>
       </CdtTrfTxInf>

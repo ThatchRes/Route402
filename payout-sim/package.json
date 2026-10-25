@@ -27,7 +27,8 @@
     "issuer:test": "tsx src/issuer.selftest.ts",
     "exposure:test": "tsx src/exposure.selftest.ts",
     "optimization:test": "tsx src/optimization.selftest.ts",
-    "asi:test": "tsx src/asiState.selftest.ts && tsx src/asi.selftest.ts"
+    "asi:test": "tsx src/asiState.selftest.ts && tsx src/asi.selftest.ts",
+    "compliance:test": "tsx src/compliance.selftest.ts"
   },
   "dependencies": {
     "dotenv": "16.4.5",

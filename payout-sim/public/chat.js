@@ -207,7 +207,7 @@ function updateChatContext(available = true) {
   if (STATE && previous && previous !== `${STATE.company}|${!!STATE.localSimulation}` && !CHAT_BUSY) {
     CHAT_ID = crypto.randomUUID(); CHAT_REVISION = 0; CHAT = []; CHAT_INPUT = ""; CHAT_FOLLOWUP = ""; pageChat($("#page")); return;
   }
-  el.textContent = !available ? "Company data unavailable · you can still ask" : workspaceNote();
+  el.textContent = `${!available ? "Company data unavailable · you can still ask" : workspaceNote()} · You’re working with AI agents: they prepare payments, a person approves each one`;
   const g = $("#greeting"); if (g) g.textContent = greeting();
   setCrumbs("Agent", chatTitle()); renderChatMessages();
 }
@@ -566,7 +566,8 @@ function confirmChatSupplier(index) {
   if (!draft || answer.conversationId !== CHAT_ID || answer.conversationRevision !== CHAT_REVISION) return;
   if (!ME) { signIn(() => confirmChatSupplier(index)); return; }
   const fields = [["accountNumber", draft.country === "MX" ? "CLABE (18 digits)" : "Receiving account number"], ["iban", "IBAN, where required"],
-    ["routing", "US routing number, if applicable"], ["swift", "SWIFT / BIC, if applicable"], ["usdcWallet", "USDC wallet (optional)"]];
+    ["routing", "US routing number, if applicable"], ["swift", "SWIFT / BIC, if applicable"], ["usdcWallet", "USDC wallet (optional)"],
+    ["street", "Street address"], ["city", "Town / city"], ["postcode", "Postcode"]];
   modal(`<h2>Save ${esc(draft.name)}</h2><p>${esc(draft.country)} · ${esc(draft.currency)}. Receiving details are validated before saving.</p><form id="chat-supplier-form">
     ${fields.map(([key, label]) => `<div class="field"><label for="supplier-${key}">${esc(label)}</label><input id="supplier-${key}" name="${key}" maxlength="100" autocomplete="off" /></div>`).join("")}
     <label class="confirm"><input type="checkbox" id="supplier-confirm" required/> I checked this supplier’s identity and receiving details.</label>

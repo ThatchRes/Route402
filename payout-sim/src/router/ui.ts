@@ -14,13 +14,15 @@ import { loadPayees } from "../company/payees.js";
 import * as C from "../company/controls.js";
 import { DEMO_COMPANY } from "../company/profile.js";
 import { marketSummary } from "./market.js";
-import { PLATFORM, SOURCES } from "./registry.js";
+import { OFFRAMPS, PLATFORM, SOURCES } from "./registry.js";
 import { optimize } from "./optimizer.js";
 import { load } from "./store.js";
 import { deliveryCondition, documentsCondition, enforcementOn } from "../company/conditions.js";
 import { cleanTerms, DOC_LABEL, EBL_PLATFORMS, lcComparison, simulateCarrierIssue, verifyDocuments } from "../company/documents.js";
 import { cleanTokenizedConfig, setTokenizedConfig, TOKENIZED_CATALOG, tokenizedConfig, tokenizedUnavailable } from "./tokenized.js";
-import { cleanCompliance, coinsOf, complianceChecks, compliancePolicy, railOf, STABLECOINS, travelRuleRecord } from "./compliance.js";
+import { cleanCompliance, coinsOf, complianceChecks, compliancePolicy, railOf, sanctionsList, STABLECOINS, travelRuleRecord } from "./compliance.js";
+import { kybFor, recordKyb } from "../company/kyb.js";
+import { monitorRequest } from "../company/monitoring.js";
 import { pain001, readiness } from "../company/iso20022.js";
 import { RAILS, TOKENIZED_NETWORKS, tokenizedQuote } from "./rails.js";
 import { usdcPeg, usdcInFlight, usdcRouteAllowed, stablecoinPlanAllowed, issuerInFlight, issuerHeadroom } from "./depeg.js";
@@ -109,7 +111,9 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
       company: l.input.company.name, bills, receivables: l.input.receivables, run, market: marketSummary(), sources: SOURCES,
       suppliers: supplierDirectory(l),
       payeesOnFile: Object.keys(loadPayees()).length, rails: RAILS, tokenizedNetworks: TOKENIZED_NETWORKS, policy: pol,
-      tokenized: { catalog: TOKENIZED_CATALOG, config: tokenizedConfig() }, compliance: { policy: compliancePolicy(pol), stablecoins: STABLECOINS },
+      tokenized: { catalog: TOKENIZED_CATALOG, config: tokenizedConfig() }, compliance: { policy: compliancePolicy(pol), stablecoins: STABLECOINS, kyb: kybFor(l.input.company.companyId),
+        offramps: OFFRAMPS.map((o) => ({ id: o.id, label: o.label })),
+        screening: sanctionsList() ? { mode: "list", names: sanctionsList()!.names.size } : process.env.OPENSANCTIONS_API_KEY ? { mode: "service", names: null } : { mode: "none", names: null } },
       documents: { platforms: EBL_PLATFORMS, labels: DOC_LABEL },
       fxRisk: fxRisk(exposures, rateHistory(), Date.now(), pol.fxRiskLimitUsd), costOfCashPct: l.input.company.costOfCashPct,
       usdc: { peg, inFlightUsd: usdcInFlight(), capUsd: C.issuerCapFor(pol, "Circle"), byIssuer: issuerInFlight() }, escrow,
@@ -237,6 +241,16 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     C.audit(u.id, "policy_changed", "policy", `${JSON.stringify(before)} -> ${JSON.stringify(p)}`); res.json(p);
   });
 
+  // Company verification: an admin records the KYB result from the partner of record (Route402 does not verify companies itself)
+  ui.post("/kyb", (req, res) => {
+    const u = need(req, res); if (!u) return;
+    if (!C.can(u, "admin")) return res.status(403).json({ error: "admin only" });
+    try { const k = recordKyb(loadLinked().input.company.companyId, req.body ?? {}, u.id);
+      C.audit(u.id, "kyb_recorded", k.companyId, `${k.status} by ${k.provider} (case ${k.caseRef}); ${k.legalName}, ${k.country} ${k.registrationNumber}; beneficial owners ${k.beneficialOwnersVerified ? "verified" : "not verified"}`);
+      res.json(k);
+    } catch (e: any) { res.status(400).json({ error: e.message }); }
+  });
+
   // ---------------------------------------------------------------- payment requests: prepare -> verify -> approve -> release
   const view = (r: C.PaymentRequest, u?: C.User) => { const p = C.loadPolicy(), n = C.nextActions(r, u, p);
     const transfer = r.transferId ? load().transfers[r.transferId] : null;
@@ -266,6 +280,9 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
         return res.status(409).json({ error: "This plan has changed. Ask for a fresh preview in this conversation before preparing it." });
     }
     const l = loadLinked(), co = l.input.company, paid = loadPaid(), reqs = C.loadRequests(), out: any[] = [];
+    const kyb = kybFor(co.companyId), pol = C.loadPolicy();
+    if (compliancePolicy(pol).requireKyb && kyb?.status !== "verified")
+      return res.status(403).json({ error: `${co.name} is not verified yet: an admin must record a verified KYB result from the partner of record in Policy & people before payments can be prepared` });
     const onDelivery = new Set<string>(req.body?.releaseOnDelivery ?? []), documentary = req.body?.documentary ?? {};
     for (const d of decisions) {
       if (!["approve", "review"].includes(d.decision) || !d.intentId) { out.push({ payable: d.payable, skipped: "held by the routing agent" }); continue; }
@@ -280,13 +297,14 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
       let terms: any = null;
       if (documentary[d.payable]) { terms = cleanTerms(documentary[d.payable], it.decision.timing?.deadlineUtc ?? it.intent.deadlineUtc); if (terms.error) { out.push({ payable: d.payable, skipped: terms.error }); continue; } }
       const routeIds = (it.decision.allocations ?? []).map((a: any) => String(a.routeId)).concat(it.decision.allocations ? [] : (d.routeIds ?? []).map(String));
-      const comp = await complianceChecks({ routeKind: railOf(routeIds), coins: coinsOf(routeIds), destCcy: it.intent.destCcy, country: it.intent.beneficiary?.country ?? bill?.beneficiary.country,
-        supplierWallet: routeIds.some((x: string) => x.includes("supplier_usdc_wallet")) ? (it.intent.beneficiary ?? bill?.beneficiary)?.usdcWallet : undefined,
-        amountUsd: Number(String(it.decision.totals.sourceDebit).split(" ")[0]) }, C.loadPolicy());
+      const ben = it.intent.beneficiary ?? bill?.beneficiary, country = ben?.country ?? bill?.beneficiary.country;
+      const record = travelRuleRecord(kyb?.status === "verified" ? { name: kyb.legalName, country: kyb.country, registrationNumber: kyb.registrationNumber, address: kyb.address } : { name: co.name, country: "US" },
+        l.source.startsWith("Nessie") ? "Operating account" : "USD operating account", ben, it.decision.totals.sourceDebit, coinsOf(routeIds).join(">") || "USDC");
+      const comp = await complianceChecks({ routeKind: railOf(routeIds), coins: coinsOf(routeIds), destCcy: it.intent.destCcy, country,
+        supplierWallet: routeIds.some((x: string) => x.includes("supplier_usdc_wallet")) ? ben?.usdcWallet : undefined,
+        amountUsd: Number(String(it.decision.totals.sourceDebit).split(" ")[0]), supplierName: ben?.name, routeIds, travelRule: record }, pol);
       if (!comp.ok) { out.push({ payable: d.payable, skipped: comp.reason }); continue; }
-      const travel = comp.checks.find((c) => c.id === "travel_rule" && c.status === "pass")
-        ? travelRuleRecord({ name: co.name, country: "US" }, l.source.startsWith("Nessie") ? "Operating account" : "USD operating account", it.intent.beneficiary ?? bill?.beneficiary,
-            it.decision.totals.sourceDebit, coinsOf(routeIds).join(">") || "USDC") : undefined;
+      const travel = comp.checks.some((c) => c.id === "travel_rule" && c.status !== "n/a") ? record : undefined;
       const r: C.PaymentRequest = { id: C.newRequestId(), payable: d.payable, supplier: it.intent.beneficiary?.name ?? bill?.beneficiary.name ?? d.payable,
         country: bill?.beneficiary.country ?? "-", ccy: it.intent.destCcy, amount: it.intent.amount, reference: it.intent.reference ?? d.payable,
         intentId: d.intentId, provider: it.decision.allocations?.length ? providerForAllocations(it.decision.allocations) : d.chosen,
@@ -299,8 +317,11 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
         condition: terms ? documentsCondition(u.id, u.roles[0], terms.presentationDays) : onDelivery.has(d.payable) ? deliveryCondition(u.id, u.roles[0]) : undefined,
         documentary: terms ? { terms, presentations: [] } : undefined, compliance: { checkedAt: new Date().toISOString(), checks: comp.checks, travelRule: travel }, msgId: `R402-${Date.now().toString(36).toUpperCase()}-${d.payable}`.slice(0, 35),
         purpose: String(req.body?.purpose ?? "").slice(0, 120) || "Invoice payment", mode: req.body?.mode === "budget" ? "budget" : "invoice",
-        checkedBy: req.body?.confirmed ? { userId: u.id, at: new Date().toISOString() } : undefined };
-      r.status = C.computeStatus(r, C.loadPolicy()); reqs[r.id] = r;
+        checkedBy: req.body?.confirmed ? { userId: u.id, at: new Date().toISOString() } : undefined,
+        platformFee: it.decision.value?.platformFee, feeRule: it.decision.value?.feeRule };
+      r.alerts = monitorRequest(r, Object.values(reqs), pol, C.USERS);
+      r.status = C.computeStatus(r, pol); reqs[r.id] = r;
+      if (r.alerts.length) C.audit("monitoring", "monitoring_alert", r.id, r.alerts.map((a) => `${a.severity}: ${a.detail}`).join("; "));
       C.audit(u.id, "prepared", r.id, `${r.payable} ${r.amount} ${r.ccy} to ${r.supplier} via ${r.provider} (${it.decision.totals.sourceDebit}); agent plan ${r.intentId}${terms ? "; released when the shipping documents verify (instead of a letter of credit)" : r.releaseOnDelivery ? "; release on delivery" : ""}; compliance ${comp.checks.filter((c) => c.status === "pass").length} checks passed`);
       out.push({ payable: d.payable, requestId: r.id, status: r.status });
     }
@@ -326,8 +347,12 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     r.callback = { by: u.id, at: new Date().toISOString(), phoneOnFile: String(b.phoneOnFile).slice(0, 40), contact: String(b.contact).slice(0, 80), outcome: "confirmed" };
     C.audit(u.id, "callback_verified", r.id, `${r.supplier}: new bank details confirmed by ${r.callback.contact} on ${r.callback.phoneOnFile}`); return null;
   }));
-  const approveRequest = act((r, u) => {
+  const approveRequest = act((r, u, b) => {
     const a = allowed(r, u, "approve"); if (!a.allowed) return a.why;
+    const review = (r.alerts ?? []).filter((x) => x.severity === "review");
+    if (review.length && b.alertsReviewed !== true)
+      return `review the ${review.length} monitoring alert${review.length === 1 ? "" : "s"} on this payment (${review.map((x) => x.detail).join("; ")}) and approve it from the payment's review screen`;
+    if (review.length) { r.alertsReviewed = { by: u.id, at: new Date().toISOString() }; C.audit(u.id, "alerts_reviewed", r.id, review.map((x) => x.detail).join("; ")); }
     r.approvals.push({ by: u.id, at: new Date().toISOString() });
     if (u.owner && u.id === r.preparedBy) C.audit(u.id, "owner_override", r.id, "the owner approved a payment they prepared (segregation of duties skipped by owner authority)");
     C.audit(u.id, "approved", r.id, `approval ${r.approvals.length} of ${C.approvalsRequired(r, C.loadPolicy())} for ${r.debitUsd.toLocaleString()} USD`); return null;
@@ -377,7 +402,9 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     res.json(lcComparison(r.debitUsd, C.loadPolicy().lcFeePct));
   });
   // Stablecoin transfers with the fields digital-asset tax reporting asks for (Form 1099-DA, CARF/DAC8), as CSV
-  ui.get("/compliance/tax-report.csv", (_req, res) => {
+  ui.get("/compliance/tax-report.csv", (req, res) => {
+    const u = need(req, res); if (!u) return;
+    if (!C.can(u, "approver")) return res.status(403).json({ error: "only approvers and admins can export the tax report" });
     const rows = Object.values(C.loadRequests()).filter((r) => r.route?.includes("coin:") && ["COMPLETED", "EXECUTING"].includes(r.status) || (r.route?.includes("coin:") && r.transferId));
     const q = (v: any) => `"${String(v ?? "").replace(/"/g, '""')}"`;
     const head = ["date_utc", "payment_request", "transfer", "asset", "amount_usd", "counterparty", "counterparty_country", "currency_delivered", "amount_delivered", "purpose", "settlement_proof"];
@@ -500,11 +527,14 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
 
   // ISO 20022 pain.001 for one payment request: the same instruction a wire or a tokenized-deposit network can take
   ui.get("/requests/:id/iso20022", (req, res) => {
+    if (!need(req, res)) return;
     const r = C.loadRequests()[String(req.params.id)]; if (!r) return res.status(404).json({ error: "no such request" });
     const l = loadLinked(), bill = l.input.payables.find((p) => p.id === r.payable);
     if (!bill) return res.status(404).json({ error: "bill not found in the linked data" });
     res.type("application/xml").setHeader("content-disposition", `attachment; filename="${r.msgId ?? r.id}.pain001.xml"`);
-    res.send(pain001({ msgId: r.msgId ?? r.id, createdAt: r.preparedAt, debtorName: l.input.company.name, debtorAccountRef: "OPERATING-ACCOUNT-ON-FILE",
+    const kyb = kybFor(l.input.company.companyId), verified = kyb?.status === "verified";
+    res.send(pain001({ msgId: r.msgId ?? r.id, createdAt: r.preparedAt, debtorName: verified ? kyb!.legalName : l.input.company.name,
+      debtorAddress: verified ? { ...kyb!.address, country: kyb!.country } : undefined, debtorAccountRef: "OPERATING-ACCOUNT-ON-FILE",
       executionDate: r.arrivalUtc, endToEndId: r.payable, amount: r.amount, ccy: r.ccy, beneficiary: bill.beneficiary, invoiceRef: r.payable,
       condition: r.condition ? { kind: r.condition.kind, evidence: r.condition.proof.evidence } : null }));
   });
@@ -634,6 +664,7 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
       legs: d.allocations.map((a: any) => ({ label: a.label, routeId: a.routeId, arrivalUtc: a.arrivalUtc, sourceDebit: a.quote.sourceDebit.display,
         fundingFee: a.quote.fundingFee.display, payoutFee: a.quote.payoutFee.display, funded: a.quote.funding.display, onrampRate: a.quote.funding.rate,
         fxRate: a.quote.converted.rate, converted: a.quote.converted.display, recipientNet: a.quote.recipientNet.display })),
+      platformFee: d.value?.platformFee ?? null, feeRule: d.value?.feeRule ?? null,
       analysis: analysisOf(it, l.input.company.costOfCashPct) });
   });
 

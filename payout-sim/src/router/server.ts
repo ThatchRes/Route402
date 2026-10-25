@@ -49,7 +49,7 @@ const complianceFor = (it: any, d: any) => {
   const routeIds = (d.allocations ?? []).map((a: any) => String(a.routeId)), kind = railOf(routeIds);
   return complianceChecks({ routeKind: kind, coins: coinsOf(routeIds), destCcy: it.destCcy, country: it.beneficiary?.country,
     supplierWallet: routeIds.some((r: string) => r.includes("supplier_usdc_wallet")) ? it.beneficiary?.usdcWallet : undefined,
-    amountUsd: it.srcCcy === "USD" ? Number(String(d.totals.sourceDebit).split(" ")[0]) : 0, supplierName: it.beneficiary?.name }, loadPolicy());
+    amountUsd: it.srcCcy === "USD" ? Number(String(d.totals.sourceDebit).split(" ")[0]) : 0, supplierName: it.beneficiary?.name, routeIds }, loadPolicy());
 };
 const PAYOUT = process.env.PAYOUT_URL ?? "http://localhost:8403";
 const PAYOUT_H = () => ({ authorization: `Bearer ${process.env.PAYOUT_INTERNAL_TOKEN ?? "dev-token"}`, "content-type": "application/json" });
