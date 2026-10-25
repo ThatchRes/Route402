@@ -1,4 +1,4 @@
-// Stand-in for Person A's backend.
+// Stand-in for the router backend.
 //   npm run transfer -- <scenario> [--expired]                     full flow: x402 funding (stablecoin routes) -> payout -> reconciliation
 //   npm run transfer -- custom --from USD --to BRL --amount 1000.00 --rate 5.4321 [--type SOURCE_FIXED|RECIPIENT_FIXED]
 //        [--route stablecoin|bank] [--asset USDC] [--onramp-rate 1.000000] [--funding-fee 2.00] [--payout-fee 10.00] [--outcome delivered]

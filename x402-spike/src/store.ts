@@ -1,4 +1,4 @@
-// Tiny durable JSON store (spike only; Person A ports this to PostgreSQL tables).
+// Tiny durable JSON store (prototype only; production would use PostgreSQL).
 // Writes go to a temp file and are renamed, so a crash never leaves a half-written file.
 import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
 

@@ -1,10 +1,10 @@
-"""Typed uAgent messages (blueprint section 7, Prompt 9).
+"""Typed uAgent messages.
 Every message carries tenantId + correlationId so one instruction can be traced across agents."""
 from typing import List, Optional
 from uagents import Model
 
 
-# ---------- Intent parsing (sec 7 "LLM use with evidence", guide B1) ----------
+# ---------- Intent parsing ----------
 class ParseBody(Model):
     tenantId: str
     message: str                     # untrusted operator text
@@ -24,7 +24,7 @@ class ParseResult(Model):
     correlationId: str
 
 
-# ---------- Routing (Prompt 4 single payment + splits, both economic modes) ----------
+# ---------- Routing (single payment + splits, both economic modes) ----------
 class RouteRequest(Model):
     jobId: str
     tenantId: str
@@ -49,7 +49,7 @@ class RouteResult(Model):
     evidenceRefs: List[str]          # quote IDs, decision record ID, snapshot ID cited
 
 
-# ---------- Liquidity (Prompt 5 queue + single-payment funding + treasury) ----------
+# ---------- Liquidity (queue + single-payment funding + treasury) ----------
 class FundingCheckRequest(Model):
     tenantId: str
     intentId: str
@@ -94,7 +94,7 @@ class LiquidityResult(Model):
     evidenceRefs: List[str]
 
 
-# ---------- Execution coordinator (Prompt 8) ----------
+# ---------- Execution coordinator ----------
 class ExecuteStepRequest(Model):
     jobId: str
     tenantId: str
@@ -117,7 +117,7 @@ class ExecuteStepResult(Model):
     detail: str
 
 
-# ---------- Reconciliation (Prompt 10) ----------
+# ---------- Reconciliation ----------
 class ReconcileRequest(Model):
     jobId: str
     tenantId: str
@@ -138,7 +138,7 @@ class ReconcileResult(Model):
     evidenceRefs: List[str]
 
 
-# ---------- Investigation (sec 7 investigation assistant) ----------
+# ---------- Investigation ----------
 class InvestigateRequest(Model):
     jobId: str
     tenantId: str
@@ -159,7 +159,7 @@ class InvestigateResult(Model):
     evidenceRefs: List[str]
 
 
-# ---------- REST bodies (what Person A's API sends to the gateway) ----------
+# ---------- REST bodies (what the router API sends to the gateway) ----------
 class RouteJobBody(Model):
     jobId: str
     tenantId: str
@@ -213,7 +213,7 @@ class Accepted(Model):
 
 
 class TraceResult(Model):
-    """Synchronous multi-agent result for one instruction (Prompt 9 acceptance trace)."""
+    """Synchronous multi-agent result for one instruction."""
     correlationId: str
     hops: List[dict]                 # [{from, to, message, status, ms}]
     route: Optional[dict]

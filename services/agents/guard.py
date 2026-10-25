@@ -1,4 +1,4 @@
-"""Safety boundary for the agents (blueprint sec 7 'Tool and prompt boundaries').
+"""Safety boundary for the agents (Tool and prompt boundaries).
 - IDs are validated before they go into a URL path (agents cannot choose arbitrary URLs).
 - Provider text, memos and documents are untrusted DATA, never instructions.
 - Secrets and personal data are redacted from logs.

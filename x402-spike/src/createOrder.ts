@@ -1,4 +1,4 @@
-// Stand-in for Person A's backend creating a funding order after plan approval.
+// Stand-in for the router backend creating a funding order after plan approval.
 // Usage: npm run order -- <transferId> [planVersion] [termsHash]
 import { SELLER_URL, INTERNAL_TOKEN } from "./config.js";
 const [transferId = "tr_demo_1", planVersion = "1", termsHash = "demo-terms-hash"] = process.argv.slice(2);

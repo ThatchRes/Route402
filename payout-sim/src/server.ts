@@ -1,4 +1,4 @@
-// Payout, conversion, ledger and reconciliation service (guide prompt A5). Port 8403.
+// Payout, conversion, ledger and reconciliation service. Port 8403.
 // Money only moves forward on evidence: funding confirmed -> provider accepted -> converted -> credited.
 import "dotenv/config";
 import express from "express";
@@ -137,7 +137,7 @@ async function dispatch(payoutId: string) {
   update((db) => { db.payouts[payoutId].quote.providerRef = r.providerRef; });
 }
 
-// renewed approval after quote expiry (approval itself lives in Person A's backend)
+// renewed approval after quote expiry (approval itself lives in the router backend)
 app.post("/payouts/:id/requote", internal, express.json(), async (req, res) => {
   const p = load().payouts[String(req.params.id)];
   if (!p) return res.status(404).json({ error: "not found" });

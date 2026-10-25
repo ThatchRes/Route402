@@ -1,4 +1,4 @@
-// Advisory queue optimizer (guide A9 / blueprint sec 4). Compares a joint plan against routing each payment
+// Advisory queue optimizer. Compares a joint plan against routing each payment
 // independently, with identical inputs. Never moves money. No look-ahead: only CONFIRMED inflows count, and only
 // once they have arrived before a payment's dispatch time; forecasts are shown but never spent.
 import { optimize, mid } from "./optimizer.js";

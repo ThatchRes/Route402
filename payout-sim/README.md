@@ -158,7 +158,7 @@ Router endpoints: `POST /v1/treasury/netting`, `/v1/treasury/sweeps`, `/v1/treas
 
 ---
 
-# Conversion, payout, ledger and reconciliation (guide prompt A5)
+# Conversion, payout, ledger and reconciliation
 
 The step after funding: **convert the funded asset to the destination currency, pay the recipient, record a
 balanced ledger, and prove it all matches.** The payout *provider* is simulated (labeled synthetic rates and fees)
@@ -221,7 +221,7 @@ beneficiary_credit, plus the exact funded-but-unpaid outstanding.
 
 ## Run (PowerShell, Node 22+)
 ```powershell
-cd C:\Users\tlres\OneDrive\Desktop\Apps\Calhacks\payout-sim
+cd payout-sim
 npm install
 Copy-Item .env.example .env      # set PAYOUT_INTERNAL_TOKEN, PROVIDER_WEBHOOK_SECRET, and X402_INTERNAL_TOKEN = the x402-spike value
 npm run selftest                 # 14 offline checks
@@ -236,7 +236,7 @@ npm run payout -- usd_cad_timeout
 npm run refresh -- <payoutId>                            # status lookup recovers it
 ```
 
-## Endpoints (Person A's backend calls these; the agents read the two evidence ones)
+## Endpoints (the router calls these; the agents read the two evidence ones)
 | Endpoint | Purpose |
 |---|---|
 | `POST /payouts` + `Idempotency-Key` `{transferId, scenario, quoteExpiresAt, funding:{mode:"x402_testnet",orderId} \| {mode:"simulated_bank"}}` | create payout |

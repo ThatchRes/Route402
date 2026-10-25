@@ -1,4 +1,4 @@
-﻿$root = "C:\Users\tlres\OneDrive\Desktop\Apps\Calhacks"
+$root = $PSScriptRoot
 function Open($title, $dir, $cmd) {
   Start-Process powershell -WorkingDirectory "$root\$dir" -ArgumentList "-NoExit", "-Command", "`$host.UI.RawUI.WindowTitle='$title'; $cmd"
   Start-Sleep 2

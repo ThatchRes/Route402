@@ -1,14 +1,14 @@
-# x402-spike (Person B, handed to Person A for apps/api)
+# x402-spike: x402 payments, agent wallet and escrow
 
-One **real, capped test-USDC payment on Base Sepolia**, wired the way the blueprint requires:
+One **real, capped test-USDC payment on Base Sepolia**:
 
 ```
-Person A backend ──POST /orders──▶ seller :8402   (order bound to transferId, planVersion, termsHash)
+Router ──POST /orders──▶ seller :8402   (order bound to transferId, planVersion, termsHash)
 buyer (backend wallet) ──GET /fund?orderId── 402 ──validate terms──▶ sign ──▶ CDP facilitator settles on-chain
 seller records tx ──▶ SETTLED_PENDING_CONFIRMATION ──confirm.ts checks chain──▶ FUNDING_CONFIRMED ──▶ A starts payout
 ```
 
-| Blueprint rule (sec 6, Prompt 7) | Where |
+| Rule | Where |
 |---|---|
 | Create order + quote record before requesting funds; bind to approved terms | `POST /orders` (idempotent, never mutated) |
 | Validate network, token contract, amount, receiver, lifetime **before signing** | `policy.checkRequirements` in `buyer.ts` |
@@ -28,7 +28,7 @@ seller records tx ──▶ SETTLED_PENDING_CONFIRMATION ──confirm.ts checks
 
 ## 2. Install (PowerShell, Node 22+)
 ```powershell
-cd C:\Users\tlres\OneDrive\Desktop\Apps\Calhacks\x402-spike
+cd x402-spike
 node --version          # must be v22 or newer
 npm install
 Copy-Item .env.example .env
@@ -49,12 +49,12 @@ Gas is paid by the facilitator for this USDC transfer method, so the buyer needs
 # Window A
 npm run seller
 # Window B
-npm run order -- tr_demo_1          # stand-in for Person A creating the order after approval
+npm run order -- tr_demo_1          # stand-in for the router creating the order after approval
 npm run pay -- fund_tr_demo_1_v1    # validates the 402, then pays 0.01 test USDC
 npm run confirm                     # FUNDING_CONFIRMED after 3 confirmations (rerun, or use -- --watch)
 npm run status                      # orders + attempts table
 ```
-Open the printed `sepolia.basescan.org` link. That is your Gate 3 evidence.
+Open the printed `sepolia.basescan.org` link. That is the on-chain proof of the payment.
 
 ## 5. Safety demos
 ```powershell
@@ -71,9 +71,9 @@ npm run fund -- tr_demo_2          # order -> validated pay -> wait for confirma
 The seller also serves `GET /orders/:orderId/reconciliation`. The payout service requires its outcome to be `MATCHED`
 before it pays out. The cumulative cap is 0.25 test USDC (25 transfers at 0.01).
 
-## Handoff to Person A
+## Integration with the router
 - Port `store.ts` to PostgreSQL tables: `funding_orders`, `funding_attempts`, plus a unique `tx_hash`.
-- Person A's API calls `POST /orders` after plan approval, then runs `buyer` logic from its execution worker,
+- The router calls `POST /orders` after plan approval, then runs `buyer` logic from its execution worker,
   and starts the payout only when the order is `FUNDING_CONFIRMED`.
 - The tx hash, payer, amount and confirmations go to the transfer event timeline with `provenance: "testnet"`.
 

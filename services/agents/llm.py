@@ -1,4 +1,4 @@
-"""Optional LLM helper (blueprint sec 7 'LLM use with evidence').
+"""Optional LLM helper (LLM use with evidence).
 The LLM may: draft an intent from operator text, rephrase solver explanations, summarise investigations.
 It may NOT: produce rates, amounts it wasn't given, account IDs it wasn't given, or authorise anything.
 Every output is validated; on any failure the caller uses a labeled deterministic fallback."""

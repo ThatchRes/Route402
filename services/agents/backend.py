@@ -1,4 +1,4 @@
-"""Fixed tool set for the agents: the ONLY way they reach Person A's API.
+"""Fixed tool set for the agents: the ONLY way they reach the router API.
 Agents read, or ask A's gates. A linked ASI:One user's explicit confirmation can ask
 the same company preparation/approval gates as the website; no agent supplies user authority.
 Agents never sign, write ledger rows or mark delivery.

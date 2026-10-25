@@ -1,3 +1,6 @@
 .venv/
 .env
 __pycache__/
+# uAgents runtime storage (chat de-duplication state) and the workers' metrics snapshot
+agent*_data.json
+metrics.json

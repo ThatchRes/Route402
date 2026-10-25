@@ -1,4 +1,4 @@
-"""Concierge (gateway) agent: the front door for people and for Person A's API (port 8100).
+"""Concierge (gateway) agent: the front door for people and for the router API (port 8100).
 Auth + tenant check + rate limit + jobId de-dup, then a typed message to the right agent.
 /ask     everyday prompt -> calculator preview -> routing agent buys quotes + compliance agent buys screens (x402)
          -> approve/hold per payment, with the on-chain evidence of every paid call

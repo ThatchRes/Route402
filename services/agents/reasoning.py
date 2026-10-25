@@ -193,7 +193,7 @@ async def investigate(events):
 
 # ------------------------------------------------------------------ reconciliation
 def reconcile(legs, outstanding_view=None):
-    """Distinct outcomes per Prompt 10. Never auto-refunds, resends, or marks delivered."""
+    """Distinct outcome per leg. Never auto-refunds, resends, or marks delivered."""
     by = {l["leg"]: l for l in legs}
     out_legs, refs = [], []
     for l in legs:

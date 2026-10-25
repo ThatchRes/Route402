@@ -1,4 +1,4 @@
-// Receiving side: one protected funding resource per immutable order (blueprint sec 6).
+// Receiving side: one protected funding resource per immutable order.
 // paymentFlow "upfront" = the CDP facilitator settles on-chain BEFORE our handler runs.
 // The handler still never starts a payout: it only records settlement; confirm.ts checks the chain.
 import express from "express";
@@ -20,7 +20,7 @@ function internal(req: express.Request, res: express.Response, next: express.Nex
   next();
 }
 
-// ---- Internal API for Person A's backend: create the order BEFORE any funds are requested ----
+// ---- Internal API for the router backend: create the order BEFORE any funds are requested ----
 app.post("/orders", internal, (req, res) => {
   const { orderId, transferId, planVersion, termsHash, ttlSeconds = 900 } = req.body ?? {};
   if (![orderId, transferId].every((v) => typeof v === "string" && ID.test(v)) || !Number.isInteger(planVersion)
@@ -151,7 +151,7 @@ app.get("/fund", (req, res) => {
       o.settlement = { transaction: tx, payer: s.payer, network: s.network, recordedAt: new Date().toISOString() };
     });
   });
-  // No payout here. Person A's worker starts the payout only after FUNDING_CONFIRMED.
+  // No payout here. the router's worker starts the payout only after FUNDING_CONFIRMED.
   res.json({ orderId, accepted: true, next: "awaiting on-chain confirmation" });
 });
 
