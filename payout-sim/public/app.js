@@ -224,7 +224,7 @@ function pagePayments(P) {
   const started = new Set(REQS.filter((r) => !["REJECTED", "REFUNDED"].includes(r.status)).map((r) => r.payable));
   const open = STATE.bills.filter((b) => !started.has(b.id) && b.paid?.status !== "COMPLETED");
   P.innerHTML = `${head("Payments", "Every supplier payment, from draft to settlement.")}
-    <div id="portfolio"></div>
+    <div id="portfolio"></div><div id="acct-summary"></div>
     <div class="actionbar"><div class="mid"><b>${REQS.length} payment request(s) · ${open.length} open bill(s) not started</b><span>Prepared by one person, approved by another. Nothing moves until your controls are met.</span></div><a class="btn primary" href="#/payments/new">New payment</a></div>
     <div class="panel2 scroll"><span class="label accent">Payment requests</span>${REQS.length ? `<table class="tbl" style="margin-top:8px"><thead><tr><th>Reference</th><th>Supplier</th><th>Debit</th><th>Route</th><th>Status</th><th>Next step</th></tr></thead><tbody>
       ${REQS.map((r) => `<tr class="click" data-go="#/payments/${r.id}"><td><b>${esc(r.payable)}</b><div class="note mono">${esc(r.id)}</div></td><td>${esc(r.supplier)}</td><td>${usd(r.debitUsd, 2)}</td>
@@ -234,6 +234,7 @@ function pagePayments(P) {
       ${open.map((b) => `<tr><td><b>${esc(b.id)}</b></td><td>${esc(b.supplier)}</td><td>${money(`${b.amount} ${b.ccy}`)}</td><td>${day(b.dueUtc)}</td><td>${checkPill(b)}</td>
         <td>${b.check === "BLOCK" ? `<a href="#/suppliers/${b.id}">Fix details</a>` : `<a class="btn sm" href="#/payments/new?bill=${b.id}">Start</a>`}</td></tr>`).join("") || `<tr><td colspan="6" class="muted">Every bill has a payment request.</td></tr>`}</tbody></table></div>${foot()}`;
   $$("[data-go]").forEach((tr) => tr.onclick = () => (location.hash = tr.dataset.go));
+  accountingSummary();
   // savings across all payments: paid so far plus open bills projected (the payment pages show one payment each)
   Promise.all([api("/growth").catch(() => null), api("/impact").catch(() => null)]).then(([g, imp]) => {
     GROWTH = g ?? GROWTH; const el = $("#portfolio"); if (el && location.hash.startsWith("#/payments")) el.innerHTML = portfolioPanel(g, imp);
@@ -456,7 +457,7 @@ $("#open-policy").addEventListener("click", () => {
       <div class="field"><label><input type="checkbox" name="depegFailClosed" ${p.depegFailClosed ? "checked" : ""} ${dis} /> Also pause it when no live USDC price can be read</label></div>
       ${policyIssuerCaps(dis)}${nf("escrowDeadlineDays", "Escrow refundable after (days)")}${nf("fxRiskLimitUsd", "Flag a currency when its 95% FX move on open bills exceeds (USD)")}
       ${nf("lcFeePct", "Your bank's letter-of-credit fee (%), to compare document-checked payments against", "0.05")}
-      ${policyTokenized(dis)}${policyCompliance(dis)}
+      ${policyTokenized(dis)}${policyCompliance(dis)}${policyAccounting(dis)}
       ${admin ? `<button class="btn primary sm">Save policy</button>` : `<p class="note">${ME ? "Only an admin can change the policy." : "Sign in as an admin to change it."}</p>`}<div id="pol-out"></div></form>
     <table class="tbl" style="margin-top:16px"><thead><tr><th>Person</th><th>Role</th><th>Limit</th></tr></thead><tbody>${USERS.map((u) => `<tr><td><b>${esc(u.name)}</b><div class="note">${esc(u.title)}</div></td><td>${esc(u.roles.join(", "))}</td>
       <td>${u.roles.includes("approver") ? (u.approvalLimitUsd ? usd(u.approvalLimitUsd) : "No limit") : "Cannot approve"}</td></tr>`).join("")}</tbody></table>
@@ -487,6 +488,9 @@ $("#open-policy").addEventListener("click", () => {
       travelRuleThresholdUsd: Number(f.get("c_travel")), micaForEea: f.get("c_mica") === "on", requireWalletScreening: f.get("c_screen") === "on",
       requireNameScreening: f.get("c_names") === "on", requirePartnerAgreements: f.get("c_partners") === "on", requireKyb: f.get("c_kyb") === "on",
       partnerAgreements: Object.fromEntries([...e.target.querySelectorAll("[data-ramp]")].map((i) => [i.dataset.ramp, i.value.trim()]).filter(([, v]) => v)) };
+    const acc = (k) => ({ code: f.get(`a_${k}_code`), name: f.get(`a_${k}_name`) });
+    body.accounting = { chart: { cash: acc("cash"), ap: acc("ap"), bankFees: acc("bankFees"), fxGainLoss: acc("fxGainLoss") }, apMeasurement: f.get("a_measure"),
+      variance: Object.fromEntries(["feeToleranceUsd", "fxDeviationBps", "beneficiaryTolerancePct", "unexplainedToleranceUsd", "settlementGraceHours"].map((k) => [k, Number(f.get(`v_${k}`))])) };
     try { POLICY = await api("/policy", body); await loadAll(); $("#pol-out").innerHTML = `<div class="alert ok">Saved and logged.</div>`; } catch (err) { $("#pol-out").innerHTML = `<div class="alert bad">${esc(err.message)}</div>`; } };
 });
 function policyIssuerCaps(dis) {
@@ -548,6 +552,23 @@ function policyTokenized(dis) {
       ["tk_fx", c.fxMarginBps, "FX margin (bps)"], ["tk_fee", c.feeUsd, "Fee per payment (USD)"], ["tk_minutes", c.settlementMinutes, "Settlement (minutes)"]].map(([n, v, ph]) => `<div class="field"><label class="label">${esc(ph)}</label>${input(n, v, ph)}</div>`).join("")}</div>
     <div class="field"><label class="label">Where the tariff comes from</label>${input("tk_source", c.tariffSource, "e.g. bank fee schedule, Oct 2026", "width:100%")}</div>
     ${(t.catalog ?? []).map((n) => `<p class="note">• <a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.label)}</a>: ${esc(n.status)}</p>`).join("")}</fieldset>`;
+}
+// Chart-of-accounts mapping and variance thresholds for payment accounting records (company/accounting.ts)
+function policyAccounting(dis) {
+  const A = POLICY.accounting ?? { chart: { cash: { code: "1010", name: "Operating cash" }, ap: { code: "2010", name: "Accounts payable" }, bankFees: { code: "6150", name: "Bank and transfer fees" },
+    fxGainLoss: { code: "7910", name: "Realized FX gain/loss" } }, apMeasurement: "carrying_value", configured: false,
+    variance: { feeToleranceUsd: 0, fxDeviationBps: 10, beneficiaryTolerancePct: 0.1, unexplainedToleranceUsd: 0.05, settlementGraceHours: 24 } };
+  const row = (k, label) => `<div class="field"><label class="label">${esc(label)}</label><div class="acct-acc"><input name="a_${k}_code" value="${esc(A.chart[k].code)}" maxlength="20" aria-label="${esc(label)} code" ${dis} /><input name="a_${k}_name" value="${esc(A.chart[k].name)}" maxlength="80" aria-label="${esc(label)} name" ${dis} /></div></div>`;
+  const v = (k, label, step) => `<div class="field"><label class="label">${esc(label)}</label><input type="number" min="0" step="${step}" name="v_${k}" value="${esc(A.variance[k])}" ${dis} /></div>`;
+  return `<fieldset class="pol-sec"><legend>Payment accounting</legend>
+    <p class="note">${A.configured ? `Mapping confirmed by ${esc(nameOf(A.configuredBy))} ${esc(when(A.configuredAt))}.` : "These account codes are illustrative. Saving the policy confirms them as your mapping."} Journal entries are accounting-ready for export; nothing is posted to your ledger.</p>
+    <div class="pol-grid">${row("cash", "Cash account")}${row("ap", "Accounts payable")}${row("bankFees", "Bank and transfer fees")}${row("fxGainLoss", "Realized FX gain/loss")}</div>
+    <div class="field"><label class="label">Foreign-currency bills are settled against</label><select name="a_measure" ${dis}>
+      <option value="carrying_value" ${A.apMeasurement === "carrying_value" ? "selected" : ""}>Their booked AP carrying amount (realized FX gain/loss computed)</option>
+      <option value="settlement_value" ${A.apMeasurement === "settlement_value" ? "selected" : ""}>Their value at payment (bill recognized at payment; no realized FX)</option></select></div>
+    <div class="pol-grid">${v("feeToleranceUsd", "Flag fees above quote by more than (USD)", "0.01")}${v("fxDeviationBps", "Flag rate deviations above (bps)", "1")}
+      ${v("beneficiaryTolerancePct", "Flag supplier amount differences above (%)", "0.01")}${v("unexplainedToleranceUsd", "Treat differences up to this as rounding (USD)", "0.01")}
+      ${v("settlementGraceHours", "Flag no credit this long after estimated arrival (hours)", "1")}</div></fieldset>`;
 }
 // The partner of record runs KYB; an admin records its result here (Route402 never marks a company verified by itself)
 function kybFields(dis) {

@@ -674,6 +674,7 @@ async function pageTracking(P, id) {
           ${(r.platformFee ?? q?.platformFee) != null ? `<div class="pair">${detail("Route402 fee", esc(feeText(r.platformFee ?? q?.platformFee)))}${detail("Fee rule", esc(r.feeRule ?? q?.feeRule ?? "—"))}</div>` : ""}
           <p class="note10">${t?.approval ? `Approved ${esc(tUtc(t.approval.at))}; the amounts are locked to what was approved (terms ${esc(t.termsHash.slice(0, 8))})` : `Prepared ${esc(tUtc(r.preparedAt))}`}${t?.deadlineStatus ? ` · deadline ${esc(String(t.deadlineStatus).toLowerCase())}` : ""}. We assume the supplier’s bank takes nothing extra.</p></div>
         ${exposureNote(q)}${documentsBlock(r)}${alertsBlock(r)}${complianceBlock(r)}
+        <div id="acct"></div>
       </section>
       <aside class="doc-aside w310" aria-label="Recipient and audit">
         <span class="eyebrow">RECIPIENT</span><h2 class="serif26">${esc(r.supplier)}</h2>
@@ -697,5 +698,82 @@ async function pageTracking(P, id) {
   $("#refresh").onclick = () => route();
   $("#export-audit").onclick = () => download(`route402-audit-${r.id}.json`, JSON.stringify({ request: r.id, transfer: r.transferId ?? null, chainVerified: !!audit.verify?.ok, exportedAt: new Date().toISOString(), entries: mine }, null, 2), "application/json");
   $$("[data-act]").forEach((x) => x.onclick = () => act(r, x.dataset.act, P));
+  loadAccounting(r.id);
   if (["READY", "EXECUTING"].includes(s) || r.escrow?.state === "LOCKING") POLL = setTimeout(route, 2500);
+}
+
+// ================================================================== ACCOUNTING (payment tracking)
+// The payment's accounting-ready record (/ui/accounting/:id): source and invoice, quoted vs actual cost with the variance
+// explained, flags, and the proposed journal entry. Proposed until an approver approves it; never posted to a ledger here.
+const JSTATUS = { not_ready: ["Not ready", ""], needs_review: ["Needs review", "warn"], draft: ["Ready for approval", ""], approved: ["Approved", ""] };
+async function loadAccounting(id) {
+  const el = $("#acct"); if (!el) return;
+  const a = await api(`/accounting/${encodeURIComponent(id)}`).catch((e) => ({ error: e.message }));
+  if (!$("#acct")) return;
+  if (a.error) { el.innerHTML = `<div class="divider"></div>${notice(`Accounting record unavailable: ${esc(a.error)}`, "warn")}`; return; }
+  el.innerHTML = accountingBlock(a); bindAccounting(a);
+}
+function accountingBlock(a) {
+  const J = a.journal, V = a.variance, [st, kind] = JSTATUS[J.status] ?? [J.status, ""], inv = a.source.invoice;
+  const canReview = ME && USERS.find((u) => u.id === ME.id)?.roles.some((x) => ["approver", "admin"].includes(x));
+  const mv = (v) => (v && / [A-Z]{3,5}$/.test(v) ? money(v) : esc(v));
+  const metricRow = (m) => `<tr><td><b>${esc(m.label)}</b><div class="note">${esc(m.basis)}</div></td><td>${m.quoted == null ? "—" : mv(m.quoted)}</td><td>${m.actual == null ? "Not recorded" : mv(m.actual)}</td>
+    <td>${m.diff == null ? "—" : `${mv(m.diff)}${m.pct != null ? `<div class="note">${m.unit === "bps" ? `${fmt(m.pct * 100, 2)} bps` : `${fmt(m.pct, 2)}%`}</div>` : ""}`}</td></tr>`;
+  const line = (l) => `<tr><td class="mono">${esc(l.account.code)}</td><td><b>${esc(l.account.name)}</b><div class="note">${esc(l.description)}</div><div class="note">${esc(l.calculation)}</div></td>
+    <td class="num">${l.side === "debit" ? esc(l.amount ? money(l.amount.display) : "Missing") : ""}</td><td class="num">${l.side === "credit" ? esc(l.amount ? money(l.amount.display) : "Missing") : ""}</td></tr>`;
+  return `<div class="divider"></div><div class="breakdown acct">
+    <div class="acct-head"><h3>Accounting</h3>${badge(st, kind)}</div>
+    <p class="note10">${J.status === "approved" ? `Approved by ${esc(nameOf(a.approval?.by))} · ${esc(tUtc(a.approval?.at))}. ` : "Proposed entry. "}Accounting-ready for export; Route402 has not posted it to any general ledger. Execution data: ${esc(a.provenance)}.</p>
+    <div class="pair">${detail("Invoice", inv.ref ? `${esc(inv.ref)}${inv.amount ? ` · ${money(inv.amount)}` : ""}` : "None linked", inv.origin ? `${esc(inv.origin)} · not verified against the supplier's invoice` : "")}
+      ${detail("Lifecycle", esc(a.lifecycleLabel), a.source.payment.settledAtUtc ? `Settled ${esc(tUtc(a.source.payment.settledAtUtc))}` : "")}</div>
+    <div class="pair">${detail("Payment", `${esc(a.requestId)}${a.transferId ? ` · ${esc(a.transferId)}` : ""}`, a.source.payment.payoutIds.length ? `Payout ${esc(a.source.payment.payoutIds.join(", "))}` : "")}
+      ${detail("Requested", money(a.source.payment.requestedAmount))}</div>
+    <h3>Quoted vs actual cost</h3>
+    ${V.unavailable ? notice(esc(V.unavailable), "warn") : ""}
+    <div class="scroll"><table class="tbl compact acct-tbl"><thead><tr><th>Measure</th><th>Quoted (approved)</th><th>Actual (ledger)</th><th>Difference</th></tr></thead><tbody>${V.metrics.map(metricRow).join("")}</tbody></table></div>
+    ${V.explanation?.length ? `<ul class="reasons">${V.explanation.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+    ${V.effects?.length ? `<details class="chat-details"><summary>How the difference breaks down (${esc(a.journal.currency)})</summary><ul class="reasons">${V.effects.map((e) => `<li><b>${esc(e.label)}: ${esc(e.amount.display)}</b> · ${esc(e.explanation)}</li>`).join("")}
+      ${V.residual ? `<li><b>Unexplained: ${esc(V.residual.display)}</b></li>` : ""}</ul></details>` : ""}
+    ${a.flags.length ? `<ul class="doc-checks">${a.flags.map((f) => `<li class="warn"><b>! ${esc(f.reason)}</b><span>${esc(f.values)}</span><span>Next: ${esc(f.next)}</span></li>`).join("")}</ul>` : ""}
+    <h3>Proposed journal entry${J.transactionDate ? ` · ${esc(J.transactionDate)}` : ""}</h3>
+    ${J.lines.length ? `<div class="scroll"><table class="tbl compact acct-tbl"><thead><tr><th>Code</th><th>Account</th><th class="num">Debit (${esc(J.currency)})</th><th class="num">Credit (${esc(J.currency)})</th></tr></thead><tbody>${J.lines.map(line).join("")}
+      ${J.totals ? `<tr class="tot"><td></td><td><b>Total</b> ${J.balanced ? pill("ok", "Balanced") : pill("bad", "Not balanced")}</td><td class="num"><b>${esc(money(J.totals.debit.display))}</b></td><td class="num"><b>${esc(money(J.totals.credit.display))}</b></td></tr>` : ""}</tbody></table></div>` : ""}
+    ${J.mappingIllustrative ? `<p class="note10">Account codes are illustrative until an admin confirms the chart of accounts in Policy &amp; people.</p>` : ""}
+    ${J.missing.length || J.errors.length ? `<ul class="doc-checks">${J.errors.map((x) => `<li class="bad"><b>✗ Error</b><span>${esc(x)}</span></li>`).join("")}${J.missing.map((x) => `<li class="warn"><b>! Missing</b><span>${esc(x)}</span></li>`).join("")}</ul>` : ""}
+    ${J.notes.map((x) => `<p class="note10">${esc(x)}</p>`).join("")}
+    ${J.status !== "approved" && J.status !== "not_ready" && canReview ? `<details class="chat-details" ${J.missing.length ? "open" : ""}><summary>Reviewer inputs</summary><div class="acct-form">
+        ${inv.origin !== "linked bill" ? `<label class="note11">Invoice reference<input id="ac-inv" value="${esc(a.review?.invoiceRef ?? "")}" maxlength="60" placeholder="e.g. bill number in your ERP" /></label>` : ""}
+        <label class="note11">Booked AP carrying amount for this settlement (${esc(J.currency)})<input id="ac-carry" inputmode="decimal" value="${esc(a.review?.carryingAmount ?? "")}" placeholder="from your ledger" /></label>
+        <label class="note11">Source of the carrying amount<input id="ac-src" value="${esc(a.review?.carryingSource ?? "")}" maxlength="80" placeholder="e.g. ERP bill 4471, booked at 1.3601" /></label>
+        <button class="btn-line" id="ac-save">Save inputs</button></div></details>` : ""}
+    ${J.status === "draft" && canReview ? `${ack("ac-ok", "I've checked the lines, accounts and amounts against the source records.")}<button class="btn-solid" id="ac-approve">Approve journal entry ${IC("check-white-15", 15)}</button>` : ""}
+    ${J.status === "draft" && !canReview ? `<p class="note10">An approver or admin approves this entry.</p>` : ""}
+    <div id="ac-out"></div></div>`;
+}
+function bindAccounting(a) {
+  const out = (m, bad) => { $("#ac-out").innerHTML = `<p class="note11 ${bad ? "bad" : ""}">${esc(m)}</p>`; };
+  $("#ac-save")?.addEventListener("click", async () => {
+    try { await api(`/accounting/${a.requestId}/review`, { invoiceRef: $("#ac-inv")?.value, carryingAmount: $("#ac-carry").value, carryingSource: $("#ac-src").value }); loadAccounting(a.requestId); }
+    catch (e) { out(e.message, true); }
+  });
+  $("#ac-approve")?.addEventListener("click", async () => {
+    if (!$("#ac-ok").checked) return out("Tick the confirmation first.", true);
+    try { await api(`/accounting/${a.requestId}/approve`, {}); loadAccounting(a.requestId); } catch (e) { out(e.message, true); }
+  });
+}
+// Payments page: period summary of settled payments, fees, quote variance and review queue
+async function accountingSummary(period = "30d") {
+  const el = $("#acct-summary"); if (!el) return;
+  const s = await api(`/accounting/summary?period=${period}`).catch(() => null); if (!s || !$("#acct-summary")) return;
+  const tile = (label, value, sub, basis) => `<div class="acct-tile" title="${esc(basis)}"><span class="eyebrow">${esc(label)}</span><b>${esc(value)}</b><small>${esc(sub)}</small></div>`;
+  el.innerHTML = `<div class="panel2"><div class="acct-head"><span class="label accent">Payment accounting · ${esc(s.period.label)} · ${esc(s.currency)}</span>
+      <span class="seg-mini">${[["30d", "30 days"], ["mtd", "Month to date"], ["all", "All time"]].map(([k, l]) => `<button class="${k === period ? "on" : ""}" data-period="${k}">${l}</button>`).join("")}</span></div>
+    <div class="acct-tiles">${tile("Completed volume", money(s.completed.volume), `${s.completed.count} settled payment${s.completed.count === 1 ? "" : "s"}`, s.completed.basis)}
+      ${tile("Observed fees", money(s.fees.amount), "transfer + payout fees", s.fees.basis)}
+      ${tile("Cost vs quote", money(s.variance.amount), `${s.variance.comparable} of ${s.variance.of} comparable`, s.variance.basis)}
+      ${tile("Flagged", String(s.flagged.count), "payments to investigate", s.flagged.basis)}
+      ${tile("Entries to review", String(s.awaitingReview.count), "settled, not approved", s.awaitingReview.basis)}</div>
+    <p class="note">${esc(s.completed.basis)}. Only settled payments with provider ledger data count; ${s.excluded} request${s.excluded === 1 ? "" : "s"} excluded (not settled in the period or no execution data). Execution data is simulated in this demo.
+      ${ME ? ` <a href="/ui/accounting/export.csv" download>Export validated journal entries (CSV) ↓</a>` : " Sign in to export journal entries."}</p></div>`;
+  el.querySelectorAll("[data-period]").forEach((b) => b.onclick = () => accountingSummary(b.dataset.period));
 }

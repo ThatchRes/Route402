@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { ConditionSpec } from "./conditions.js";
 import type { DocCheck, DocumentaryTerms } from "./documents.js";
 import type { Alert } from "./monitoring.js";
+import type { AccountingPolicy } from "./accounting.js";
 import type { TokenizedConfig } from "../router/tokenized.js";
 import { DEFAULT_COMPLIANCE, STABLECOINS, type Check, type CompliancePolicy } from "../router/compliance.js";
 import { DEFAULT_ADAPTIVE_EXPOSURE, type AdaptiveExposurePolicy } from "../router/exposure.js";
@@ -37,6 +38,7 @@ export interface Policy { dualApprovalOverUsd: number; // legacy display field; 
   fxRiskLimitUsd: number;        // flag a currency when its 95% one-sided FX move on open bills exceeds this
   tokenized?: TokenizedConfig | null;   // the tokenized-deposit network the company's bank offers, with its tariff (router/tokenized.ts)
   compliance?: CompliancePolicy;        // compliance rules the router enforces (router/compliance.ts)
+  accounting?: AccountingPolicy;        // chart-of-accounts mapping and variance thresholds (company/accounting.ts)
   lcFeePct: number }             // what the company's bank charges for a letter of credit, to compare the document-checked escrow against
 const POLICY_FILE = "data/policy.json";
 // Defaults are starting company settings, editable by the admin; none of them is market data.

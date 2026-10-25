@@ -283,3 +283,21 @@ button.btn-line { font-family: var(--sans); }
 .growth-legend i.real { background: var(--g-real); } .growth-legend i.proj { background: var(--g-proj); }
 @media (max-width: 1100px) { .bento { grid-template-columns: 1fr 1fr; grid-template-rows: none; grid-template-areas: "a a" "b c" "d f" "e e"; } }
 @media (max-width: 640px) { .bento { grid-template-columns: 1fr; grid-template-areas: "a" "b" "c" "d" "e" "f"; gap: 12px; } .b-tile { padding: 18px; } .bento-wrap { margin-block: 16px 24px; } }
+
+/* ---------- payment accounting (tracking section, payments summary) */
+.acct-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.acct h3 { margin-top: 6px; }
+.acct-tbl td.num, .acct-tbl th.num { text-align: right; white-space: nowrap; }
+.acct-tbl tr.tot td { border-top: 1px solid var(--line-strong); }
+.acct-form { display: grid; gap: 8px; margin-top: 8px; }
+.acct-form label { display: grid; gap: 4px; }
+.acct-form input, .acct-acc input { padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; font: inherit; min-width: 0; }
+.acct-acc { display: grid; grid-template-columns: 80px 1fr; gap: 6px; }
+.acct-tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin: 10px 0; }
+.acct-tile { display: grid; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; min-width: 0; }
+.acct-tile b { font-size: 18px; font-weight: 600; overflow-wrap: anywhere; } .acct-tile small { color: #637b8c; font-size: 11.5px; }
+.seg-mini { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.seg-mini button { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+.seg-mini button.on { background: var(--accent, #1f4a4f); color: #fff; border-color: transparent; }
+@media (max-width: 1100px) { .acct-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .acct-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

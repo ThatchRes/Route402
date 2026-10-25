@@ -23,6 +23,8 @@ import { cleanTokenizedConfig, setTokenizedConfig, TOKENIZED_CATALOG, tokenizedC
 import { cleanCompliance, coinsOf, complianceChecks, compliancePolicy, railOf, sanctionsList, STABLECOINS, travelRuleRecord } from "./compliance.js";
 import { kybFor, recordKyb } from "../company/kyb.js";
 import { monitorRequest } from "../company/monitoring.js";
+import { buildRecord, cleanAccounting, DEFAULT_ACCOUNTING, summarize, toCsv, type AccountingRecord, type Period } from "../company/accounting.js";
+import { accountingRow, approveRecord, saveReview } from "../company/accountingStore.js";
 import { pain001, readiness } from "../company/iso20022.js";
 import { RAILS, TOKENIZED_NETWORKS, tokenizedQuote } from "./rails.js";
 import { usdcPeg, usdcInFlight, usdcRouteAllowed, stablecoinPlanAllowed, issuerInFlight, issuerHeadroom } from "./depeg.js";
@@ -224,6 +226,10 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     p.escrowDeadlineDays = Math.min(180, Math.max(0.0001, Number(p.escrowDeadlineDays)));
     p.fxRiskLimitUsd = Math.max(0, Number(p.fxRiskLimitUsd)); p.lcFeePct = Math.min(10, Math.max(0, Number(p.lcFeePct ?? 1)));
     p.compliance = cleanCompliance(p.compliance);
+    if ("accounting" in (req.body ?? {})) {
+      p.accounting = { ...cleanAccounting(req.body.accounting, before.accounting ?? DEFAULT_ACCOUNTING), configured: true, configuredBy: u.id, configuredAt: new Date().toISOString() };
+      C.audit(u.id, "accounting_mapping_changed", "policy", JSON.stringify({ chart: p.accounting.chart, apMeasurement: p.accounting.apMeasurement, variance: p.accounting.variance }));
+    } else p.accounting = before.accounting;
     if ("tokenized" in (req.body ?? {})) {
       const t = cleanTokenizedConfig(req.body.tokenized); if (t.error) return res.status(400).json({ error: t.error });
       p.tokenized = t.config ? { ...t.config, enabledBy: u.id, enabledAt: new Date().toISOString() } : null;
@@ -401,6 +407,50 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     const r = C.loadRequests()[String(req.params.id)]; if (!r) return res.status(404).json({ error: "no such request" });
     res.json(lcComparison(r.debitUsd, C.loadPolicy().lcFeePct));
   });
+  // ---------------------------------------------------------------- accounting records (company/accounting.ts)
+  // One deterministic record per payment request, built from the approved terms and the payout service's ledger postings.
+  // Accounting-ready and exportable; nothing here posts to a general ledger or changes a payment's status.
+  const accountingPolicy = () => C.loadPolicy().accounting ?? DEFAULT_ACCOUNTING;
+  async function accountingRecord(raw: C.PaymentRequest): Promise<AccountingRecord> {
+    const row = accountingRow(raw.id); if (row.approval) return row.approval.snapshot;
+    const r = view(raw), t = raw.transferId ? load().transfers[raw.transferId] ?? null : null, l = loadLinked();
+    let children: any[] | null = [];
+    if (t?.children?.length) children = await self("GET", `/v1/transfers/${t.transferId}/receipt`).then((x) => x.children).catch(() => null);
+    const bill = l.input.payables.find((p) => p.id === raw.payable);
+    return buildRecord({ request: { ...raw, status: r.status }, transfer: t, children, bill: bill ? { id: bill.id, ccy: bill.ccy, amount: bill.amount, dueUtc: bill.dueUtc } : null,
+      functionalCcy: l.input.company.homeCcy, policy: accountingPolicy(), review: row.review ?? null });
+  }
+  ui.get("/accounting/summary", async (req, res) => {
+    const period = (["30d", "mtd", "all"].includes(String(req.query.period)) ? req.query.period : "30d") as Period;
+    const recs = await Promise.all(Object.values(C.loadRequests()).map(accountingRecord));
+    res.json(summarize(recs, period, Date.now(), loadLinked().input.company.homeCcy));
+  });
+  ui.get("/accounting/export.csv", async (req, res) => {
+    if (!need(req, res)) return;
+    const recs = await Promise.all(Object.values(C.loadRequests()).map(accountingRecord));
+    res.setHeader("content-type", "text/csv"); res.setHeader("content-disposition", "attachment; filename=route402-journal-entries.csv"); res.send(toCsv(recs));
+  });
+  ui.get("/accounting/:id", async (req, res) => {
+    const r = C.loadRequests()[String(req.params.id)]; if (!r) return res.status(404).json({ error: "no such request" });
+    res.json(await accountingRecord(r));
+  });
+  ui.post("/accounting/:id/review", (req, res) => {
+    const u = need(req, res); if (!u) return;
+    if (!C.can(u, "approver")) return res.status(403).json({ error: "only approvers and admins can enter accounting inputs" });
+    if (!C.loadRequests()[String(req.params.id)]) return res.status(404).json({ error: "no such request" });
+    try { const v = saveReview(String(req.params.id), req.body, u.id);
+      C.audit(u.id, "accounting_inputs", String(req.params.id), `invoice ${v.invoiceRef ?? "-"}; carrying ${v.carryingAmount ?? "-"}${v.carryingSource ? ` (${v.carryingSource})` : ""}`); res.json(v);
+    } catch (e: any) { res.status(409).json({ error: e.message }); }
+  });
+  ui.post("/accounting/:id/approve", async (req, res) => {
+    const u = need(req, res); if (!u) return;
+    if (!C.can(u, "approver")) return res.status(403).json({ error: "only approvers and admins can approve journal entries" });
+    const r = C.loadRequests()[String(req.params.id)]; if (!r) return res.status(404).json({ error: "no such request" });
+    try { const a = approveRecord(await accountingRecord(r), u.id)!;
+      C.audit(u.id, "journal_approved", `je_${r.id}`, `${r.id}; lines hash ${a.hash.slice(0, 12)}; accounting-ready, not posted to any ledger`); res.json(a.snapshot);
+    } catch (e: any) { res.status(409).json({ error: e.message }); }
+  });
+
   // Stablecoin transfers with the fields digital-asset tax reporting asks for (Form 1099-DA, CARF/DAC8), as CSV
   ui.get("/compliance/tax-report.csv", (req, res) => {
     const u = need(req, res); if (!u) return;
