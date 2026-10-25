@@ -758,5 +758,7 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
       res.json(await r.json());
     } catch { res.json({ calls: [], note: "agent wallet not reachable" }); }
   });
+  // Unknown browser endpoints answer plainly instead of falling through to the router's bearer-token check (a 401)
+  ui.use((req, res) => res.status(404).json({ error: `This server has no ${req.method} /ui${req.path}. If you just pulled new code, restart the router.` }));
   app.use("/ui", ui);
 }
