@@ -18,10 +18,16 @@ if (r.status >= 300 && r.status !== 200) { console.log(`NOT_FUNDED ${orderId} or
 const order = await r.json();
 if (order.status === "AWAITING_FUNDING") run("src/buyer.ts", orderId);
 
+let reconciled = 0;
 for (let i = 0; i < 40; i++) {                       // up to ~2 minutes for confirmations
   run("src/confirm.ts");
   const a = await auditOrder(orderId);
   if (a?.outcome === "MATCHED") { console.log(`FUNDED ${orderId} ${a.legs.find((l) => l.leg === "chain_transfer")?.evidenceRef}`); process.exit(0); }
+  // The seller and buyer write the same store; a lost buyer write leaves a settled attempt at SUBMITTED.
+  // Resolve it from chain evidence (read-only, never pays again) before calling the outcome unknown.
+  if (a?.outcome === "UNKNOWN_NEEDS_RECONCILE" && reconciled < 3) {
+    reconciled++; run("src/reconcile.ts"); await new Promise((res) => setTimeout(res, 3000)); continue;
+  }
   if (a && ["MISMATCH", "FAILED", "UNKNOWN_NEEDS_RECONCILE", "AWAITING_FUNDING"].includes(a.outcome) && i > 0) {
     console.log(`NOT_FUNDED ${orderId} ${a.outcome}`); process.exit(1);
   }

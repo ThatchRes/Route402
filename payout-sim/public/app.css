@@ -24,7 +24,7 @@ a { color: var(--accent); } .mono { font-family: ui-monospace, SFMono-Regular, M
 body.side-hidden .shell { grid-template-columns: minmax(0, 1fr); } body.side-hidden .side { display: none; }
 .side { background: var(--side); color: #fff; display: flex; flex-direction: column; gap: 14px; padding: 16px 12px 16px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
 .logo { display: flex; align-items: center; gap: 10px; padding: 2px 8px; flex: none; text-decoration: none; color: #fff; }
-.logo-mark { flex: none; display: block; border-radius: 10px; box-shadow: 0 4px 14px rgba(0,0,0,.18); }
+.logo-mark { flex: none; display: block; }   /* the shield draws its own shadow, so a box shadow would show a square */
 .logo-word { display: grid; gap: 1px; line-height: 1.1; }
 .logo-word b { font: 700 17px/1.1 "Inter", var(--sans); letter-spacing: -.02em; color: #fff; }
 .logo-word i { font-style: normal; color: #8fd8cf; }

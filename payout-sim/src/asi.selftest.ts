@@ -8,6 +8,7 @@ import express from "express";
 const cwd = process.cwd(); process.chdir(mkdtempSync(path.join(tmpdir(), "route402-asi-")));
 process.env.LOCAL_ROUTING = "1"; process.env.LIVE_MARKET = "0"; process.env.ROUTER_NO_LISTEN = "1";
 process.env.AGENT_SERVICE_TOKEN = "asi-local-test-token";
+process.env.ASI_CHAT_AUTOLINK = "0";   // browser-link mode first; the configured-user mode is checked at the end
 const C = await import("./company/controls.js"), S = await import("./assistant/asiState.js");
 const { askConversation, recordConversationReview } = await import("./assistant/conversation.js");
 const { loadLinked, saveLinked } = await import("./assistant/linked.js");
@@ -163,6 +164,17 @@ try {
   assert.equal((await api("context", "session-company")).data.linked, false);
   assert.equal((await api("confirm", "session-policy", { confirmationId: policy.data.confirmationId })).status, 409);
   pass("switching companies or signing out revokes usable chat authority");
+
+  delete process.env.ASI_CHAT_AUTOLINK; process.env.ASI_CHAT_USER = "maya";
+  const auto = await api("context", "session-auto");
+  assert.equal(auto.data.linked, true); assert.equal((await api("link", "session-auto")).status, 200);
+  const autoOffer = await offer("session-auto"); assert.equal(autoOffer.status, 200);
+  process.env.ASI_CHAT_USER = "priya";   // a configuration change revokes the previous chat authority
+  assert.equal((await api("confirm", "session-auto", { confirmationId: autoOffer.data.confirmationId })).status, 409);
+  process.env.ASI_CHAT_AUTOLINK = "0";
+  assert.equal((await api("context", "session-auto")).data.linked, false);
+  assert.equal(C.loadAudit().filter((e) => e.action === "asi_linked" && e.detail.includes("configured chat user")).length, 1);
+  pass("without a browser sign-in, chats act only as the configured user, and disabling it revokes them");
   assert.equal(sends, 1); assert.equal(C.verifyAudit().ok, true);
   console.log(`ASI integration suite: ${checks} checks passed; local HTTP settlement fixtures, no external payments.`);
 } finally { server.close(); server.closeAllConnections(); process.chdir(cwd); }

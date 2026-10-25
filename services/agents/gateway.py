@@ -305,7 +305,7 @@ if CHAT:
     from datetime import datetime, timezone
     from uuid import uuid4
     from uagents import Protocol
-    from uagents_core.contrib.protocols.chat import (ChatAcknowledgement, ChatMessage, TextContent,
+    from uagents_core.contrib.protocols.chat import (ChatAcknowledgement, ChatMessage, TextContent, MetadataContent,
                                                      EndSessionContent, chat_protocol_spec)
     from asi_chat import AsiChatAdapter, is_end_session
     from chat_format import format_answer
@@ -315,9 +315,9 @@ if CHAT:
 
     chat_limiter = RateLimiter(int(os.getenv("CHAT_PAID_PER_MIN", "3")))   # each chat review spends test USDC
 
+    # ASI:One replies carry no app or sign-in links; small talk uses the ASI:One LLM (read-only), payments do not.
     chat_adapter = AsiChatAdapter(backend, concierge_ask, format_answer, CHAT_TENANT,
-        app_url=(os.getenv("ASI_APP_URL", "http://localhost:8404").rstrip("/") + "/app/#/payments"),
-        paid_limiter=chat_limiter)
+        paid_limiter=chat_limiter, converse=context_llm.converse)
 
     @chat.on_message(ChatMessage)
     async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
@@ -328,8 +328,10 @@ if CHAT:
             text = "end session"
         if not text:
             return  # Session-control-only messages are acknowledged, never interpreted as payment instructions.
-        answer = await chat_adapter.handle(ctx, sender, str(ctx.session), str(msg.msg_id), text)
+        answer, card = await chat_adapter.respond(ctx, sender, str(ctx.session), str(msg.msg_id), text)
         content = [TextContent(type="text", text=answer)]
+        if card:   # ASI:One Interactive Card; the text above is the fallback if the card is rejected
+            content.append(MetadataContent(type="metadata", metadata=card))
         if is_end_session(text):
             content.append(EndSessionContent(type="end-session"))
         await ctx.send(sender, ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(),

@@ -27,7 +27,7 @@ import { usdcPeg, usdcInFlight, usdcRouteAllowed, stablecoinPlanAllowed, issuerI
 import { allInCost, fxRisk, sendBy, transitDays } from "../company/economics.js";
 import { midInfo, rateHistory } from "./market.js";
 import { planningNow } from "./timing.js";
-import { executionPolicy, planForDispatch, validateDispatchDecision, providerForAllocations } from "./dispatch.js";
+import { executionPolicy, planForDispatch, validateDispatchDecision, providerForAllocations, reviewedRouteIds } from "./dispatch.js";
 import { confirmSupplier, conversationView, ConversationConflict } from "../assistant/conversation.js";
 import { supplierDirectory } from "../company/suppliers.js";
 import { publicData, validateChatRequest } from "../assistant/safety.js";
@@ -450,8 +450,14 @@ export function mountUi(app: express.Express, port: number, reprice?: (intent: I
     const check = planForDispatch(originalTerms, NOW(), { exposureContext: current, issuerHeadroomUsd: issuerHeadroom(pol, r.id) });
     if (!check.ok) return pause(`${check.reason}. Nothing new was sent; request a new plan or approval.`);
     // Refresh only within the routes and debit cap the company reviewed. No provider switch or higher debit is implicit.
-    const refreshIntent = { ...original.intent, issuerHeadroomUsd: issuerHeadroom(pol, r.id), provider: r.allowReroute ? undefined : original.intent.provider, allowedRouteIds: originalTerms.executionPolicy.allowedRouteIds };
-    const refreshed = reprice ? reprice(refreshIntent, r.id) : await self("POST", "/v1/intents", refreshIntent);
+    // The reviewed route is re-priced first; an allowed backup is used only when that route can no longer pass the checks.
+    const requote = async (provider: any, allowedRouteIds: string[]) => {
+      const refreshIntent = { ...original.intent, issuerHeadroomUsd: issuerHeadroom(pol, r.id), provider, allowedRouteIds };
+      return reprice ? reprice(refreshIntent, r.id) : await self("POST", "/v1/intents", refreshIntent);
+    };
+    let refreshed = await requote(original.intent.provider, reviewedRouteIds(originalTerms));
+    if (r.allowReroute && (refreshed.decision?.status !== "OK" || !validateDispatchDecision(originalTerms, refreshed.decision).ok))
+      refreshed = await requote(undefined, originalTerms.executionPolicy.allowedRouteIds);
     if (refreshed.decision?.status !== "OK") return pause(refreshed.decision?.reason ?? "No route can still meet the recipient deadline");
     const finalCheck = validateDispatchDecision(originalTerms, refreshed.decision);
     if (!finalCheck.ok) return pause(`${finalCheck.reason}. Nothing new was sent; review a fresh quote before approving different terms.`);

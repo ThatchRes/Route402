@@ -109,6 +109,21 @@ export function completeLink(token: string, userId: string, sessionHash: string,
   return clone(binding);
 }
 
+// Server-configured chat authority (no browser sign-in). Never derived from chat text or the gateway's request body.
+const AGENT_AUTHORITY = "asi-agent:";
+export const isAgentAuthority = (sessionHash: string) => typeof sessionHash === "string" && sessionHash.startsWith(AGENT_AUTHORITY);
+
+/** Bind this signed sender + session to the company user the router is configured to act as for ASI:One. */
+export function autoLink(tenant: string, sender: string, session: string, companyId: string, userId: string): AsiBinding {
+  context(tenant, sender, session, companyId); text(userId);
+  const s = read(), key = scopeKey(tenant, sender, session, companyId), existing = s.bindings[key];
+  if (existing && existing.expiresAt > Date.now() && existing.userId === userId && isAgentAuthority(existing.sessionHash)) return clone(existing);
+  const binding: AsiBinding = { tenant, sender, session, companyId, id: randomUUID(), userId,
+    sessionHash: AGENT_AUTHORITY + digest(JSON.stringify([tenant, sender, session, companyId, userId])), createdAt: Date.now(), expiresAt: Date.now() + AUTHORITY_MS };
+  s.bindings[key] = binding; delete s.pending[key]; write(s);
+  return clone(binding);
+}
+
 export function requireBinding(tenant: string, sender: string, session: string, companyId: string,
   sessionValidFn: (sessionHash: string, userId: string) => boolean): AsiBinding {
   context(tenant, sender, session, companyId);

@@ -42,7 +42,7 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
         m = self.module
         ctx = SimpleNamespace(send=AsyncMock(), session=uuid4())
         msg = m.ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=[m.TextContent(type="text", text="yes")])
-        with patch.object(m.chat_adapter, "handle", AsyncMock(return_value="Acceptance recorded")) as handle:
+        with patch.object(m.chat_adapter, "respond", AsyncMock(return_value=("Acceptance recorded", None))) as handle:
             await m.on_chat(ctx, "agent1" + "a" * 55, msg)
         ack, reply = [call.args[1] for call in ctx.send.await_args_list]
         self.assertIsInstance(ack, m.ChatAcknowledgement)
@@ -56,7 +56,7 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
         m = self.module
         ctx = SimpleNamespace(send=AsyncMock(), session=uuid4())
         msg = m.ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=[m.TextContent(type="text", text="end chat")])
-        with patch.object(m.chat_adapter, "handle", AsyncMock(return_value="Disconnected")):
+        with patch.object(m.chat_adapter, "respond", AsyncMock(return_value=("Disconnected", None))):
             await m.on_chat(ctx, "agent1" + "a" * 55, msg)
         reply = ctx.send.await_args_list[-1].args[1]
         self.assertTrue(any(isinstance(c, m.EndSessionContent) for c in reply.content))
@@ -65,7 +65,7 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
         m = self.module
         ctx = SimpleNamespace(send=AsyncMock(), session=uuid4())
         msg = m.ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=[])
-        with patch.object(m.chat_adapter, "handle", AsyncMock()) as handle:
+        with patch.object(m.chat_adapter, "respond", AsyncMock()) as handle:
             await m.on_chat(ctx, "agent1" + "a" * 55, msg)
         self.assertEqual(ctx.send.await_count, 1)
         handle.assert_not_called()

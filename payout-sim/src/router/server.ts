@@ -256,14 +256,53 @@ function runX402Fund(childId: string): Promise<{ orderId: string; tx?: string }>
   });
 }
 
-async function execute(transferId: string) {
+// Read-only x402 check: resolve lost buyer/seller writes from chain evidence, then require the audit to prove ONE settlement.
+function x402Matched(orderId: string): Promise<boolean> {
+  const run = (args: string[]) => new Promise<string>((resolve) => {
+    const p = spawn("npx", ["tsx", ...args], { cwd: X402_DIR, shell: process.platform === "win32" });
+    let out = ""; p.stdout.on("data", (d) => (out += d)); p.stderr.on("data", (d) => (out += d)); p.on("close", () => resolve(out));
+  });
+  return run(["src/reconcile.ts"]).then(() => run(["src/auditCli.ts", orderId])).then((out) => new RegExp(`^${orderId} \\(.*\\) order=FUNDING_CONFIRMED -> MATCHED$`, "m").test(out.trim()));
+}
+
+// Verified resume of a split that stopped on an UNKNOWN x402 funding step (e.g. the seller's write hid the buyer's settlement).
+// Continues only when every earlier leg is confirmed, the approved quote is still valid, and x402 proves this leg was funded
+// exactly once. It never funds again; payouts reuse the deterministic idempotency keys, so a repeat cannot pay twice.
+const resumeTried = new Map<string, number>();
+async function resumeVerified() {
+  for (const t of Object.values(load().transfers)) {
+    if (t.status !== "NEEDS_RECONCILIATION" || Date.now() - (resumeTried.get(t.transferId) ?? 0) < 60_000) continue;
+    const steps = Object.entries<any>(t.steps ?? {}), unknown = steps.filter(([k, v]) => k.startsWith("fund_") && v.status === "UNKNOWN");
+    if (unknown.length !== 1) continue;
+    const [fundStep, info] = unknown[0], leg = Number(fundStep.split("_")[1]) - 1;
+    if (!/x402/.test(info.rail ?? "") || t.steps[`payout_${leg + 1}`] || t.children.length !== leg
+      || steps.some(([k, v]) => k !== fundStep && !["CONFIRMED", "PENDING"].includes(v.status))
+      || Date.parse(t.executionQuoteExpiresAt ?? t.quoteExpiresAt) <= Date.parse(now())) continue;
+    resumeTried.set(t.transferId, Date.now());
+    const orderId = `fund_${t.transferId}_c${leg + 1}_v1`;
+    if (!(await x402Matched(orderId))) continue;
+    const ok = update((db) => { const x = db.transfers[t.transferId];
+      if (x.status !== "NEEDS_RECONCILIATION" || x.steps[fundStep]?.status !== "UNKNOWN") return false;
+      x.steps[fundStep] = { ...x.steps[fundStep], status: "CONFIRMED", orderId, detail: undefined, at: now() };
+      x.status = "EXECUTING"; x.history.push({ at: now(), status: "EXECUTING", note: `resumed after reconciliation: x402 order ${orderId} proven funded once; continuing leg ${leg + 1}` });
+      return true; });
+    if (ok) void execute(t.transferId, leg).catch((e) => update((db) => { const x = db.transfers[t.transferId]; x.status = "NEEDS_RECONCILIATION";
+      x.history.push({ at: now(), status: x.status, note: String(e).slice(0, 300) }); }));
+  }
+}
+
+async function execute(transferId: string, fromLeg = 0) {
   const t = load().transfers[transferId];
   for (const [i, a] of (t.executionPlan ?? t.terms).allocations.entries()) {
+    if (i < fromLeg) continue;   // earlier legs already funded and paid out (verified resume)
     const childId = `${transferId}_c${i + 1}`, input = a.input;
     const fundStep = `fund_${i + 1}`, payStep = `payout_${i + 1}`;
     let funding: any;
     const live = input.route === "stablecoin" && input.fundingAsset === "USDC" && (input.network ?? "base") === "base";
-    if (live) {
+    const proven = fromLeg > 0 && i === fromLeg ? load().transfers[transferId].steps[fundStep] : undefined;
+    if (proven?.status === "CONFIRMED" && proven.orderId) {
+      funding = { mode: "x402_testnet", orderId: proven.orderId };   // funded once, proven by the x402 audit: never fund again
+    } else if (live) {
       const rail = "x402 settlement proof: 0.01 test USDC on Base Sepolia (proves the settlement path; not the transfer amount)";
       setStep(transferId, fundStep, "REQUESTED", { rail });
       try { const { orderId, tx } = await runX402Fund(childId); funding = { mode: "x402_testnet", orderId };
@@ -275,7 +314,9 @@ async function execute(transferId: string) {
       setStep(transferId, fundStep, "CONFIRMED", { rail: `${funding.mode} (labeled simulation)` });
     }
     const deadline = t.terms.intent.deadlineUtc;
-    const remaining: any = optimize({ ...t.terms.intent, amount: input.amount, nowUtc: now(), allowedRouteIds: [a.routeId], allowSplit: false });
+    // Re-check this one approved leg on its own. The route is pinned, so the quote's provider filter does not apply:
+    // under a stablecoin quote the bank leg of a split is a "complement" that is never valid alone, which failed every split here.
+    const remaining: any = optimize({ ...t.terms.intent, provider: undefined, bankComplement: undefined, amount: input.amount, nowUtc: now(), allowedRouteIds: [a.routeId], allowSplit: false });
     if (remaining.status !== "OK") throw new Error(`route can no longer meet its approved deadline after funding: ${remaining.reason}. Reconcile existing funds; do not resend`);
     setStep(transferId, payStep, "REQUESTED");
     // Persist the deterministic child before submission: a crash or timeout after provider acceptance must still be recoverable by reads.
@@ -483,6 +524,7 @@ if (process.env.ROUTER_NO_LISTEN !== "1") {
   update((db) => { for (const t of Object.values(db.transfers)) if (t.status === "EXECUTING") {
     t.status = "NEEDS_RECONCILIATION"; t.history.push({ at: now(), status: t.status, note: "router restarted; inspect existing evidence before any further send" });
   } });
-  const tick = () => { void dispatchDue().catch((e) => console.error("dispatch check:", e.message)); void monitorTransfers().catch((e) => console.error("reconciliation check:", e.message)); };
+  const tick = () => { void dispatchDue().catch((e) => console.error("dispatch check:", e.message)); void monitorTransfers().catch((e) => console.error("reconciliation check:", e.message));
+    void resumeVerified().catch((e) => console.error("verified resume:", e.message)); };
   setInterval(tick, 2000).unref(); tick();
 }

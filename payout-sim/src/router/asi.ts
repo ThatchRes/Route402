@@ -9,6 +9,7 @@ import { recordUiReview, trustedUiDecision } from "../assistant/reviews.js";
 import { load } from "./store.js";
 import { browserSecurity, browserRateLimit } from "./browserSecurity.js";
 import { fmt, toMinor } from "../money.js";
+import { midInfo } from "./market.js";
 
 interface SharedControls {
   prepare: express.RequestHandler;
@@ -31,6 +32,29 @@ const appBase = () => {
     throw new Error("ASI_APP_URL must be an HTTPS app origin, or localhost for the demo.");
   return url.origin;
 };
+
+// The same quote breakdown the website's review page shows (fees, exchange, bank comparison, what was searched),
+// read from the stored intent only. Account numbers never leave: only the last four characters.
+const railOf = (id: string) => id.startsWith("coin:") ? "stablecoin" : id.startsWith("tokenized:") ? "tokenized deposit" : "bank wire";
+function breakdown(stored: any) {
+  const d = stored.decision, it = stored.intent, cands: any[] = d.candidates ?? [], ben = it.beneficiary ?? {};
+  const account = String(ben.iban ?? ben.accountNumber ?? "").replace(/\s+/g, "");
+  const excluded: Record<string, number> = {};
+  for (const c of cands.filter((x) => !x.eligible)) {
+    const kind = /deadline/i.test(c.reason ?? "") ? "would arrive after the deadline" : /capacity/i.test(c.reason ?? "") ? "more than the route can carry"
+      : /peg|stable/i.test(c.reason ?? "") ? "stablecoin too far from its peg" : "not available for this payment";
+    excluded[kind] = (excluded[kind] ?? 0) + 1;
+  }
+  const mid = midInfo(it.destCcy);
+  return { amountType: it.amountType, country: ben.country ?? null, maskedAccount: account ? `•••• ${account.slice(-4)}` : null,
+    legs: d.allocations.map((a: any) => ({ label: a.label, fundingFee: a.quote.fundingFee.display, payoutFee: a.quote.payoutFee.display,
+      funded: a.quote.funding.display, fxRate: a.quote.converted.rate, recipientNet: a.quote.recipientNet.display })),
+    baseline: d.baseline ? { label: d.baseline.label, sourceDebit: d.baseline.sourceDebit, recipientNet: d.baseline.recipientNet, arrivalUtc: d.baseline.arrivalUtc } : null,
+    costVsMidBps: d.costVsMidBps ?? null, objective: d.objective ?? it.objective ?? null,
+    searched: { routes: cands.length, eligible: cands.filter((x) => x.eligible).length, rails: [...new Set(cands.map((x) => railOf(String(x.routeId))))],
+      networks: [...new Set(cands.map((x) => String(x.routeId)).filter((x) => x.startsWith("coin:")).map((x) => x.split(":")[2]))], excluded },
+    market: { srcCcy: it.srcCcy, destCcy: it.destCcy, rate: mid.rate, source: mid.source } };
+}
 
 // Invoke the exact same handlers used by the website with server-resolved authority.
 // No bearer browser cookie is manufactured or returned to the gateway.
@@ -91,7 +115,12 @@ export function mountAsi(app: express.Express, controls: SharedControls) {
       return void res.status(422).json({ error: "Invalid signed chat sender or session." });
     res.set("Cache-Control", "no-store"); next();
   });
-  const bound = (req: express.Request) => S.requireBinding(tenant(), req.body.sender, req.body.session, company(), C.activeSessionFingerprint);
+  // ASI:One users are not sent to an external sign-in: each signed chat session acts as the configured company user
+  // (ASI_CHAT_USER, default the demo owner). Role, limits, compliance and release controls still apply to that user.
+  // ASI_CHAT_AUTOLINK=0 restores the browser-link requirement.
+  const chatUser = () => process.env.ASI_CHAT_AUTOLINK === "0" ? undefined : C.user(process.env.ASI_CHAT_USER ?? "alex");
+  const sessionValid = (hash: string, userId: string) => S.isAgentAuthority(hash) ? chatUser()?.id === userId : C.activeSessionFingerprint(hash, userId);
+  const bound = (req: express.Request) => S.requireBinding(tenant(), req.body.sender, req.body.session, company(), sessionValid);
   const wrap = (handler: (req: express.Request, res: express.Response) => Promise<any> | any): express.RequestHandler =>
     async (req, res) => { try { await handler(req, res); } catch (e: any) { res.status(409).json({ error: e.message }); } };
   const pendingView = (binding: S.AsiBinding) => {
@@ -100,7 +129,12 @@ export function mountAsi(app: express.Express, controls: SharedControls) {
   };
   api.post("/context", wrap((req, res) => {
     let binding: S.AsiBinding;
-    try { binding = bound(req); } catch { return res.json({ linked: false }); }
+    try { binding = bound(req); } catch {
+      const user = chatUser();
+      if (!user) return res.json({ linked: false });
+      binding = S.autoLink(tenant(), req.body.sender, req.body.session, company(), user.id);
+      C.audit(user.id, "asi_linked", binding.id, `ASI:One sender ${binding.sender}; session ${binding.session}; configured chat user`);
+    }
     res.json({ linked: true, conversationId: conversationId(binding), pending: pendingView(binding) });
   }));
   api.post("/link", browserRateLimit(20), wrap((req, res) => {
@@ -147,7 +181,7 @@ export function mountAsi(app: express.Express, controls: SharedControls) {
         recipientGets: decision.totals.recipientNet, platformFee: fee, netSavings: decision.value?.customerNetSaving,
         arrivalUtc: decision.totals.arrivalUtc, bankArrivalUtc: decision.baseline?.arrivalUtc,
         routeLabel: decision.allocations.map((a: any) => a.label).join(" + "), routeIds: decision.allocations.map((a: any) => a.routeId),
-        expiresAt: new Date(expiry).toISOString(), simulation: true });
+        expiresAt: new Date(expiry).toISOString(), simulation: true, ...breakdown(stored) });
     }
     const pending: S.AsiPending = { id: randomUUID(), state: "ready", conversationId: answer.conversationId,
       conversationRevision: answer.conversationRevision, plans, details, expiresAt: Math.min(...plans.map((p) => p.expiresAt)),
@@ -156,11 +190,13 @@ export function mountAsi(app: express.Express, controls: SharedControls) {
     res.json({ confirmationId: pending.id, expiresAt: pending.expiresAt, details,
       confirmation: `Reply yes to submit and, if your account may approve it, authorize this ${plans.length === 1 ? "payment" : `${plans.length}-payment run`}. Your company's release checks still apply. An increased debit requires fresh approval. Say cancel or change the plan to close this proposal.` });
   }));
+  // The saving vs the bank wire that this payment's approved quote measured (after Route402's fee), as the site's impact view shows.
+  const savedOf = (r: C.PaymentRequest) => load().intents[r.intentId]?.decision?.value?.customerNetSaving ?? null;
   const requestResults = (pending: S.AsiPending, user: C.User) => (pending.requestIds ?? []).map((id) => {
     const r = C.loadRequests()[id]; if (!r) return { id, status: "UNKNOWN", note: "Check this request in Route402." };
     const value = controls.view(r, user);
     return { id, supplier: r.supplier, status: value.status, transferId: value.transferId, note: value.note,
-      url: `${appBase()}/app/#/payments/${encodeURIComponent(id)}` };
+      amount: value.recipientGets, saved: savedOf(r), url: `${appBase()}/app/#/payments/${encodeURIComponent(id)}` };
   });
   api.post("/status", wrap((req, res) => {
     const binding = bound(req), pending = S.getPending(binding);
@@ -169,6 +205,15 @@ export function mountAsi(app: express.Express, controls: SharedControls) {
       : pending.state === "ready" ? "A payment review is awaiting your yes. Nothing has been submitted by this review."
       : "Current status of this chat's payment requests." : "No payment is awaiting confirmation in this chat.",
       requests: pending ? requestResults(pending, C.user(binding.userId)!) : [] });
+  }));
+  // Every stored payment request for the linked company, newest first (ASI:One "payment history"). Read-only.
+  api.post("/payments", wrap((req, res) => {
+    const binding = bound(req), user = C.user(binding.userId)!;
+    const rows = Object.values(C.loadRequests()).sort((a, b) => b.preparedAt.localeCompare(a.preparedAt)).slice(0, 25);
+    res.json({ message: rows.length ? `${rows.length} most recent payment${rows.length === 1 ? "" : "s"} for ${loadLinked().input.company.name}.` : "No payments have been submitted yet.",
+      requests: rows.map((r) => { const value = controls.view(r, user);
+        return { id: r.id, supplier: r.supplier, status: value.status, note: value.note, amount: value.recipientGets, at: r.preparedAt,
+          saved: savedOf(r), viaChat: /ASI:One/.test(r.purpose ?? "") }; }) });
   }));
   api.post("/confirm", wrap(async (req, res) => {
     const binding = bound(req), user = C.user(binding.userId)!, pending = S.getPending(binding);

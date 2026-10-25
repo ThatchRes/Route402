@@ -40,11 +40,11 @@ class ChatFormatTests(unittest.TestCase):
 
     def test_paid_choice_never_uses_different_calculator_amount_or_saving(self):
         result = format_answer(self.review())
-        self.assertIn("Lowest cash cost", result)
+        self.assertIn("lowest cash cost", result)
         self.assertIn("Stablecoin and bank split", result)
         self.assertIn("0.41%", result)
         self.assertIn("27 Oct 2026, 10:00 UTC", result)
-        self.assertIn("Ready for your confirmation", result)
+        self.assertIn("ready to send", result)
         self.assertNotIn("999999", result)
         self.assertNotIn("888888", result)
         self.assertNotIn("private-wallet", result)
@@ -57,12 +57,12 @@ class ChatFormatTests(unittest.TestCase):
                                    "arrivalUtc": "2026-10-27T10:00:00Z", "bankArrivalUtc": "2026-10-29T10:00:00Z",
                                    "expiresAt": "2026-10-24T20:00:00Z"}}
         result = format_answer(self.review(), quote_details=details, confirmation="Reply yes to accept this exact payment.")
-        self.assertIn("You pay, including Route402 fee:** 50,000.00 USD", result)
-        self.assertIn("Supplier receives:** 38,000.00 GBP", result)
+        self.assertIn("You pay · fees included:** 50,000.00 USD", result)
+        self.assertIn("They receive:** 38,000.00 GBP", result)
         self.assertIn("Route402 fee:** 50.00 USD", result)
-        self.assertIn("Estimated saving vs your bank, after our fee:** 200.00 USD", result)
-        self.assertIn("Estimated time saved:** 2.0 days", result)
-        self.assertIn("Reply yes to accept this exact payment.", result)
+        self.assertIn("You save vs your bank:** 200.00 USD after Route402's 50.00 USD fee", result)
+        self.assertIn("2.0 days sooner than a bank wire", result)
+        self.assertIn("Reply `yes` to send", result)
         self.assertNotIn("Approval is still required", result)
 
     def test_estimated_savings_in_source_fixed_budget_are_not_falsely_shown_as_smaller_debit(self):
@@ -70,20 +70,20 @@ class ChatFormatTests(unittest.TestCase):
         result = format_answer(self.review(), quote_details=details)
         self.assertIn("500.00 USD", result)
         self.assertIn("9,500.00 MXN", result)
-        self.assertIn("Estimated saving", result)
+        self.assertIn("You save vs your bank", result)
         self.assertNotIn("profit", result)
 
     def test_hold_and_additional_review_do_not_claim_human_approval(self):
         answer = self.review()
         answer["decisions"][0].update(decision="review", needs=["call-back verification"], reasons=["Bank details changed"])
         result = format_answer(answer)
-        self.assertIn("Additional review needed", result)
-        self.assertIn("Before release:** call-back verification", result)
+        self.assertIn("additional review needed", result)
+        self.assertIn("Before release: call-back verification", result)
         self.assertIn("Bank details changed", result)
         self.assertNotIn("Ready for your confirmation", result)
         answer["decisions"][0].update(decision="hold", chosen=None, intentId=None, options=[], reasons=["No timely route"])
         result = format_answer(answer)
-        self.assertIn("On hold", result)
+        self.assertIn("on hold", result)
         self.assertIn("No timely route", result)
 
     def test_untrusted_text_cannot_introduce_markdown_or_html_links(self):
@@ -99,10 +99,10 @@ class ChatFormatTests(unittest.TestCase):
         answer = self.review()
         answer.update(spentUsdc="0.003", paidCalls=[{"explorer": good}, {"explorer": good}, {"explorer": evil}])
         result = format_answer(answer)
-        self.assertEqual(result.count("[Receipt 1]"), 1)
+        self.assertEqual(result.count("[receipt 1]"), 1)
         self.assertIn(good, result)
         self.assertNotIn("evil.example", result)
-        self.assertNotIn("[Receipt 2]", result)
+        self.assertNotIn("[receipt 2]", result)
         self.assertIn("0.003 test USDC", result)
 
     def test_mock_tools_do_not_claim_on_chain_payments(self):
@@ -134,7 +134,7 @@ class ChatFormatTests(unittest.TestCase):
         result = format_answer(self.review(), quote_details=details)
         self.assertNotIn("NaN", result)
         self.assertNotIn("Infinity", result)
-        self.assertIn("after our fee:** 0.00 USD", result)
+        self.assertIn("You save vs your bank:** 0.00 USD, after our fee", result)
 
     def test_portfolio_benefit_is_labeled_as_projection_with_components(self):
         result = format_answer({"status": "ok", "preview": {"companyKeeps": "8567.00 USD"}})

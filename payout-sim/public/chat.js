@@ -180,8 +180,11 @@ function impactCard() {
   const row = (big, text) => `<div class="imp-row"><b>${esc(big)}</b><span>${esc(text)}</span></div>`;
   return `<section class="impact-card" aria-label="Savings vs your bank"><span class="imp-label">Savings vs your bank wire</span>
     <div class="imp-big">$${fmt(T.realizedUsd + T.projectedUsd, 0)}</div>
-    <p class="imp-sub">$${fmt(T.realizedUsd, 0)} on ${plural(g.realized.length, "paid payment")} + $${fmt(T.projectedUsd, 0)} projected on ${plural(g.projected.length, "open bill")}, after our fee</p>
-    ${T.avgDaysFaster > 0.04 ? row(`${T.avgDaysFaster.toFixed(1)} days faster`, `average on ${T.fasterBills} of ${g.projected.length} open bills, vs a bank wire`) : ""}
+    <p class="imp-sub">${g.realized.length
+      ? `$${fmt(T.realizedUsd, 0)} saved on ${plural(g.realized.length, "paid payment")} + $${fmt(T.projectedUsd, 0)} projected on ${plural(g.projected.length, "open bill")}, after our fee`
+      : g.projected.length ? `Projected on ${plural(g.projected.length, "open bill")} once paid on their best routes, after our fee. Nothing paid through Route402 yet.`
+      : "No open bills to project and nothing paid through Route402 yet."}</p>
+    ${T.avgDaysFaster > 0.04 ? row(`${T.avgDaysFaster.toFixed(1)} days sooner`, `on average, for the ${T.fasterBills} of ${g.projected.length} open bills that arrive before a bank wire would`) : ""}
     ${s.earlyPayDiscounts && num(s.earlyPayDiscounts) > 0 ? row(`+ ${money(s.earlyPayDiscounts, 0)}`, "early-payment discounts the faster routes make reachable (not included above)") : ""}
     ${blocked ? row(`${blocked} caught`, `payment${blocked === 1 ? "" : "s"} with bad bank details stopped before sending`) : ""}
     <a class="imp-link" href="#/payments">See the growth chart →</a>

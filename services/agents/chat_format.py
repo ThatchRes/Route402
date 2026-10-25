@@ -117,30 +117,49 @@ def _supplier_name(preview, payable, index, count):
     return f"Payment {index}"
 
 
+def _route(label):
+    """'Your bank (US big-bank pricing, measured) (your current bank) + USDC->EURC swap on base, ...' -> readable legs."""
+    legs = []
+    for leg in str(label or "").split(" + ")[:6]:
+        leg = leg.strip()
+        if not leg:
+            continue
+        if leg.lower().startswith("your bank"):
+            leg = "your bank wire"
+        legs.append(re.sub(r"\bon base\b", "on Base", leg.replace("->", "→")))
+    if not legs:
+        return None
+    return ("Split: " if len(legs) > 1 else "") + " + ".join(legs)
+
+
+def _arrival(detail):
+    arrival = _date(detail.get("arrivalUtc"))
+    if not arrival:
+        return None
+    bank = _date(detail.get("bankArrivalUtc"))
+    if not bank:
+        return arrival
+    hours = (datetime.fromisoformat(detail["bankArrivalUtc"].replace("Z", "+00:00"))
+             - datetime.fromisoformat(detail["arrivalUtc"].replace("Z", "+00:00"))).total_seconds() / 3600
+    if hours > 1:
+        return f"{arrival} · {hours / 24:.1f} days sooner than a bank wire" if hours >= 24 else f"{arrival} · {hours:.0f} hours sooner than a bank wire"
+    return f"{arrival} · same time as a bank wire" if hours >= -1 else f"{arrival} · later than a bank wire"
+
+
 def _details(detail):
     lines = []
-    for field, label in (("youPay", "You pay, including Route402 fee"),
-                         ("recipientGets", "Supplier receives"), ("platformFee", "Route402 fee"),
-                         ("netSavings", "Estimated saving vs your bank, after our fee")):
-        money = _money(detail.get(field))
-        if money is not None:
-            lines.append(f"- **{label}:** {money}")
-    arrival = _date(detail.get("arrivalUtc"))
+    received = _money(detail.get("recipientGets"))
+    if received:
+        lines.append(f"- **Supplier receives:** {received}")
+    paid, fee = _money(detail.get("youPay")), _money(detail.get("platformFee"))
+    if paid:
+        lines.append(f"- **You pay:** {paid}" + (f" (includes {fee} Route402 fee)" if fee else ""))
+    saving = _money(detail.get("netSavings"))
+    if saving:
+        lines.append(f"- **Saving vs your bank:** {saving}, after our fee")
+    arrival = _arrival(detail)
     if arrival:
-        lines.append(f"- **Estimated arrival:** {arrival}")
-    bank_arrival = _date(detail.get("bankArrivalUtc"))
-    if bank_arrival:
-        lines.append(f"- **Bank comparison arrival:** {bank_arrival}")
-    if arrival and bank_arrival:
-        ours = datetime.fromisoformat(detail["arrivalUtc"].replace("Z", "+00:00"))
-        bank = datetime.fromisoformat(detail["bankArrivalUtc"].replace("Z", "+00:00"))
-        hours = (bank - ours).total_seconds() / 3600
-        if hours > 1:
-            faster = f"{hours / 24:.1f} days" if hours >= 24 else f"{hours:.1f} hours"
-            lines.append(f"- **Estimated time saved:** {faster}")
-    expiry = _date(detail.get("expiresAt"))
-    if expiry:
-        lines.append(f"- **Quote valid until:** {expiry}")
+        lines.append(f"- **Arrives:** {arrival}")
     return lines
 
 
@@ -150,34 +169,35 @@ def _decision_blocks(answer, preview, quote_details):
     for index, decision in enumerate(decisions[:25], 1):
         if not isinstance(decision, dict):
             continue
-        detail = _mapping(quote_details.get(decision.get("intentId")))
-        supplier = detail.get("supplier") or _supplier_name(preview, decision.get("payable"), index, len(decisions))
-        disposition = {"approve": "Ready for your confirmation", "review": "Additional review needed",
-                       "hold": "On hold"}.get(decision.get("decision"), "Review needed")
-        lines = [f"**{_plain(supplier, 140)} · {disposition}**"]
-        selected = next((o for o in decision.get("options", []) if isinstance(o, dict)
-                         and o.get("intentId") == decision.get("intentId") and decision.get("intentId")), {})
-        route = detail.get("routeLabel") or selected.get("label") or {
-            "stablecoin": "Stablecoin route", "bank": "Your bank wire", "tokenized_deposit": "Tokenized deposit"
-        }.get(decision.get("chosen"))
-        if route:
-            lines.append(f"- **Route:** {_plain(route, 200)}")
-        lines.extend(_details(detail))
-        cost = _number(selected.get("costBps"))
-        if cost is not None:
-            lines.append(f"- **Quoted cost above market rate:** {cost / 100:.2f}%")
-        if not detail.get("arrivalUtc"):
-            arrival = _date(selected.get("arrivalUtc") or _mapping(decision.get("timing")).get("arrivalUtc"))
-            if arrival:
-                lines.append(f"- **Estimated arrival:** {arrival}")
-        needs = [x for x in decision.get("needs", []) if isinstance(x, str)]
-        if needs:
-            lines.append("- **Before release:** " + "; ".join(_plain(x, 200) for x in needs[:4]))
-        if decision.get("decision") in ("hold", "review"):
-            reasons = [r for r in decision.get("reasons", []) if isinstance(r, str) and not r.startswith("compared:")]
-            lines.extend(f"- {_plain(reason, 350)}" for reason in reasons[:2])
-        blocks.append("\n".join(lines))
+        from asi_layout import payment   # same sections and order as the website's review page
+        p = payment(decision, _mapping(quote_details.get(decision.get("intentId"))), preview, index, len(decisions))
+        head = [f"**{_plain(p['supplier'], 140)}**" + (f" · {_plain(p['meta'], 120)}" if p["meta"] else "")]
+        if p["flow"]:
+            head.append(" → ".join(f"**{_plain(k, 60)}:** {v}" for k, v in p["flow"][:2]))
+            head.extend(f"**{_plain(k, 60)}: {v}**" for k, v in p["flow"][2:])   # the saving, as its own headline
+        if p["account"]:
+            head.append(_plain(p["account"], 80))
+        if p["route"]:
+            head.append(f"**Route:** {_plain(p['route'], 240)}" + (" · Recommended" if decision.get("decision") == "approve" else ""))
+        if p["routeWhy"]:
+            head.append(f"_{_plain(p['routeWhy'], 400)}_")
+        head.extend(f"- {_plain(note, 350)}" for note in p["notes"])
+        blocks.append("\n".join(head))
+        for title, rows in p["sections"]:
+            blocks.append(f"**{_plain(title, 80)}**\n" + "\n".join(f"- **{_plain(k, 80)}:** {_plain(v, 400)}" for k, v in rows))
     return blocks
+
+
+def _agent_blocks(answer):
+    from asi_layout import agent_trail
+    trail = agent_trail(answer)
+    if not trail:
+        return []
+    summary, steps = trail
+    lines = [f"**How your agents handled this**" + (f" · {_plain(summary, 80)}" if summary else "")]
+    lines += [f"{i}. **{_plain(who, 40)}:** {_plain(what, 400)}" + (f" ({_plain(t, 20)})" if t else "")
+              for i, (who, what, t) in enumerate(steps, 1)]
+    return ["\n".join(lines)]
 
 
 def _read_only_blocks(preview):
@@ -248,16 +268,16 @@ def _receipts(answer):
     if not real:
         return f"**Agent activity:** {len(calls)} simulated tool call{'s' if len(calls) != 1 else ''}; no x402 payment was made."
     spent = _number(answer.get("spentUsdc"))
-    text = f"**Agent activity:** {len(real)} quote/screening call{'s' if len(real) != 1 else ''} purchased with x402"
+    text = f"**Agent activity:** {len(real)} quote/screening call{'s' if len(real) != 1 else ''} bought with x402"
     if spent is not None and spent >= 0:
-        text += f" · {spent:f} test USDC"
+        text += f" ({spent:f} test USDC)"
     links, seen = [], set()
     for call in real:
         url = _safe_url(call.get("explorer"), receipt=True)
         if url and url not in seen:
             seen.add(url)
-            links.append(f"[Receipt {len(links) + 1}]({url})")
-    return text + "." + ("\n\n" + " · ".join(links[:6]) if links else "")
+            links.append(f"[receipt {len(links) + 1}]({url})")
+    return text + (" · " + " · ".join(links[:6]) if links else "")
 
 
 def format_answer(answer, *, confirmation=None, app_url=None, quote_details=None):
@@ -282,20 +302,32 @@ def format_answer(answer, *, confirmation=None, app_url=None, quote_details=None
     if decisions:
         policy = _POLICIES.get(answer.get("policy"))
         if policy:
-            blocks.append(f"**Preference:** {policy}. You can ask for cheapest, fastest or balanced.")
+            blocks.append(f"Optimized for: **{policy.lower()}**")
         blocks.extend(_decision_blocks(answer, preview, quote_details))
-        blocks.append("Demo: supplier payouts and currency conversion are simulated. Supported USDC testnet settlement is a representative proof, not the invoice amount.")
+        blocks.extend(_agent_blocks(answer))
     else:
         blocks.extend(_read_only_blocks(preview))
         if not blocks:
             blocks.append("Ask about suppliers, payment costs or status, or give me an amount and supplier to plan a payment.")
     receipts = _receipts(answer)
-    if receipts:
+    if receipts and decisions and "[receipt" in receipts:
+        # The agent trail above already counts the calls; keep only the on-chain receipts, as the site does.
+        spent = _number(answer.get("spentUsdc"))
+        blocks.append("Receipts for the data the agents bought" + (f" ({spent:f} test USDC)" if spent is not None and spent > 0 else "")
+                      + ": " + receipts.split(" · ", 1)[1])
+    elif receipts:
         blocks.append(receipts)
-    if confirmation:
+    offered = any(isinstance(d, dict) and d.get("intentId") in quote_details for d in decisions)
+    if confirmation and offered:
+        # The router's acceptance terms, condensed; the action words are fixed text, not provider data.
+        blocks.append("**Reply `yes` to send**, `cancel` to drop it, or `cheapest` / `fastest` to re-plan. "
+                      "Your company's approval and release checks still apply.")
+    elif confirmation:
         blocks.append(_plain(confirmation, 1500))
     elif decisions:
-        blocks.append("No supplier payment has been sent by this review. Approval is still required through your connected Route402 account.")
+        blocks.append("No supplier payment has been sent by this review.")
+    if decisions:
+        blocks.append("_Demo: supplier payouts and currency conversion are simulated; USDC testnet settlement is a representative proof, not the invoice amount._")
     link = _safe_url(app_url)
     if link:
         blocks.append(f"[Open in Route402]({link})")

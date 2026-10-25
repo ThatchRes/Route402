@@ -264,8 +264,10 @@ export function optimize(it: Intent) {
   const bestUnsplit = searched.singles[objective]?.children[0];
   const chosen = winner?.children, useSplit = chosen && chosen.length > 1;
 
+  // Explain with the routes that actually failed; a bank-complement leg on its own is not a stablecoin route and has no failure reason.
+  const failed = priced.filter((p) => p.reason && !complement(p.routeId));
   if (!chosen) return { status: "HOLD", reason: process.env.LOCAL_ROUTING === "1" && it.provider === "stablecoin" ? "stablecoin settlement disabled in LOCAL_ROUTING; use simulated bank routes"
-    : priced.length ? [...new Set(priced.map((p) => `${p.label}: ${p.reason}`))].join("; ")
+    : failed.length ? [...new Set(failed.map((p) => `${p.label}: ${p.reason}`))].join("; ")
     : it.provider === "tokenized_deposit" ? (tokenizedUnavailable(it.srcCcy, it.destCcy, it.beneficiary?.country) ?? "no tokenized route meets this payment's deadline") : it.provider === "stablecoin" ? (unpriced.length ? unpriced.join("; ") : `our stablecoin rail has no published-price route to ${it.destCcy} yet`) : "no eligible route or allocation",
     deadlineUtc: it.deadlineUtc, earliestArrivalUtc: priced.filter((p) => p.quote).map((p) => p.arrivalUtc).sort()[0] ?? null,
     unpriced, candidates: priced, baseline };

@@ -332,5 +332,9 @@ async def asi_status(tenant, corr, sender, session):
     return await _asi("status", tenant, corr, sender, session)
 
 
+async def asi_payments(tenant, corr, sender, session):
+    return await _asi("payments", tenant, corr, sender, session)
+
+
 async def asi_disconnect(tenant, corr, sender, session):
     return await _asi("disconnect", tenant, corr, sender, session)

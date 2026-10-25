@@ -1,17 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40" fill="none">
-  <!-- Route402 mark: one payment comes in from the left, the router splits it, the chosen route (bright) wins over the alternative (dim) -->
+  <!-- Route402 mark: a highway route shield with the route number, 402, centred.
+       Same teal gradient and white strokes as the original mark. -->
   <defs>
-    <linearGradient id="r402-bg" x1="4" y1="2" x2="36" y2="38" gradientUnits="userSpaceOnUse">
+    <linearGradient id="r402-bg" x1="6" y1="2" x2="34" y2="38" gradientUnits="userSpaceOnUse">
       <stop stop-color="#3fb2a8"/>
       <stop offset="1" stop-color="#16514d"/>
     </linearGradient>
+    <filter id="r402-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="1.2" stdDeviation="1.1" flood-color="#000" flood-opacity=".22"/>
+    </filter>
   </defs>
-  <rect width="40" height="40" rx="11" fill="url(#r402-bg)"/>
-  <path d="M8 20H17" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/>
-  <path d="M17 20C22.5 20 23.5 28.5 31 28.5" stroke="#fff" stroke-opacity=".5" stroke-width="2.8" stroke-linecap="round"/>
-  <path d="M17 20C22.5 20 23.5 11.5 31 11.5" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/>
-  <circle cx="8" cy="20" r="3" fill="#fff"/>
-  <circle cx="31" cy="28.5" r="2.6" fill="#fff" fill-opacity=".5"/>
-  <circle cx="31" cy="11.5" r="3.6" fill="#fff"/>
-  <circle cx="31" cy="11.5" r="1.5" fill="#2a8a84"/>
+  <g filter="url(#r402-shadow)">
+    <path d="M20 2.6C25.4 5 30.6 4.9 35.4 2.8C37 8.4 37.5 13.2 37 17.8C36.1 27 30 33.4 20 37.6C10 33.4 3.9 27 3 17.8C2.5 13.2 3 8.4 4.6 2.8C9.4 4.9 14.6 5 20 2.6Z" fill="url(#r402-bg)"/>
+    <path d="M20 2.6C25.4 5 30.6 4.9 35.4 2.8C37 8.4 37.5 13.2 37 17.8C36.1 27 30 33.4 20 37.6C10 33.4 3.9 27 3 17.8C2.5 13.2 3 8.4 4.6 2.8C9.4 4.9 14.6 5 20 2.6Z"
+          transform="translate(20 20) scale(.87) translate(-20 -20)" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/>
+  </g>
+  <!-- route number, centred in the shield (its visual middle sits a little above the geometric one) -->
+  <text x="20" y="23.9" text-anchor="middle" fill="#fff" font-family="Inter, 'Segoe UI', Arial, sans-serif" font-size="12.5" font-weight="800" letter-spacing="-.3">402</text>
 </svg>

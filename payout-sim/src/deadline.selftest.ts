@@ -70,13 +70,18 @@ check("a new price cannot exceed the signed debit cap", () => {
 });
 
 delete process.env.LOCAL_ROUTING;
-check("a consented fallback can cross quote providers, but cannot change the payment task", () => {
+check("a consented fallback keeps the reviewed route while it passes, crosses providers only when it fails, and cannot change the task", () => {
   const usd = { ...intent, destCcy: "USD", amount: "100.00", objective: "cheapest" as const, deadlineUtc: "2026-10-31T20:00:00Z", beneficiaryAcceptsUsdc: true,
     currentBank: { ...intent.currentBank, wireFeeUsd: 0 }, provider: "stablecoin" as const };
   const primary: any = optimize(usd), bankIntent = { ...usd, provider: "bank" as const }, bankDecision: any = optimize(bankIntent);
   const policy = executionPolicy(usd, primary, true, [{ intent: bankIntent, decision: bankDecision }]);
-  const result = planForDispatch({ intent: usd, totals: primary.totals, allocations: primary.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input })), executionPolicy: policy }, intent.nowUtc!);
-  assert.equal(result.decision.allocations[0].routeId, "bank:current_bank");
+  const reviewed = { intent: usd, totals: primary.totals, allocations: primary.allocations.map((a: any) => ({ routeId: a.routeId, input: a.quote.input })), executionPolicy: policy };
+  // A backup that is equal or cheaper must not replace the route the company approved (the reported stablecoin -> bank switch).
+  const kept = planForDispatch(reviewed, intent.nowUtc!);
+  assert.equal(kept.ok, true);
+  assert.deepEqual(kept.decision.allocations.map((a: any) => a.routeId), primary.allocations.map((a: any) => a.routeId));
+  const retired = planForDispatch({ ...reviewed, allocations: [{ routeId: "coin:USDC:retired:route", input: reviewed.allocations[0].input }] }, intent.nowUtc!);
+  assert.equal(retired.decision.allocations[0].routeId, "bank:current_bank");
   assert.throws(() => executionPolicy(usd, primary, true, [{ intent: { ...bankIntent, amount: "200.00" }, decision: bankDecision }]));
 });
 process.env.LOCAL_ROUTING = "1";

@@ -9,12 +9,19 @@ import json
 import re
 from uuid import uuid4
 
-from chat_format import _plain, _safe_url
+import asi_cards
+from chat_format import _date, _money, _plain
 
-_YES = {"yes", "yes please", "confirm", "confirm payment", "approve", "send it", "yes send it"}
+# Exact phrases only: a quoted, conditional or edited "yes" is a new request, never consent. Never routed through an LLM.
+_YES = {"yes", "y", "yes please", "yep", "yeah", "confirm", "confirm payment", "confirmed", "approve", "approve it",
+        "send it", "yes send it", "yes, send it", "go ahead", "yes go ahead", "yes, go ahead", "proceed", "do it",
+        "pay it", "yes pay it", "accept", "i accept", "ok send it", "okay send it"}
 _CANCEL = {"cancel", "no", "no thanks", "cancel payment", "cancel this", "never mind", "nevermind"}
 _STATUS = {"status", "payment status", "check status", "check payment status"}
 _CONTINUE = {"continue", "connected", "i connected", "i've connected", "done"}
+# Read-only: every stored payment request for the company, newest first.
+_HISTORY = {"payments", "my payments", "show my payments", "show payments", "list payments", "list my payments", "all payments",
+            "payment history", "history", "past payments", "previous payments", "what have i paid", "what did i pay", "recent payments"}
 _END = {"end chat", "end session", "goodbye"}
 
 
@@ -39,13 +46,22 @@ def _result(value):
               "SCHEDULED": "Scheduled", "EXECUTING": "Processing", "COMPLETED": "Completed",
               "PAUSED": "Paused", "FAILED": "Needs attention", "PARTIAL": "Partially completed",
               "NEEDS_RECONCILIATION": "Needs reconciliation", "UNKNOWN": "Outcome needs checking"}
-    for request in value.get("requests", [])[:25]:
+    requests = [r for r in value.get("requests", [])[:25] if isinstance(r, dict)]
+    total = asi_cards.saved_total(requests)
+    if total:
+        blocks.append(f"**Saved vs your bank wire: {total}**" + (" on completed payments" if len(requests) > 1 else ""))
+    for request in requests:
         line = "**" + _plain(request.get("supplier") or "Payment", 140) + ": " + states.get(request.get("status"), "Check in Route402") + "**"
+        amount = _money(request.get("amount"))
+        when = _date(request.get("at"))
+        saved = asi_cards.saved_label(request)
+        if amount or when or saved:
+            line += "\n\n" + " · ".join(x for x in (amount, saved, f"submitted {when}" if when else None, "via ASI:One" if request.get("viaChat") else None) if x)
         if request.get("note"):
             line += "\n\n" + _plain(request["note"], 450)
-        url = _safe_url(request.get("url"))
-        if url:
-            line += f"\n\n[View payment]({url})"
+        if request.get("id"):
+            line += "\n\nPayment request " + _plain(request["id"], 80)
+        # No app links: ASI:One users are never sent to sign in elsewhere; status is answered in this chat.
         blocks.append(line)
     for note in value.get("notes", [])[:4]:
         blocks.append(_plain(note, 300))
@@ -53,14 +69,25 @@ def _result(value):
 
 
 class AsiChatAdapter:
-    def __init__(self, backend, concierge_callable, format_answer, tenant, app_url=None, paid_limiter=None):
+    def __init__(self, backend, concierge_callable, format_answer, tenant, paid_limiter=None, converse=None):
         self.backend, self.concierge = backend, concierge_callable
-        self.format_answer, self.tenant, self.app_url = format_answer, tenant, app_url
+        self.format_answer, self.tenant = format_answer, tenant
         self.paid_limiter = paid_limiter
+        # Optional read-only small-talk reply for turns the payment planner does not handle (ASI:One only).
+        self.converse = converse
         self._locks = {}
 
     async def handle(self, ctx, sender, session, msg_id, text):
-        if not isinstance(text, str) or len(text) > 500:
+        """Text reply only (the card is dropped)."""
+        return (await self.respond(ctx, sender, session, msg_id, text))[0]
+
+    async def respond(self, ctx, sender, session, msg_id, text):
+        """(text, card metadata or None). The text is always complete on its own."""
+        reply = await self._respond(ctx, sender, session, msg_id, text)
+        return (reply[0], reply[1]) if isinstance(reply, (list, tuple)) else (reply, None)
+
+    async def _respond(self, ctx, sender, session, msg_id, text):
+        if not isinstance(text, str) or len(text) > 2000 or (len(text) > 500 and not asi_cards.looks_like_selection(text)):
             return "Use a message of at most 500 characters. No payment action was taken."
         scope = hashlib.sha256(json.dumps([sender, session], separators=(",", ":")).encode()).hexdigest()
         # The signed transport supplies sender and ctx.session; neither comes from the user's text.
@@ -81,8 +108,8 @@ class AsiChatAdapter:
                 reply = await self._handle(ctx, sender, str(session), text.strip(), state)
             except Exception:
                 # Do not echo credentials, remote errors or untrusted provider text.
-                reply = "I couldn't verify the result. Ask for status or open Route402 before trying another payment. An uncertain confirmation will not be retried automatically."
-            seen[message_id] = reply
+                reply = "I couldn't verify the result. Ask for status before trying another payment. An uncertain confirmation will not be retried automatically."
+            seen[message_id] = list(reply) if isinstance(reply, tuple) else reply
             ctx.storage.set(key, state)
             return reply
 
@@ -97,27 +124,30 @@ class AsiChatAdapter:
             state["original"], state["offered"] = None, None
             return "This chat is disconnected. Any previously submitted payments keep their existing status in Route402."
         if not context.get("linked"):
-            if normalized not in _YES | _CONTINUE | _CANCEL | _STATUS and text:
-                state["original"] = text
+            # The router decides who a chat acts as. No sign-in link is ever sent to ASI:One.
             state["offered"] = None
-            link = await self.backend.asi_link(*args)
-            url = _safe_url(link.get("linkUrl"))
-            if not url:
-                return "The Route402 connection URL is unavailable. Check ASI_APP_URL on the router."
-            return ("**Connect your Route402 account**\n\n"
-                    f"[Connect this ASI:One conversation]({url})\n\n"
-                    "Sign in on the existing site, authorize this conversation, then return here and say continue. "
-                    "I will show the payment review before asking you to say yes. No supplier payment has been submitted.")
+            return ("**Payments are not enabled for this chat**\n\n"
+                    "This deployment has not configured a company account for ASI:One conversations, "
+                    "so I can't plan or submit payments here. No supplier payment has been submitted.")
+        # A card click becomes the same fixed command a user could type; nothing else in it is interpreted.
+        picked = asi_cards.selection(text, state.get("offered"))
+        if picked is not None:
+            command, clicked_id = picked
+            if not command:
+                return "I didn't recognise that selection. No payment action was taken."
+            if command == "yes" and clicked_id != state.get("offered"):
+                return "That payment review is no longer current. Ask for a fresh review before sending."
+            text, normalized = command, _normalized(command)
+        if normalized in _HISTORY:
+            result = await self.backend.asi_payments(*args)
+            return _result(result), asi_cards.status_card(result, title="Payment history")
         if normalized in _STATUS or normalized.startswith("status "):
-            return _result(await self.backend.asi_status(*args))
+            return _with_card(await self.backend.asi_status(*args))
         if normalized in _CANCEL:
             result = await self.backend.asi_cancel(*args)
-            state["offered"], state["original"] = None, None
-            return _result(result)
-        if normalized in _YES | _CONTINUE and state.get("original") and not state.get("offered"):
-            text, state["original"] = state["original"], None
-            normalized = _normalized(text)
-        elif normalized in _YES:
+            state["offered"] = None
+            return _result(result), asi_cards.actions_card("Proposal closed. What next?")
+        if normalized in _YES:
             pending = context.get("pending") or {}
             confirmation_id = pending.get("confirmationId") or pending.get("id")
             # The proposal must have been shown by this adapter, not just created on another channel.
@@ -125,11 +155,11 @@ class AsiChatAdapter:
                 return "There is no payment review awaiting your yes in this chat. Tell me the supplier and amount to review first."
             if pending.get("state") == "cancelled":
                 return "That proposal was cancelled. Ask for a new payment review before accepting."
-            return _result(await self.backend.asi_confirm(*args, confirmation_id))
-        elif normalized in _CONTINUE:
-            return "Your account is connected. Tell me the supplier and amount, or ask to see your suppliers."
+            return _with_card(await self.backend.asi_confirm(*args, confirmation_id))
+        if normalized in _CONTINUE:
+            return "Tell me the supplier and amount, or ask to see your suppliers.", asi_cards.actions_card()
         if not text:
-            return "Tell me a supplier and amount, or ask which suppliers use EUR."
+            return "Tell me a supplier and amount, or ask which suppliers use EUR.", asi_cards.actions_card()
         # Every new turn invalidates the last unaccepted plan before even a clarification or failed replan.
         await self.backend.asi_cancel(*args)
         state["offered"] = None
@@ -144,6 +174,35 @@ class AsiChatAdapter:
                 state["offered"] = offer.get("confirmationId")
                 confirmation = offer.get("confirmation")
             except Exception:
-                confirmation = "This plan cannot currently be accepted in chat. Ask for a fresh review or use Route402 to resolve any hold, permission or expired quote. No payment was submitted."
+                confirmation = ("This payment is on hold for the reasons above, so it can't be sent. Nothing was submitted. Ask again in a moment or pick a different preference."
+                                if any(d.get("decision") == "hold" for d in answer.get("decisions", []) if isinstance(d, dict))
+                                else "This plan can't be accepted in chat right now (expired quote or missing permission). Ask for a fresh review. Nothing was submitted.")
         details = {row["intentId"]: row for row in offer.get("details", []) if isinstance(row, dict) and row.get("intentId")}
-        return self.format_answer(answer, confirmation=confirmation, app_url=self.app_url, quote_details=details)
+        if _small_talk(answer):
+            chat = await self.converse(text) if self.converse else None
+            if chat:
+                return _plain(chat, 900) + "\n\n" + _HINT, asi_cards.actions_card()
+            return self.format_answer(answer, confirmation=confirmation, quote_details=details), asi_cards.actions_card()
+        reply = self.format_answer(answer, confirmation=confirmation, quote_details=details)
+        preview = answer.get("preview") if isinstance(answer.get("preview"), dict) else {}
+        if answer.get("decisions"):
+            return reply, asi_cards.review_card(answer, details, state.get("offered"))
+        if preview.get("suppliers"):
+            return reply, asi_cards.suppliers_card(preview)
+        return reply
+
+
+_HINT = ("_Try: “which suppliers use EUR?”, “pay Muller Teile 5000 EUR by Friday” or “how much can I save?”. "
+         "I show a full review first; nothing is sent until you reply yes._")
+
+
+def _with_card(result):
+    return _result(result), asi_cards.status_card(result)
+
+
+def _small_talk(answer):
+    """Only the planner's generic 'not a payment request' turn; never security refusals, plans or slot questions."""
+    preview = answer.get("preview") if isinstance(answer.get("preview"), dict) else {}
+    return (answer.get("status") in ("ok", "clarification") and not answer.get("decisions")
+            and preview.get("template") in ("out_of_scope", "help") and not preview.get("task")
+            and preview.get("title") != "Chat cannot override security controls")

@@ -7,7 +7,7 @@
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
 /* sidebar: recent work (saved conversations) */
-.chat-history { display: grid; gap: 1px; padding: 4px 0 0; max-height: 150px; overflow-y: auto; scrollbar-width: none; }
+.chat-history { display: grid; grid-auto-rows: max-content; align-content: start; gap: 1px; padding: 4px 0 0; max-height: 150px; overflow-y: auto; scrollbar-width: none; }
 .chat-history:empty { display: none; }
 .history-label { color: var(--side-sub); font-size: 9px; text-transform: uppercase; padding: 0 10px 6px; }
 .chat-history button { text-align: left; border: 0; border-radius: 6px; background: transparent; color: var(--side-sub); padding: 4px 10px; font: 11px/1.5 var(--sans); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }

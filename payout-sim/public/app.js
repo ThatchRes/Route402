@@ -126,6 +126,11 @@ function renderPage(P, page, a, b, q) {
   return pageOverview(P);
 }
 window.addEventListener("hashchange", route);
+// Payments can also be made outside this tab (another tab, or ASI:One): refresh the chat page's payment list and savings card.
+const onChat = () => /^#\/(chat|overview)?$/.test(location.hash || "#/chat");
+const refreshChatData = () => { if (onChat() && document.visibilityState === "visible") loadAll().catch(() => {}); };
+document.addEventListener("visibilitychange", refreshChatData);
+setInterval(refreshChatData, 20_000);
 document.addEventListener("click", (e) => { if (e.target.closest("[data-sources]")) { e.preventDefault(); showSources(); } });
 setInterval(() => $$("[data-exp]").forEach((el) => {   // quote countdowns
   const s = Math.round((Date.parse(el.dataset.exp) - Date.now()) / 1000);

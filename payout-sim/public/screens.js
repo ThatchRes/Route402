@@ -565,19 +565,27 @@ function impactPanel(r, q, impact) {
 // All payments (Payments page): what has been saved on paid payments, and where it grows as the open bills are paid
 function portfolioPanel(g, impact) {
   if (!g) return "";
-  const T = g.totals, paid = impact?.payments ?? [], grand = T.realizedUsd + T.projectedUsd, pts = [];
+  const T = g.totals, grand = T.realizedUsd + T.projectedUsd, pts = [];
   let total = 0;
   for (const x of g.realized) { total += x.savedUsd; pts.push({ t: Date.parse(x.at), v: total, kind: "realized", label: `${x.supplier} · paid, +$${fmt(x.savedUsd, 0)}` }); }
   const now = Math.max(Date.now(), pts.at(-1)?.t ?? 0); pts.push({ t: now, v: total, kind: "realized", label: "Today" });
   for (const x of g.projected) { total += x.savedUsd; pts.push({ t: Math.max(now, Date.parse(x.payOnUtc)), v: total, kind: "projected", label: `${x.supplier} · open bill, +$${fmt(x.savedUsd, 0)} by ${day(x.payOnUtc)}` }); }
+  const by = g.projected.length ? ` (by ${esc(day(g.projected.at(-1).payOnUtc))})` : "";
   const tiles = {
-    growth: `<span class="eyebrow">Savings growth</span><div class="b-num">$${fmt(T.realizedUsd, 0)} <em>→</em> $${fmt(grand, 0)}</div>
-      <p class="b-sub">Saved on paid payments so far, and where it grows as your open bills are paid on their best routes${g.projected.length ? ` (by ${esc(day(g.projected.at(-1).payOnUtc))})` : ""}.</p>
-      <dl class="b-facts"><div><dt>Paid payments</dt><dd>${paid.filter((p) => p.status === "COMPLETED").length}</dd></div><div><dt>Open bills with a route</dt><dd>${g.projected.length} of ${g.open?.bills ?? g.projected.length}</dd></div></dl>`,
-    paid: `<span class="eyebrow">Paid so far</span><div class="b-num">$${fmt(T.realizedUsd, 0)}</div><p class="b-sub">saved across ${plural(g.realized.length, "completed payment")}</p>`,
+    growth: `<span class="eyebrow">Savings growth</span>${g.realized.length
+        ? `<div class="b-num">$${fmt(T.realizedUsd, 0)} <em>→</em> $${fmt(grand, 0)}</div>
+      <p class="b-sub">Saved on paid payments so far, and where it grows as your open bills are paid on their best routes${by}.</p>`
+        : `<div class="b-num">$${fmt(grand, 0)} <em>projected</em></div>
+      <p class="b-sub">Nothing has been paid through Route402 yet. This is what your open bills save once they are paid on their best routes${by}.</p>`}
+      <dl class="b-facts"><div><dt>Paid payments</dt><dd>${g.realized.length}</dd></div><div><dt>Open bills with a route</dt><dd>${g.projected.length} of ${g.open?.bills ?? g.projected.length}</dd></div></dl>`,
+    paid: `<span class="eyebrow">Paid so far</span><div class="b-num">$${fmt(T.realizedUsd, 0)}</div><p class="b-sub">${!g.realized.length ? "No completed payments yet"
+      : T.realizedUsd >= 0.5 ? `saved across ${plural(g.realized.length, "completed payment")}`
+      : `across ${plural(g.realized.length, "completed payment")}; none beat your bank wire on price`}</p>`,
     projected: `<span class="eyebrow">Open bills, projected</span><div class="b-num">+$${fmt(T.projectedUsd, 0)}</div>
       <p class="b-sub">on ${g.projected.length} of ${g.open?.bills ?? g.projected.length} open bills, after our fee${g.open?.blocked || g.open?.noRoute ? ` (${[g.open.blocked && `${g.open.blocked} need bank details fixed`, g.open.noRoute && `${g.open.noRoute} with no route by the deadline yet`].filter(Boolean).join(", ")})` : ""}</p>`,
-    speed: `<span class="eyebrow">Speed</span><div class="b-num">${T.avgDaysFaster > 0.04 ? daysLabel(T.avgDaysFaster) : "—"}</div><p class="b-sub">${T.fasterBills} of ${g.projected.length} open bills arrive sooner than a wire</p>`,
+    speed: `<span class="eyebrow">Speed</span><div class="b-num">${T.avgDaysFaster > 0.04 ? `${daysLabel(T.avgDaysFaster)} sooner` : "Same as a wire"}</div><p class="b-sub">${T.fasterBills
+      ? `on average, for the ${T.fasterBills} of ${g.projected.length} open bills that arrive before a bank wire would`
+      : `none of the ${g.projected.length} open bills with a route arrive before a bank wire would`}</p>`,
     chart: `<span class="eyebrow">Cumulative savings vs your bank</span>${growthChart(pts, { marks: [{ t: now, label: "Today" }], aria: `Savings ${fmt(T.realizedUsd, 0)} USD paid so far, growing to ${fmt(grand, 0)} USD as open bills are paid` })}`,
     process: howWeDidIt(0),
   };

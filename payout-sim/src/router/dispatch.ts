@@ -51,6 +51,11 @@ export function validateDispatchDecision(terms: any, decision: any): { ok: boole
 export function planForDispatch(terms: any, nowUtc: string, currentBudget: Partial<Intent> = {}) {
   const policy = terms.executionPolicy ?? executionPolicy(terms.intent, {
     totals: terms.totals, allocations: terms.allocations, candidates: [] });
-  const decision: any = optimize({ ...terms.intent, ...currentBudget, provider: policy.allowReroute ? undefined : terms.intent.provider, nowUtc, allowedRouteIds: policy.allowedRouteIds });
-  return validateDispatchDecision(terms, decision);
+  const run = (allowedRouteIds: string[], provider: any) =>
+    validateDispatchDecision(terms, optimize({ ...terms.intent, ...currentBudget, provider, nowUtc, allowedRouteIds }));
+  // The reviewed routes first: a backup that merely ties on the objective must never replace the approved route.
+  const reviewed = run(reviewedRouteIds(terms), terms.intent.provider);
+  return reviewed.ok || !policy.allowReroute ? reviewed : run(policy.allowedRouteIds, undefined);
 }
+
+export const reviewedRouteIds = (terms: any): string[] => [...new Set<string>((terms.allocations ?? []).map((a: any) => String(a.routeId)))];
